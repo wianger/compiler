@@ -1,0 +1,46 @@
+int logicNumber = 0;
+
+int testLAnd(int n) {
+    logicNumber = n;
+    return 1;
+}
+
+int testLOr(int n) {
+    logicNumber = n;
+    return 1;
+}
+
+int main() {
+    int number;
+    number = getint();
+
+    logicNumber = 1;
+    if (!logicNumber && testLAnd(number)) { ;}
+    printf("%d\n", logicNumber);
+
+    logicNumber = 1;
+    if (testLAnd(number) && !logicNumber) { ;}
+    printf("%d\n", logicNumber);
+
+    logicNumber = 0;
+    if (!logicNumber || testLOr(number)) { ;}
+    printf("%d\n", logicNumber);
+
+    logicNumber = 0;
+    if (testLOr(number) || !logicNumber) { ;}
+    printf("%d\n", logicNumber);
+
+    if (number <= number > number) printf("true\n");
+    else printf("false\n");
+
+    if (number >= number < number) printf("true\n");
+    else printf("false\n");
+
+    if (number < number >= number) printf("true\n");
+    else printf("false\n");
+
+    if (number > number <= number) printf("true\n");
+    else printf("false\n");
+
+    return 0;
+}

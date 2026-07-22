@@ -1,0 +1,22 @@
+int main() {
+    /* dasdfhasdjkhfklsdh
+    int i = 0;
+    const char *sh = "uzi yyds!!!";
+    // System.out.println("wu hu qi fei!!!");
+    // java python
+    void f() {
+        void f() {
+        }
+        // function = (msg) =>  {
+        // dasdfhasdjkhfklsdh
+        };
+    }
+    */
+    printf("hello world\n");
+    // printf("hello, world!");
+    // /* */dasdfhasdjkh
+    /* 
+    //pppp*/
+    printf("end\n");
+    return 0;
+}

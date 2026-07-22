@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.10)
+project(compiler)
+
+# 设置C++标准
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 源文件
+set(SOURCES
+    src/main.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/mips.cpp
+    src/compiler.cpp
+)
+
+# 头文件目录
+include_directories(include)
+
+# 可执行文件
+add_executable(compiler ${SOURCES})

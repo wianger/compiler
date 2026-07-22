@@ -1,23 +1,4 @@
-# 构建目录
-build/
-.vscode/
-
-# 编译器生成的可执行文件
-compiler
-
-tests/functional/*.ll
-tests/h_functional/*.ll
-
-tests/functional/*.ast
-tests/h_functional/*.ast
-
-tests/functional/*.s
-tests/h_functional/*.s
-
-tests/functional/*.c
-tests/h_functional/*.c
-
-test_logs/
-test_logs_ssa/
-test_logs_opt/
-test_results/
+/build/
+/.vscode/
+compiler.cpp
+*.zip

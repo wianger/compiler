@@ -1,0 +1,22 @@
+const int Pai = 3;
+
+int a, b, c;
+int testBlock = 1;
+
+int main() {
+    printf("%d\n", testBlock);
+    int testBlock = 2;
+    {
+        printf("%d\n", testBlock);
+        int testBlock = 3;
+        printf("%d\n", testBlock);
+    }
+
+    int d = 10, e = 9, f = 8;
+    a = (+ d + e + f) * (-(-d - e - f) / (d % f));
+    b = 2 * (2 * (2 * (2 * (2 * f))));
+    c = a + b * c - d / e % f;
+    printf("%d\n", a + b + c);
+
+    return 0;
+}

@@ -1,0 +1,32 @@
+int maxNumber = 12;
+int minNumber = 0;
+
+int main() {
+    int times, i;
+    times = getint();
+
+    i = 0;
+    while (i < times) {
+        i = i + 1;
+        int number;
+        number = getint();
+
+        if (number < minNumber) {
+            printf("%d: less than minNumber\n\n", number);
+            continue;
+        }
+        if (number > maxNumber) {
+            printf("%d: greater than maxNumber\n\n", number);
+            continue;
+        }
+
+        if (number >= minNumber) {
+            if (number <= maxNumber) {
+                printf("%d: between minNumber and maxNumber\n", number);
+            }
+            printf("\n");
+        }
+    }
+
+    return 0;
+}

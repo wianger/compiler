@@ -1,0 +1,44 @@
+int main() {
+    int i = 0;
+    int j = 2;
+    int k = 3;
+    int m = 0;
+
+    if (i < j && k != 2) {
+        printf("ret\n");
+    } else {
+        printf("error\n");
+    }
+
+    if (i < j && k == 3) {
+        printf("ret\n");
+    } else {
+        printf("error\n");
+    }
+
+    if (i < j && k == 2 || m == 0) {
+        printf("ret\n");
+    } else {
+        printf("error\n");
+    }
+
+    if (1 > 2 > -1) {
+        printf("ret\n");
+    } else {
+        printf("error\n");
+    }
+
+    if (1 > 2 >= 0) {
+        printf("ret\n");
+    } else {
+        printf("error\n");
+    }
+
+    if (1 > 2 <= 0) {
+        printf("ret\n");
+    } else {
+        printf("error\n");
+    }
+
+    return 0;
+}
