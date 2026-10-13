@@ -29,8 +29,9 @@ enum class Base { Int, Float, Void, String };
 struct Type {
   Base base = Base::Int;
   // Array parameters have -1 as their first extent. Arrays retain their shape
-  // until lowering, so partial indexing and argument checks are independent of LLVM.
+  // until lowering, so partial indexing and argument checks stay target-independent.
   std::vector<int64_t> shape;
+  bool tensor = false;
   bool numeric() const { return shape.empty() && (base == Base::Int || base == Base::Float); }
   bool array() const { return !shape.empty(); }
   int64_t elements() const;
@@ -50,7 +51,7 @@ Number convert(Number value, Base type, Location loc);
 struct Symbol;
 struct Function;
 struct Expr {
-  enum class Kind { Number, String, Variable, Call, Unary, Binary };
+  enum class Kind { Number, String, Variable, Call, Unary, Binary, Element };
   Kind kind;
   Location location;
   std::string text;
@@ -75,7 +76,7 @@ struct Variable {
   Location location;
   std::string name;
   Base base = Base::Int;
-  bool isConst = false, arrayParameter = false;
+  bool isConst = false, arrayParameter = false, tensor = false;
   std::vector<std::unique_ptr<Expr>> dimensions;
   std::optional<Initializer> initializer;
   Symbol *symbol = nullptr;
@@ -109,6 +110,8 @@ struct Function {
   std::vector<Variable> parameters;
   std::unique_ptr<Stmt> body;
   bool runtime = false, variadic = false, timer = false;
+  bool tensorResult = false;
+  std::vector<int64_t> resultShape;
 };
 
 struct Item {
@@ -125,6 +128,7 @@ struct ProgramIR {
 TokenIR tokenize(const Source &source);
 ProgramIR parse(const TokenIR &tokens);
 void resolve(ProgramIR &program);
+void expandTensors(ProgramIR &program);
 void printIR(const ProgramIR &program, std::ostream &out);
 
 } // namespace sysy

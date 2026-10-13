@@ -45,6 +45,18 @@ CASES = {
       putf("%d %d %d %d\\n",a,b,c,count); return 0; }''', "0 1 1 2\n0\n"),
     "integer_edges": ('''int main() { int x=getint(); int y=getint();
       putf("%d %d %d %d %d\\n",x+y,x-y,x*y,x/y,x%y); return 0; }''', "-2147483644 2147483642 2147483643 429496729 2\n0\n"),
+    "tensor_alias_and_broadcast": ('''int calls; int tick(){calls=calls+1;return 2;}
+      int main(){ tensor int a[2][2]={{1,2},{3,4}};
+        a=a@a; putarray(4,a[0]); a=a+tick(); putarray(4,a[0]);
+        a=a+a[0][0]; putarray(4,a[0]); putint(calls); return 0; }''',
+      "4: 7 10 15 22\n4: 9 12 17 24\n4: 18 21 26 33\n1\n0\n"),
+    "tensor_call_control_flow": ('''int calls;
+      tensor int make(){tensor int a[2]={1,2};calls=calls+1;return a;}
+      int first(tensor int a[]){return a[0];}
+      int main(){int x=getint(); if(x && first(make()))putint(99);
+        if(x || first(make()))putint(calls);
+        while(calls<3 && first(make())){continue;}
+        putch(32); putint(calls); make(); putch(32); putint(calls); return 0;}''', "1 3 4\n0\n"),
 }
 
 INVALID = {
@@ -63,6 +75,11 @@ INVALID = {
     "comment": ("int main(){ /*", "unterminated comment"),
     "octal": ("int main(){return 09;}", "invalid or overflowing"),
     "exponent": ("int main(){return 1e+;}", "exponent requires digits"),
+    "array_element_type": ("int main(){int a[2]={1.5,2};return 0;}", "float elements"),
+    "tensor_shape": ("int main(){tensor int a[2];tensor int b[3];a=b;return 0;}", "matching tensor shape"),
+    "matrix_shape": ("int main(){tensor int a[2][3];tensor int b[2][3];a=a@b;return 0;}", "compatible rank-2"),
+    "tensor_return_shape": ("tensor int f(int x){tensor int a[2];tensor int b[3];if(x)return a;return b;} int main(){return 0;}", "consistent shape"),
+    "tensor_void": ("tensor void f(){tensor int a[2];return a;} int main(){return 0;}", "int or float elements"),
 }
 
 
@@ -84,6 +101,7 @@ def main():
         (directory / f"{name}.out").write_text(expected)
     (directory / "float_conditions.in").write_text("0\n")
     (directory / "integer_edges.in").write_text("2147483647 5\n")
+    (directory / "tensor_call_control_flow.in").write_text("0\n")
     for opt in (0, 2):
         subprocess.run(["python3", str(ROOT / "tools/test.py"), str(directory), "--compiler", str(opts.compiler),
                         "--opt", str(opt), "--output", str(ROOT / f"build/regression-o{opt}")], check=True)

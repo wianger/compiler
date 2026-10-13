@@ -21,12 +21,9 @@ def tool(name, override):
     if not candidate and (CACHE / "usr/bin" / name).exists():
         candidate = str(CACHE / "usr/bin" / name)
     if not candidate:
-        raise RuntimeError(f"Missing {name}; supply its path with --{name.split('-')[-1]}")
+        flag = "qemu" if name == "qemu-riscv64" else name.split("-")[-1]
+        raise RuntimeError(f"Missing {name}; supply its path with --{flag}")
     return candidate
-
-
-def unlimited_stack():
-    resource.setrlimit(resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
 
 
 def compare(actual, expected):
@@ -65,6 +62,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--exclude-tensor", action="store_true")
     opts = parser.parse_args()
+    if opts.jobs < 1 or opts.timeout <= 0:
+        parser.error("--jobs and --timeout must be positive")
+    _, stack_limit = resource.getrlimit(resource.RLIMIT_STACK)
+    resource.setrlimit(resource.RLIMIT_STACK, (stack_limit, stack_limit))
     assembler = tool("riscv64-linux-gnu-as", opts.assembler)
     linker = tool("riscv64-linux-gnu-ld", opts.linker)
     qemu = tool("qemu-riscv64", opts.qemu)
@@ -105,7 +106,7 @@ def main():
             input_file = case.with_suffix(".in")
             result = subprocess.run([qemu, "-L", str(sysroot), str(executable)],
                                     input=input_file.read_bytes() if input_file.exists() else b"",
-                                    capture_output=True, env=env, timeout=opts.timeout, preexec_fn=unlimited_stack)
+                                    capture_output=True, env=env, timeout=opts.timeout)
             (directory / "stdout").write_bytes(result.stdout)
             (directory / "stderr").write_bytes(result.stderr)
             if result.returncode < 0:

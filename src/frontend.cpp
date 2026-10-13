@@ -114,7 +114,7 @@ public:
         std::string op(1, take());
         if ((op == "&" && peek() == '&') || (op == "|" && peek() == '|') ||
             ((op == "=" || op == "!" || op == "<" || op == ">") && peek() == '=')) op += take();
-        if (std::string("+-*/%!=<>(){}[],;").find(op[0]) == std::string::npos && op != "&&" && op != "||")
+        if (std::string("+-*/%@!=<>(){}[],;").find(op[0]) == std::string::npos && op != "&&" && op != "||")
           throw Error(start, "unexpected character '" + op + "'");
         result.push_back({TokenKind::Punctuation, op, start});
       }
@@ -137,7 +137,7 @@ class Parser {
   }
   Token identifier() {
     static const std::unordered_set<std::string> keywords = {
-        "const", "int", "float", "void", "if", "else", "while", "break", "continue", "return"};
+        "const", "tensor", "int", "float", "void", "if", "else", "while", "break", "continue", "return"};
     if (peek().kind != TokenKind::Identifier || keywords.count(peek().text))
       throw Error(peek().location, "expected identifier");
     return take();
@@ -154,7 +154,7 @@ class Parser {
     if (op == "==" || op == "!=") return 3;
     if (op == "<" || op == ">" || op == "<=" || op == ">=") return 4;
     if (op == "+" || op == "-") return 5;
-    if (op == "*" || op == "/" || op == "%") return 6;
+    if (op == "*" || op == "/" || op == "%" || op == "@") return 6;
     return 0;
   }
   std::unique_ptr<Expr> primary() {
@@ -205,8 +205,8 @@ class Parser {
     expect("}");
     return init;
   }
-  Variable variable(Token name, Base type, bool isConst, bool parameter = false) {
-    Variable v; v.location = name.location; v.name = name.text; v.base = type; v.isConst = isConst;
+  Variable variable(Token name, Base type, bool isConst, bool parameter = false, bool tensor = false) {
+    Variable v; v.location = name.location; v.name = name.text; v.base = type; v.isConst = isConst; v.tensor = tensor;
     if (parameter && accept("[")) { expect("]"); v.arrayParameter = true; }
     while (accept("[")) { v.dimensions.push_back(expression()); expect("]"); }
     if (!parameter) {
@@ -215,10 +215,10 @@ class Parser {
     }
     return v;
   }
-  std::vector<Variable> declaration(Base type, bool isConst, Token name) {
+  std::vector<Variable> declaration(Base type, bool isConst, Token name, bool tensor = false) {
     std::vector<Variable> variables;
-    variables.push_back(variable(std::move(name), type, isConst));
-    while (accept(",")) variables.push_back(variable(identifier(), type, isConst));
+    variables.push_back(variable(std::move(name), type, isConst, false, tensor));
+    while (accept(",")) variables.push_back(variable(identifier(), type, isConst, false, tensor));
     expect(";");
     return variables;
   }
@@ -226,11 +226,12 @@ class Parser {
     auto s = std::make_unique<Stmt>(Stmt::Kind::Block, expect("{").location);
     while (!at("}")) {
       if (peek().kind == TokenKind::End) throw Error(peek().location, "unterminated block");
-      if (at("const") || at("int") || at("float")) {
+      if (at("const") || at("tensor") || at("int") || at("float")) {
         auto d = std::make_unique<Stmt>(Stmt::Kind::Declaration, peek().location);
         bool isConst = accept("const");
+        bool tensor = accept("tensor");
         Base type = base();
-        d->variables = declaration(type, isConst, identifier());
+        d->variables = declaration(type, isConst, identifier(), tensor);
         s->children.push_back(std::move(d));
       } else s->children.push_back(statement());
     }
@@ -269,24 +270,28 @@ public:
     ProgramIR program;
     while (peek().kind != TokenKind::End) {
       bool isConst = accept("const");
+      bool tensor = accept("tensor");
       Base type = base(!isConst);
       auto name = identifier();
       Item item;
       if (accept("(")) {
         if (isConst) throw Error(name.location, "function cannot be const");
+        if (tensor && type == Base::Void) throw Error(name.location, "tensor function requires int or float elements");
         item.function = std::make_unique<Function>();
         auto &f = *item.function;
         f.location = name.location; f.name = f.linkageName = name.text; f.result = type;
+        f.tensorResult = tensor;
         if (!at(")")) {
           do {
+            bool paramTensor = accept("tensor");
             Base paramType = base();
-            f.parameters.push_back(variable(identifier(), paramType, false, true));
+            f.parameters.push_back(variable(identifier(), paramType, false, true, paramTensor));
           } while (accept(","));
         }
         expect(")"); f.body = block();
       } else {
         if (type == Base::Void) throw Error(name.location, "variable cannot have void type");
-        item.variables = declaration(type, isConst, std::move(name));
+        item.variables = declaration(type, isConst, std::move(name), tensor);
       }
       program.items.push_back(std::move(item));
     }

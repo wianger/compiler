@@ -37,6 +37,7 @@ struct ModuleIR {
 
 ModuleIR lower(const ProgramIR &program);
 void optimize(ModuleIR &module, int level);
+void runPasses(ModuleIR &module, const std::string &pipeline);
 void verify(const ModuleIR &module);
 void printIR(const ModuleIR &module, std::ostream &out);
 void emitAssembly(const ModuleIR &module, std::ostream &out);

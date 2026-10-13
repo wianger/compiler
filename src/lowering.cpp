@@ -52,6 +52,11 @@ class Lowering {
     return value(Op::Address, ValueType::Pointer, {}, offset, symbol);
   }
   int address(const Expr &e) {
+    if (e.kind == Expr::Kind::Element) {
+      int base = expression(*e.operands[0]);
+      int index = expression(*e.operands[1]);
+      return value(Op::Offset, ValueType::Pointer, {base, index}, 4);
+    }
     int64_t fixed = 0;
     bool allConstant = true;
     for (const auto &index : e.operands) allConstant &= index->constant.has_value();
@@ -102,6 +107,7 @@ class Lowering {
       int ptr = address(e);
       return e.type.array() ? ptr : value(Op::Load, valueType(e.type.base), {ptr});
     }
+    case Expr::Kind::Element: return value(Op::Load, valueType(e.type.base), {address(e)});
     case Expr::Kind::Call: {
       const auto &f = *e.callee;
       std::vector<int> args;
@@ -278,9 +284,22 @@ void eliminateDead(FunctionIR &f) {
 
 ModuleIR lower(const ProgramIR &program) { return Lowering().run(program); }
 void optimize(ModuleIR &module, int level) {
-  for (auto &f : module.functions) {
-    prune(f);
-    if (level > 0) { promote(f); eliminateDead(f); }
+  runPasses(module, level > 0 ? "prune,promote,dce" : "prune");
+}
+void runPasses(ModuleIR &module, const std::string &pipeline) {
+  size_t start = 0;
+  while (start < pipeline.size()) {
+    size_t comma = pipeline.find(',', start);
+    auto name = pipeline.substr(start, comma == std::string::npos ? comma : comma - start);
+    for (auto &f : module.functions) {
+      if (name == "prune") prune(f);
+      else if (name == "promote") promote(f);
+      else if (name == "dce") eliminateDead(f);
+      else throw std::runtime_error("unknown IR pass: " + name);
+    }
+    verify(module);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
   }
 }
 void verify(const ModuleIR &module) {
@@ -290,8 +309,50 @@ void verify(const ModuleIR &module) {
       if (b.instructions.empty()) throw std::logic_error("IR block has no terminator");
       for (size_t n = 0; n < b.instructions.size(); ++n) {
         const auto &i = b.instructions[n];
+        auto require = [](bool valid, const char *message) { if (!valid) throw std::logic_error(message); };
         if (i.result >= static_cast<int>(f.values.size())) throw std::logic_error("IR result is out of range");
         for (int arg : i.args) if (arg < 0 || arg >= static_cast<int>(f.values.size())) throw std::logic_error("IR operand is out of range");
+        size_t arity = 0;
+        switch (i.op) {
+        case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Convert: case Op::Branch: arity = 1; break;
+        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem:
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: arity = 2; break;
+        case Op::Call:
+          require(i.callee != nullptr, "IR call has no callee");
+          arity = i.args.size();
+          require(arity >= i.callee->parameters.size(), "IR call has too few arguments");
+          if (!i.callee->variadic) require(arity == i.callee->parameters.size() + (i.callee->timer ? 1 : 0), "IR call arity mismatch");
+          for (size_t a = 0; a < i.callee->parameters.size(); ++a) {
+            auto type = i.callee->parameters[a].symbol->type;
+            require(f.values[i.args[a]] == (type.array() ? ValueType::Pointer : valueType(type.base)), "IR call argument type mismatch");
+          }
+          require(i.callee->result == Base::Void ? i.result == -1 : i.result >= 0, "IR call result mismatch");
+          break;
+        case Op::Return: arity = f.source->result == Base::Void ? 0 : 1; break;
+        default: break;
+        }
+        require(i.args.size() == arity, "IR instruction arity mismatch");
+        bool produces = pure(i.op) || (i.op == Op::Call && i.callee->result != Base::Void);
+        require(produces ? i.result >= 0 : i.result == -1, "IR instruction result mismatch");
+        auto a = [&](size_t index) { return f.values[i.args[index]]; };
+        if (i.op == Op::Load || i.op == Op::Store || i.op == Op::Zero || i.op == Op::Offset)
+          require(a(0) == ValueType::Pointer, "IR memory operand is not a pointer");
+        if (i.op == Op::Move) require(a(0) == f.values[i.result], "IR move type mismatch");
+        if (i.op == Op::Convert) {
+          auto to = f.values[i.result];
+          require((a(0) == ValueType::Int && to == ValueType::Float) ||
+                  (a(0) == ValueType::Float && (to == ValueType::Int || to == ValueType::Double)), "IR conversion type mismatch");
+        }
+        if (i.op == Op::Offset) require(a(1) == ValueType::Int && f.values[i.result] == ValueType::Pointer, "IR offset type mismatch");
+        if (i.op == Op::Branch) require(a(0) == ValueType::Int, "IR branch condition must be int");
+        if (i.op == Op::Return && arity) require(a(0) == valueType(f.source->result), "IR return type mismatch");
+        if (i.op >= Op::Add && i.op <= Op::Rem) {
+          require(a(0) == a(1) && a(0) == f.values[i.result], "IR arithmetic type mismatch");
+          require(a(0) == ValueType::Int || a(0) == ValueType::Float, "IR arithmetic requires numeric values");
+          if (i.op == Op::Rem) require(a(0) == ValueType::Int, "IR remainder requires int values");
+        }
+        if (i.op >= Op::Eq && i.op <= Op::Ge)
+          require(a(0) == a(1) && f.values[i.result] == ValueType::Int, "IR comparison type mismatch");
         bool terminal = i.op == Op::Jump || i.op == Op::Branch || i.op == Op::Return;
         if (terminal != (n + 1 == b.instructions.size())) throw std::logic_error("IR terminator is misplaced");
         if ((i.op == Op::Jump || i.op == Op::Branch) && (i.target < 0 || i.target >= static_cast<int>(f.blocks.size())))

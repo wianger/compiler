@@ -19,6 +19,7 @@ int64_t Type::elements() const {
 }
 std::string Type::str() const {
   std::string result = base == Base::Int ? "int" : base == Base::Float ? "float" : base == Base::Void ? "void" : "string";
+  if (tensor && array()) result = "tensor " + result;
   for (auto extent : shape) result += "[" + (extent < 0 ? std::string() : std::to_string(extent)) + "]";
   return result;
 }
@@ -135,7 +136,8 @@ class Resolver {
         // An out-of-bounds access stays an access, never a folded constant.
         if (known) offset += n * stride;
       }
-      e.type = {type.base, std::vector<int64_t>(type.shape.begin() + e.operands.size(), type.shape.end())};
+      e.type = {type.base, std::vector<int64_t>(type.shape.begin() + e.operands.size(), type.shape.end()),
+                type.tensor && e.operands.size() < type.shape.size()};
       if (e.type.numeric() && e.symbol->isConst && e.symbol->constantReady && known) {
         auto it = e.symbol->values.find(offset);
         e.constant = it == e.symbol->values.end() ?
@@ -147,6 +149,10 @@ class Resolver {
       auto it = functions.find(e.text);
       if (it == functions.end()) throw Error(e.location, "undefined function '" + e.text + "'");
       auto &f = *it->second; e.callee = &f; e.type.base = f.result;
+      if (f.tensorResult) {
+        if (f.resultShape.empty()) throw Error(e.location, "tensor return shape is not yet known");
+        e.type = {f.result, f.resultShape, true};
+      }
       if (e.operands.size() < f.parameters.size() || (!f.variadic && e.operands.size() != f.parameters.size()))
         throw Error(e.location, "wrong argument count for '" + e.text + "'");
       for (size_t i = 0; i < e.operands.size(); ++i) {
@@ -166,7 +172,9 @@ class Resolver {
       return;
     }
     case Expr::Kind::Unary: {
-      auto &a = *e.operands[0]; numeric(a);
+      auto &a = *e.operands[0];
+      if (a.type.tensor && a.type.array() && e.text != "!") { e.type = a.type; return; }
+      numeric(a);
       e.type.base = e.text == "!" ? Base::Int : a.type.base;
       if (!a.constant) return;
       auto n = *a.constant;
@@ -176,7 +184,28 @@ class Resolver {
       e.constant = n; return;
     }
     case Expr::Kind::Binary: {
-      auto &a = *e.operands[0], &b = *e.operands[1]; numeric(a); numeric(b);
+      auto &a = *e.operands[0], &b = *e.operands[1];
+      if (a.type.array() || b.type.array()) {
+        if ((!a.type.numeric() && !a.type.tensor) || (!b.type.numeric() && !b.type.tensor))
+          throw Error(e.location, "array arithmetic requires tensor operands");
+        Base common = a.type.base == Base::Float || b.type.base == Base::Float ? Base::Float : Base::Int;
+        if (e.text == "@") {
+          if (a.type.shape.size() != 2 || b.type.shape.size() != 2 || a.type.shape[1] != b.type.shape[0])
+            throw Error(e.location, "matrix multiplication requires compatible rank-2 tensors");
+          e.type = {common, {a.type.shape[0], b.type.shape[1]}, true};
+        } else {
+          if (e.text != "+" && e.text != "-" && e.text != "*" && e.text != "/" && e.text != "%")
+            throw Error(e.location, "unsupported tensor operator");
+          if (a.type.array() && b.type.array() && a.type.shape != b.type.shape)
+            throw Error(e.location, "tensor operands must have the same shape");
+          if (e.text == "%" && common != Base::Int) throw Error(e.location, "remainder requires int operands");
+          e.type = {common, a.type.array() ? a.type.shape : b.type.shape, true};
+        }
+        for (auto size : e.type.shape) if (size < 0) throw Error(e.location, "tensor operation requires known extents");
+        return;
+      }
+      if (e.text == "@") throw Error(e.location, "matrix multiplication requires tensor operands");
+      numeric(a); numeric(b);
       bool logical = e.text == "&&" || e.text == "||";
       bool comparison = e.text == "==" || e.text == "!=" || e.text == "<" || e.text == ">" || e.text == "<=" || e.text == ">=";
       e.type.base = (logical || comparison) ? Base::Int :
@@ -188,6 +217,7 @@ class Resolver {
       else if (a.constant && b.constant) e.constant = binary(e.text, *a.constant, *b.constant, e.location);
       return;
     }
+    case Expr::Kind::Element: throw std::logic_error("tensor elements must be introduced after resolution");
     }
   }
   int64_t dimension(Expr &e) {
@@ -221,9 +251,10 @@ class Resolver {
     }
   }
   void variable(Variable &v, bool global, bool parameter = false) {
-    Type type{v.base, {}};
+    Type type{v.base, {}, v.tensor};
     if (v.arrayParameter) type.shape.push_back(-1);
     for (auto &d : v.dimensions) type.shape.push_back(dimension(*d));
+    if (v.tensor && type.shape.empty()) throw Error(v.location, "tensor variable must have an array shape");
     int64_t count = 1;
     try {
       if (v.arrayParameter) { Type tail = type; tail.shape.erase(tail.shape.begin()); tail.elements(); }
@@ -238,6 +269,8 @@ class Resolver {
     flatten(v, *v.initializer, 0, 0, count);
     for (auto [index, e] : v.initializers) {
       expr(*e); numeric(*e);
+      if (v.symbol->type.array() && v.base == Base::Int && e->type.base == Base::Float)
+        throw Error(e->location, "int array initializer cannot contain float elements");
       if (global || v.isConst) {
         if (!e->constant) throw Error(e->location, "initializer must be a constant expression");
         Number value = convert(*e->constant, v.base, e->location);
@@ -259,7 +292,7 @@ class Resolver {
     case Stmt::Kind::Expression:
       if (s.expression) {
         expr(*s.expression);
-        if (s.expression->type.array() || s.expression->type.base == Base::String)
+        if ((s.expression->type.array() && s.expression->kind != Expr::Kind::Call) || s.expression->type.base == Base::String)
           throw Error(s.location, "expression statement requires a scalar or void call");
       }
       return;
@@ -267,6 +300,11 @@ class Resolver {
       expr(*s.target); expr(*s.expression);
       if (s.target->kind != Expr::Kind::Variable || s.target->symbol->isConst)
         throw Error(s.target->location, "assignment requires a mutable lvalue");
+      if (s.target->type.tensor && s.target->type.array()) {
+        if (!s.expression->type.numeric() && (!s.expression->type.tensor || s.target->type.shape != s.expression->type.shape))
+          throw Error(s.location, "tensor assignment requires a scalar or a matching tensor shape");
+        return;
+      }
       numeric(*s.target); numeric(*s.expression); return;
     case Stmt::Kind::If:
       expr(*s.expression); numeric(*s.expression);
@@ -280,7 +318,15 @@ class Resolver {
       return;
     case Stmt::Kind::Return:
       if (s.expression) {
-        expr(*s.expression); numeric(*s.expression);
+        expr(*s.expression);
+        if (current->tensorResult) {
+          if (!s.expression->type.tensor || !s.expression->type.array()) throw Error(s.location, "tensor function must return a tensor");
+          for (auto extent : s.expression->type.shape) if (extent < 0) throw Error(s.location, "tensor return shape must be known");
+          if (current->resultShape.empty()) current->resultShape = s.expression->type.shape;
+          else if (current->resultShape != s.expression->type.shape) throw Error(s.location, "tensor returns must have a consistent shape");
+          return;
+        }
+        numeric(*s.expression);
         if (current->result == Base::Void) throw Error(s.location, "void function cannot return a value");
       } else if (current->result != Base::Void) throw Error(s.location, "non-void function must return a value");
       return;
@@ -319,11 +365,12 @@ public:
       functions[function.name] = &function;
       current = &function;
       if (function.name == "main") {
-        if (function.result != Base::Int || !function.parameters.empty())
+        if (function.tensorResult || function.result != Base::Int || !function.parameters.empty())
           throw Error(function.location, "main must have signature int main()");
         main = true;
       }
       statement(*function.body, true);
+      if (function.tensorResult && function.resultShape.empty()) throw Error(function.location, "tensor function needs a return with a known shape");
       scopes.pop_back();
     }
     if (!main) throw Error({}, "program must define int main()");
