@@ -61,6 +61,7 @@ struct Expr {
   std::optional<Number> constant;
   Symbol *symbol = nullptr;
   Function *callee = nullptr;
+  bool uniformProduct = false;
   Expr(Kind kind, Location loc, std::string text = {})
       : kind(kind), location(loc), text(std::move(text)) {}
 };
@@ -129,6 +130,8 @@ TokenIR tokenize(const Source &source);
 ProgramIR parse(const TokenIR &tokens);
 void resolve(ProgramIR &program);
 void expandTensors(ProgramIR &program);
+void analyzeTensors(ProgramIR &program);
+void optimizeHighIR(ProgramIR &program, int level);
 void printIR(const ProgramIR &program, std::ostream &out);
 
 } // namespace sysy

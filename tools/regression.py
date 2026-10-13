@@ -57,6 +57,35 @@ CASES = {
         if(x || first(make()))putint(calls);
         while(calls<3 && first(make())){continue;}
         putch(32); putint(calls); make(); putch(32); putint(calls); return 0;}''', "1 3 4\n0\n"),
+    "saved_predicate": ('''int main(){int a=getint();int b=getint();int t=a<b;
+      if(a>0){a=a+11;b=b-7;} else {a=a-13;b=b+17;}
+      putf("%d %d %d\\n",a,b,t);if(t)putint(1);else putint(0);return 0;}''', "14 -2 1\n1\n0\n"),
+    "repeat_integer": ('''int main(){int a[5]={1,2,3,4,5};int sum=getint();int r=2;int i=9;
+      while(r<19){i=0;while(i<5){if(a[i]%2)sum=sum+a[i]*2;i=i+1;}r=r+1;}
+      putf("%d %d %d\\n",sum,r,i);return 0;}''', "299 19 5\n0\n"),
+    "repeat_memory_write": ('''int main(){int a[1]={1};int r=0;
+      while(r<5){a[0]=a[0]+2;r=r+1;}putint(a[0]);return 0;}''', "11\n0\n"),
+    "repeat_impure": ('''int calls;int bump(){calls=calls+1;return calls;}
+      int main(){int sum=0;int r=0;while(r<5){sum=sum+bump();r=r+1;}
+        putf("%d %d\\n",sum,calls);return 0;}''', "15 5\n0\n"),
+    "repeat_carried": ('''int main(){int sum=1;int r=0;while(r<5){sum=sum+sum;r=r+1;}
+      putf("%d %d\\n",sum,r);return 0;}''', "32 5\n0\n"),
+    "uniform_rounding": ('''tensor float a[1][257];tensor float b[257][1];tensor float c[1][1];
+      int main(){int i=0;while(i<1){int j=0;while(j<257){a[i][j]=0.1;j=j+1;}i=i+1;}
+        i=0;while(i<257){int j=0;while(j<1){b[i][j]=0.3;j=j+1;}i=i+1;}c=a@b;
+        float sum=0;int k=0;while(k<257){sum=sum+a[0][k]*b[k][0];k=k+1;}
+        if(c[0][0]==sum)putint(1);else putint(0);return 0;}''', "1\n0\n"),
+    "uniform_signed_zero": ('''tensor float a[1][3];tensor float b[3][1];tensor float c[1][1];
+      int main(){int i=0;while(i<1){int j=0;while(j<3){a[i][j]=-0.0;j=j+1;}i=i+1;}
+        i=0;while(i<3){int j=0;while(j<1){b[i][j]=1.0;j=j+1;}i=i+1;}c=a@b;
+        putf("%f\\n",c[0][0]);return 0;}''', "0.000000\n0\n"),
+    "canonical_nan": ('''float zero(){return 0.0;} int main(){float a=zero();float b=a/a;
+      float c=0.0/0.0;putf("%f %f %f\\n",b,c,-c);return 0;}''', "nan nan nan\n0\n"),
+    "uniform_unknown_call": ('''int i;tensor int a[2][3];tensor int b[3][2];tensor int c[2][2];
+      void dirty(){i=1;a[0][0]=9;}
+      int main(){i=0;dirty();while(i<2){int j=0;while(j<3){a[i][j]=i+1;j=j+1;}i=i+1;}
+        i=0;while(i<3){int j=0;while(j<2){b[i][j]=j+1;j=j+1;}i=i+1;}
+        c=a@b;putarray(4,c[0]);return 0;}''', "4: 9 18 6 12\n0\n"),
 }
 
 INVALID = {
@@ -96,13 +125,41 @@ def main():
     total = "+".join([f"i{n}" for n in range(12)] + [f"f{n}" for n in range(12)])
     args = ",".join([str(n) for n in range(12)] + [f"{n}.5" for n in range(12)])
     cases["mixed_arguments"] = (f"float sum({params}){{putch(65);return {total};}} int main(){{putfloat(sum({args}));return 0;}}", "A0x1.14p+7\n0\n")
+    import random
+    rng = random.Random(137)
+    numerators = [-2147483648, -2147483647, -65537, -1, 0, 1, 65537, 2147483647] + [rng.randrange(-2147483648, 2147483648) for _ in range(100)]
+    divisors = [-2147483648, -2147483647, -1000000007, -65537, -97, -31, -10, -7, -3, -2, -1, 1, 2, 3, 7, 10, 31, 97, 65537, 1000000007, 2147483647]
+    expressions = [f"x/({d}),x%({d})" for d in divisors]
+    fmt = " ".join(["%d"] * (2 * len(divisors))) + "\\n"
+    source = f'int main(){{int i=0;while(i<{len(numerators)}){{int x=getint();putf("{fmt}",{",".join(expressions)});i=i+1;}}return 0;}}'
+    output = []
+    for n in numerators:
+        row = []
+        for d in divisors:
+            q = abs(n) // abs(d) * (-1 if (n < 0) != (d < 0) else 1)
+            remainder = n - q*d
+            if q == 2147483648: q = -2147483648
+            row.extend([str(q), str(remainder)])
+        output.append(" ".join(row))
+    cases["constant_division"] = (source, "\n".join(output) + "\n0\n")
+    matrix = '''tensor float a[2][7];tensor float b[7][5];tensor float c[2][5];
+      int main(){int i=0;while(i<2){int j=0;while(j<7){a[i][j]=(i+1)*0.25;j=j+1;}i=i+1;}
+        i=0;while(i<7){int j=0;while(j<5){b[i][j]=(j+1)*0.5;j=j+1;}i=i+1;}
+        MODIFY c=a@b;int bad=0;i=0;while(i<2){int j=0;while(j<5){float sum=0;
+          int k=0;while(k<7){sum=sum+a[i][k]*b[k][j];k=k+1;}
+          if(sum!=c[i][j])bad=bad+1;j=j+1;}i=i+1;}putint(bad);return 0;}'''
+    cases["uniform_rectangular"] = (matrix.replace("MODIFY", ""), "0\n0\n")
+    cases["uniform_invalidation"] = (matrix.replace("MODIFY", "a[0][1]=9.0;"), "0\n0\n")
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)
     (directory / "float_conditions.in").write_text("0\n")
     (directory / "integer_edges.in").write_text("2147483647 5\n")
     (directory / "tensor_call_control_flow.in").write_text("0\n")
-    for opt in (0, 2):
+    (directory / "saved_predicate.in").write_text("3 5\n")
+    (directory / "constant_division.in").write_text("\n".join(map(str,numerators)) + "\n")
+    (directory / "repeat_integer.in").write_text("-7\n")
+    for opt in (0, 2, 3):
         subprocess.run(["python3", str(ROOT / "tools/test.py"), str(directory), "--compiler", str(opts.compiler),
                         "--opt", str(opt), "--output", str(ROOT / f"build/regression-o{opt}")], check=True)
     invalid_dir = ROOT / "build/invalid"
@@ -116,7 +173,7 @@ def main():
         if result.returncode != 1 or message not in result.stderr or output.read_text() != "preserve existing output\n":
             raise AssertionError(f"{name}: {result.stderr}")
         print(f"PASS diagnostic/{name}")
-    print(f"{len(cases) * 2} execution and {len(INVALID)} diagnostic regressions passed")
+    print(f"{len(cases) * 3} execution and {len(INVALID)} diagnostic regressions passed")
 
 
 if __name__ == "__main__":

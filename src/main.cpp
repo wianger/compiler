@@ -6,7 +6,7 @@
 #include <sstream>
 
 namespace {
-enum class Output { Assembly, Tokens, HighIR, ExpandedIR, ControlIR };
+enum class Output { Assembly, Tokens, HighIR, ExpandedIR, ControlIR, MachineIR };
 struct Options {
   std::string input, output;
   Output kind = Output::Assembly;
@@ -17,12 +17,14 @@ void help() {
   std::cout << "Usage: compiler [options] input.sy\n"
       "  -S                 emit RV64GC / LP64D assembly (default)\n"
       "  -o PATH            output file; - means stdout\n"
-      "  -O0 / -O1 / -O2 / -O3  disable / enable IR optimization\n"
+      "  -O0 / -O1 / -O2 / -O3  none / scalar / loop+tensor / repetition\n"
       "  --emit-tokens      print Token IR\n"
       "  --emit-hir         print typed, resolved source IR\n"
       "  --emit-expanded-hir  print source IR after tensor expansion\n"
       "  --emit-ir          print control-flow IR after optimization\n"
-      "  --passes=PIPELINE  override IR passes: prune,promote,dce\n"
+      "  --emit-mir         print target IR after phi lowering and instruction selection\n"
+      "  --passes=PIPELINE  override ordered IR passes (comma separated)\n"
+      "    prune,inline,globaldce,promote,ssa,simplify,sccp,gvn,licm,strength,dce,compact,lower-phi,isel,layout\n"
       "  --help             print this help\n";
 }
 Options options(int argc, char **argv) {
@@ -37,6 +39,7 @@ Options options(int argc, char **argv) {
     else if (arg == "--emit-hir") o.kind = Output::HighIR;
     else if (arg == "--emit-expanded-hir") o.kind = Output::ExpandedIR;
     else if (arg == "--emit-ir") o.kind = Output::ControlIR;
+    else if (arg == "--emit-mir") o.kind = Output::MachineIR;
     else if (arg.rfind("--passes=", 0) == 0) o.passes = arg.substr(9);
     else if (arg.size() == 3 && arg.substr(0, 2) == "-O" && arg[2] >= '0' && arg[2] <= '3') o.optimization = arg[2] - '0';
     else if (arg != "-" && !arg.empty() && arg[0] == '-') throw std::runtime_error("unknown option: " + arg);
@@ -79,14 +82,18 @@ int main(int argc, char **argv) {
       sysy::resolve(program);
       if (o.kind == Output::HighIR) sysy::printIR(program, result);
       else {
+        if (o.optimization >= 2) sysy::analyzeTensors(program);
         sysy::expandTensors(program);
+        sysy::optimizeHighIR(program, o.optimization);
         if (o.kind == Output::ExpandedIR) sysy::printIR(program, result);
         else {
           auto module = sysy::lower(program);
           sysy::verify(module);
           if (o.passes) sysy::runPasses(module, *o.passes);
           else sysy::optimize(module, o.optimization);
-          if (o.kind == Output::ControlIR) sysy::printIR(module, result);
+          if (o.kind == Output::MachineIR) {
+            sysy::runPasses(module, "lower-phi,isel,layout"); sysy::printIR(module, result);
+          } else if (o.kind == Output::ControlIR) sysy::printIR(module, result);
           else sysy::emitAssembly(module, result);
         }
       }

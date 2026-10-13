@@ -5,7 +5,7 @@ C++17 实现的 SysY 编译器，输出 RV64GC / LP64D 汇编。SysY 的解析�
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-build/compiler -S -O2 test/functional/00_main.sy -o build/main.s
+build/compiler -S -O3 test/functional/00_main.sy -o build/main.s
 ```
 
 构建需要 CMake 和普通 C++17 编译器；编译器运行时只依赖 C++ 标准库。
@@ -16,16 +16,18 @@ build/compiler -S -O2 test/functional/00_main.sy -o build/main.s
 
 ```
 Source → Token IR → Program IR → resolved Program IR
-       → tensor expansion → control-flow IR → register IR → RISC-V assembly
+       → tensor structure analysis → expanded HIR → control-flow IR
+       → SSA IR → target IR → register allocation → RISC-V assembly
 ```
 
 - `frontend.cpp` 产生 Token IR 和结构化 Program IR。
 - `semantic.cpp` 绑定符号、检查类型和数组形状、计算常量，并将嵌套初始化转为稀疏的行优先初始化。
-- `tensor.cpp` 将 tensor 操作展开为循环。逐元素表达式融合到同一个循环，标量广播只求值一次；矩阵乘法使用临时结果保证别名安全。返回 tensor 使用调用方提供的缓冲区。
-- `lowering.cpp` 将结构化控制流变成基本块，将短路表达式变成分支，将访存和调用显式化。优化裁剪不可达块、提升不逃逸的局部标量、删除无用计算。
-- `backend.cpp` 在控制流图上计算活跃信息，以线性扫描分配整数和浮点寄存器，溢出到栈；生成符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。常量和地址按需重新生成，减少溢出槽。
+- `tensor.cpp` 保留并分析数组形状和生产者，推导行、列一致性，再选择矩阵算法。一般矩阵使用四列微内核，保持每个元素的浮点累加顺序；符合证明条件的矩阵使用二重循环。逐元素表达式融合，标量广播只求值一次；临时结果保证别名安全，返回值使用调用方提供的缓冲区。`-O3` 还分析无副作用的重复循环与整数加法归约。
+- `lowering.cpp` 将结构化控制流变成基本块，短路表达式变成分支，访存和调用显式化；提升不逃逸的局部标量，检查 PASS 前后约束。很长的算术表达式以迭代方式降级，减少编译器栈消耗。
+- `optimizer.cpp` 计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。实现小函数内联、不可达函数消除、稀疏条件常量传播、公共表达式与冗余加载消除、循环不变量外提、带范围证明的指针归纳变量、死代码消除和 IR 紧缩。
+- `backend.cpp` 将 Phi 降为边上的并行复制，选择比较分支和布局，按真实冲突图与循环权重分配寄存器。合并复制，使用调用者与被调用者保存的寄存器，将热值优先保留在寄存器中。选择立即数、移位和整数倒数乘法，复用循环不变量，生成符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。
 
-优化前的临时值只有一个定义；标量提升后，变量对应可多次写入的虚拟寄存器。当前不要求 SSA，后续可以在这一边界独立引入 SSA、循环优化或其他分配器。每个优化 PASS 后检查终结指令、操作数范围、指令元数、类型和调用签名。
+标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。每层 IR 都可单独打印，各 PASS 可以重新组合。
 
 ```sh
 build/compiler --emit-tokens input.sy
@@ -33,10 +35,13 @@ build/compiler --emit-hir input.sy
 build/compiler --emit-expanded-hir input.sy
 build/compiler --emit-ir -O0 input.sy
 build/compiler --emit-ir -O2 input.sy
-build/compiler --emit-ir --passes=prune,promote,dce input.sy
+build/compiler --emit-mir -O3 input.sy
+build/compiler --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce input.sy
 ```
 
-默认 `-O0`。`-O1`、`-O2`、`-O3` 当前使用同一组优化 PASS。`-o -` 输出到标准输出，`-` 输入从标准输入读取。错误带文件、行、列；失败不会覆盖已有输出文件。
+默认 `-O0`。`-O1` 使用标量 SSA 优化，`-O2` 增加循环和 tensor 结构优化，`-O3` 增加经过数据流检查的重复循环归约。追求执行性能时使用 `-O3`。`-o -` 输出到标准输出，`-` 输入从标准输入读取。错误带文件、行、列；失败不会覆盖已有输出文件。
+
+优化保留浮点运算顺序，不启用 fast-math 或 FMA 重结合。浮点矩阵算法变换要求证明每一步乘积和部分和都能精确表示；未知浮点值走普通内核。常量求值采用目标的 [NaN 规则](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)。
 
 ## QEMU 测试
 
@@ -44,6 +49,7 @@ build/compiler --emit-ir --passes=prune,promote,dce input.sy
 
 ```sh
 python3 tools/test.py test
+python3 tools/test.py test --opt 3
 python3 tools/test.py test/functional test/h_functional --opt 0 --output build/o0-results
 python3 tools/regression.py
 ```
@@ -60,4 +66,4 @@ python3 tools/regression.py
 
 根据额外测试支持 `tensor int/float` 数组、逐元素 `+ - * / %`、一元 `+ -`、标量广播、`@` 二维矩阵乘法、tensor 参数和返回值。逐元素操作要求相同形状；矩阵乘法要求内部维度匹配；`%` 只接受整数。返回形状从函数体推导，各个 return 必须形状一致。tensor 运算和返回需要静态已知的维度；省略首维的 tensor 参数可按普通数组索引访问。
 
-本地验证：`-O2` 下全部 **210/210** 用例通过，`-O0` 下功能用例 **150/150** 通过；额外 **24** 次执行回归和 **20** 个诊断回归通过。
+性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O3` 下全部 **210/210** 用例通过，`-O1` 功能用例 **150/150** 通过；24 个额外程序分别验证 `-O0`、`-O2`、`-O3`，另有 **20** 个诊断回归。

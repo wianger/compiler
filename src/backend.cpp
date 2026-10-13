@@ -1,6 +1,7 @@
 #include "machine_ir.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -27,14 +28,16 @@ std::vector<Argument> arguments(const std::vector<ValueType> &types, size_t name
   return result;
 }
 
-struct Interval { int start = std::numeric_limits<int>::max(), end = -1; };
 struct Allocation {
   std::vector<int> registers;
   std::vector<int64_t> spills;
   std::vector<const Instruction *> definitions;
+  std::vector<const Instruction *> original;
+  std::vector<int> uses;
   std::unordered_map<const Symbol *, int64_t> objects;
   std::set<int> integers, floats;
   int64_t frame = 0, saves = 0;
+  bool leaf = true;
 };
 
 Allocation allocate(const FunctionIR &f) {
@@ -42,27 +45,40 @@ Allocation allocate(const FunctionIR &f) {
   Allocation result;
   result.registers.assign(count, -1); result.spills.assign(count, -1); result.definitions.assign(count, nullptr);
   std::vector<int> definitionCount(count, 0);
-  std::vector<Interval> intervals(count);
+  std::vector<int> sites(count, 0);
+  auto depth = loopDepth(f);
+  std::vector<double> weight(count, 0);
   std::vector<std::unordered_set<int>> use(blocks), def(blocks), in(blocks), out(blocks);
-  std::vector<int> begin(blocks), end(blocks);
-  int position = 0;
   for (size_t b = 0; b < blocks; ++b) {
-    begin[b] = position;
     for (const auto &i : f.blocks[b].instructions) {
+      result.leaf &= i.op != Op::Call;
       for (int arg : i.args) {
         if (!def[b].count(arg)) use[b].insert(arg);
-        intervals[arg].end = std::max(intervals[arg].end, position);
-        intervals[arg].start = std::min(intervals[arg].start, position);
+        weight[arg] += std::pow(10., std::min(depth[b], 6));
       }
       if (i.result >= 0) {
         def[b].insert(i.result); result.definitions[i.result] = &i; ++definitionCount[i.result];
-        intervals[i.result].start = std::min(intervals[i.result].start, position + 1);
-        intervals[i.result].end = std::max(intervals[i.result].end, position + 1);
+        sites[i.result] = b; weight[i.result] += std::pow(10., std::min(depth[b], 6));
       }
-      position += 2;
     }
-    end[b] = position;
   }
+  result.original = result.definitions;
+  result.uses.assign(count, 0);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) for (int a : i.args) ++result.uses[a];
+  for (size_t v = 0; v < count; ++v) if (definitionCount[v] != 1) result.original[v] = nullptr;
+  std::vector<bool> cached(count, false);
+  for (size_t b = 0; b < blocks; ++b) for (const auto &i : f.blocks[b].instructions) for (int a : i.args) {
+    const auto *source = result.original[a];
+    if (!source || depth[b] <= depth[sites[a]]) continue;
+    if (source->op == Op::Address && i.op == Op::Offset) cached[a] = true;
+    if (source->op == Op::Constant && source->immediate != 0 &&
+        (fp(f.values[a]) || (!small(source->immediate) && i.op >= Op::Eq && i.op <= Op::Ge))) cached[a] = true;
+  }
+  for (size_t v = 0; v < count; ++v) {
+    const auto *i = result.definitions[v];
+    if (definitionCount[v] != 1 || cached[v] || !i || (i->op != Op::Constant && i->op != Op::Address && i->op != Op::String)) result.definitions[v] = nullptr;
+  }
+  auto tracked = [&](int v) { return result.definitions[v] == nullptr; };
   bool changed;
   do {
     changed = false;
@@ -77,35 +93,68 @@ Allocation allocate(const FunctionIR &f) {
       changed |= oldIn != in[b] || oldOut != out[b];
     }
   } while (changed);
+  std::vector<std::unordered_set<int>> interference(count);
+  std::vector<std::vector<int>> hints(count);
+  std::vector<bool> crossesCall(count, false);
   for (size_t b = 0; b < blocks; ++b) {
-    for (int v : in[b]) { intervals[v].start = std::min(intervals[v].start, begin[b]); intervals[v].end = std::max(intervals[v].end, begin[b]); }
-    for (int v : out[b]) { intervals[v].start = std::min(intervals[v].start, end[b]); intervals[v].end = std::max(intervals[v].end, end[b]); }
-  }
-  for (size_t v = 0; v < count; ++v) {
-    const auto *i = result.definitions[v];
-    if (definitionCount[v] != 1 || !i || (i->op != Op::Constant && i->op != Op::Address && i->op != Op::String)) result.definitions[v] = nullptr;
-  }
-  for (bool floating : {false, true}) {
-    std::vector<int> order;
-    for (size_t v = 0; v < count; ++v)
-      if (fp(f.values[v]) == floating && !result.definitions[v] && intervals[v].end >= 0) order.push_back(v);
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return intervals[a].start < intervals[b].start; });
-    std::vector<int> active;
-    std::set<int> free;
-    for (int r = 0; r < 12; ++r) free.insert(r);
-    for (int v : order) {
-      active.erase(std::remove_if(active.begin(), active.end(), [&](int old) {
-        if (intervals[old].end < intervals[v].start) { free.insert(result.registers[old]); return true; }
-        return false;
-      }), active.end());
-      if (free.empty()) {
-        auto victim = std::max_element(active.begin(), active.end(), [&](int a, int b) { return intervals[a].end < intervals[b].end; });
-        if (victim != active.end() && intervals[*victim].end > intervals[v].end) {
-          int old = *victim; result.registers[v] = result.registers[old]; result.registers[old] = -1; *victim = v;
+    auto live = out[b];
+    for (auto it = f.blocks[b].instructions.rbegin(); it != f.blocks[b].instructions.rend(); ++it) {
+      const auto &i = *it;
+      if (i.op == Op::Call) for (int v : live) if (v != i.result) crossesCall[v] = true;
+      if (i.result >= 0 && tracked(i.result)) {
+        int source = i.op == Op::Move ? i.args[0] : -1;
+        if (source >= 0 && tracked(source)) { hints[i.result].push_back(source); hints[source].push_back(i.result); }
+        for (int v : live) if (v != i.result && v != source && tracked(v) && fp(f.values[v]) == fp(f.values[i.result])) {
+          interference[v].insert(i.result); interference[i.result].insert(v);
         }
-      } else {
-        result.registers[v] = *free.begin(); free.erase(free.begin()); active.push_back(v);
+        live.erase(i.result);
       }
+      for (int v : i.args) if (tracked(v)) live.insert(v);
+    }
+  }
+  std::vector<ValueType> parameterTypes;
+  for (const auto &p : f.source->parameters) parameterTypes.push_back(p.symbol->type.array() ? ValueType::Pointer : p.base == Base::Float ? ValueType::Float : ValueType::Int);
+  auto incoming = arguments(parameterTypes, parameterTypes.size());
+  auto preferred = [&](int v) {
+    const auto *i = result.original[v];
+    if (!result.leaf || !i || i->op != Op::Parameter) return -1;
+    auto a = incoming.at(i->immediate);
+    if (a.reg < 0 || (fp(f.values[v]) && !a.floating)) return -1;
+    return a.reg + (fp(f.values[v]) ? 21 : 13);
+  };
+  auto allowed = [&](int v, int r) {
+    if (r >= 12 && crossesCall[v]) return false;
+    const auto *i = result.original[v];
+    if (i && i->op == Op::Parameter && r >= (fp(f.values[v]) ? 21 : 13) && r != preferred(v)) return false;
+    return true;
+  };
+  for (bool floating : {false, true}) {
+    int colors = floating ? (result.leaf ? 29 : 21) : (result.leaf ? 21 : 13);
+    std::set<int> pending;
+    for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v) && weight[v] > 0) pending.insert(v);
+    std::vector<int> degree(count), order;
+    for (int v : pending) degree[v] = interference[v].size();
+    while (!pending.empty()) {
+      int selected = -1; double cheapest = std::numeric_limits<double>::infinity();
+      for (int v : pending) {
+        int available = 0; for (int r = 0; r < colors; ++r) available += allowed(v, r);
+        if (degree[v] < available) { selected = v; break; }
+        double cost = weight[v] / std::max(1, degree[v]);
+        if (cost < cheapest) { cheapest = cost; selected = v; }
+      }
+      pending.erase(selected); order.push_back(selected);
+      for (int v : interference[selected]) if (pending.count(v)) --degree[v];
+    }
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+      int v = *it; std::set<int> occupied;
+      for (int neighbor : interference[v]) if (result.registers[neighbor] >= 0) occupied.insert(result.registers[neighbor]);
+      auto choose = [&](int r) { if (r >= 0 && r < colors && allowed(v, r) && !occupied.count(r)) { result.registers[v] = r; return true; } return false; };
+      if (choose(preferred(v))) continue;
+      bool chosen = false;
+      for (int hint : hints[v]) if (choose(result.registers[hint])) { chosen = true; break; }
+      if (chosen) continue;
+      for (int r = 12; r < colors && !chosen; ++r) chosen = choose(r);
+      for (int r = 0; r < 12 && !chosen; ++r) chosen = choose(r);
     }
   }
   int64_t offset = 0;
@@ -118,12 +167,12 @@ Allocation allocate(const FunctionIR &f) {
   for (auto s : f.objects) { offset = align(offset, 4); result.objects[s] = offset; offset += s->type.elements() * 4; }
   offset = align(offset, 8);
   for (size_t v = 0; v < count; ++v) {
-    if (result.definitions[v] || intervals[v].end < 0) continue;
+    if (result.definitions[v] || weight[v] == 0) continue;
     if (result.registers[v] < 0) { result.spills[v] = offset; offset += 8; }
-    else (fp(f.values[v]) ? result.floats : result.integers).insert(result.registers[v]);
+    else if (result.registers[v] < 12) (fp(f.values[v]) ? result.floats : result.integers).insert(result.registers[v]);
   }
   result.saves = offset;
-  result.frame = align(offset + (result.integers.size() + result.floats.size() + 1) * 8, 16);
+  result.frame = align(offset + (result.integers.size() + result.floats.size() + (result.leaf ? 0 : 1)) * 8, 16);
   return result;
 }
 
@@ -135,10 +184,20 @@ class Assembly {
   size_t functionId = 0;
   int privateLabel = 0;
   std::vector<Argument> incoming;
+  int currentBlock = 0;
+  std::optional<int64_t> scratchConstant;
 
   void line(const std::string &text) { out << "\t" << text << '\n'; }
+  void literalT2(int64_t value) {
+    if (!scratchConstant || *scratchConstant != value) line("li t2, " + std::to_string(value));
+    scratchConstant = value;
+  }
   std::string label(int block) const { return ".L" + std::to_string(functionId) + "_b" + std::to_string(block); }
-  std::string reg(int id) const { return (fp(function->values[id]) ? "fs" : "s") + std::to_string(allocation.registers[id]); }
+  std::string reg(int id) const {
+    int r = allocation.registers[id];
+    if (fp(function->values[id])) return r < 12 ? "fs" + std::to_string(r) : r < 21 ? "ft" + std::to_string(r - 9) : "fa" + std::to_string(r - 21);
+    return r < 12 ? "s" + std::to_string(r) : r == 12 ? "t5" : "a" + std::to_string(r - 13);
+  }
   std::string stringLabel(int id) const { return ".Lstr" + std::to_string(functionId) + '_' + std::to_string(id); }
   void memory(const std::string &op, const std::string &r, int64_t offset, const std::string &base = "sp") {
     if (small(offset)) line(op + " " + r + ", " + std::to_string(offset) + "(" + base + ")");
@@ -165,9 +224,14 @@ class Assembly {
     auto def = allocation.definitions[id];
     if (def) {
       if (def->op == Op::Constant) {
+        if (def->immediate == 0) {
+          if (!fp(function->values[id])) return "zero";
+          line(std::string(function->values[id] == ValueType::Double ? "fmv.d.x " : "fmv.w.x ") + scratch + ", zero"); return scratch;
+        }
         if (fp(function->values[id])) {
-          line("li t4, " + std::to_string(static_cast<int32_t>(def->immediate)));
-          line("fmv.w.x " + scratch + ", t4");
+          bool wide = function->values[id] == ValueType::Double;
+          line("li t4, " + std::to_string(wide ? def->immediate : static_cast<int32_t>(def->immediate)));
+          line(std::string(wide ? "fmv.d.x " : "fmv.w.x ") + scratch + ", t4");
         } else line("li " + scratch + ", " + std::to_string(def->immediate));
       } else if (def->op == Op::String) line("la " + scratch + ", " + stringLabel(id));
       else objectAddress(def->symbol, def->immediate, scratch);
@@ -212,7 +276,9 @@ class Assembly {
     auto abi = arguments(types, i.callee->timer ? 1 : i.callee->parameters.size());
     for (size_t n = 0; n < i.args.size(); ++n) {
       auto type = types[n]; auto location = abi[n];
-      auto src = read(i.args[n], fp(type) ? "ft0" : "t0");
+      auto bank = (location.floating ? "fa" : "a") + std::to_string(location.reg);
+      auto scratch = location.reg >= 0 && (!fp(type) || location.floating) ? bank : fp(type) ? "ft0" : "t0";
+      auto src = read(i.args[n], scratch);
       if (location.reg < 0) memory(type == ValueType::Float ? "fsw" : type == ValueType::Double ? "fsd" : "sd", src, location.offset);
       else {
         auto dst = (location.floating ? "fa" : "a") + std::to_string(location.reg);
@@ -221,23 +287,115 @@ class Assembly {
       }
     }
     line("call " + i.callee->linkageName);
-    if (i.result >= 0) {
+    if (i.result >= 0 && allocation.uses[i.result]) {
       auto dst = destination(i.result); auto type = function->values[i.result];
       move(dst, fp(type) ? "fa0" : "a0", type); finish(i.result, dst);
     }
   }
+  bool integerImmediate(const Instruction &i, const std::string &dst, const std::string &a) {
+    if (i.args.size() != 2 || function->values[i.result] != ValueType::Int) return false;
+    auto constant = allocation.original[i.args[1]];
+    if (!constant || constant->op != Op::Constant) return false;
+    int32_t d = constant->immediate;
+    if ((i.op == Op::Add && small(d)) || (i.op == Op::Sub && small(-static_cast<int64_t>(d)))) {
+      line("addiw " + dst + ", " + a + ", " + std::to_string(i.op == Op::Add ? d : -static_cast<int64_t>(d))); return true;
+    }
+    uint64_t magnitude = d < 0 ? -static_cast<int64_t>(d) : d;
+    bool power = magnitude && (magnitude & (magnitude - 1)) == 0;
+    int shift = 0; if (power) for (auto n = magnitude; n > 1; n >>= 1) ++shift;
+    if (i.op == Op::Mul) {
+      if (d == 0) { move(dst, "zero", ValueType::Int); return true; }
+      if (power) {
+        if (shift) line("slliw " + dst + ", " + a + ", " + std::to_string(shift));
+        else move(dst, a, ValueType::Int);
+        if (d < 0 && shift != 31) line("negw " + dst + ", " + dst);
+        return true;
+      }
+      return false;
+    }
+    if ((i.op != Op::Div && i.op != Op::Rem) || d == 0) return false;
+    scratchConstant.reset();
+    if (power) {
+      if (shift == 0) {
+        if (i.op == Op::Rem) move(dst, "zero", ValueType::Int);
+        else if (d < 0) line("negw " + dst + ", " + a);
+        else move(dst, a, ValueType::Int);
+        return true;
+      }
+      line("sraiw t2, " + a + ", 31");
+      line("srliw t2, t2, " + std::to_string(32-shift));
+      line("addw t2, " + a + ", t2"); line("sraiw t2, t2, " + std::to_string(shift));
+      if (i.op == Op::Rem) { line("slliw t2, t2, " + std::to_string(shift)); line("subw " + dst + ", " + a + ", t2"); }
+      else if (d < 0) line("negw " + dst + ", t2");
+      else move(dst, "t2", ValueType::Int);
+      return true;
+    }
+    // Signed reciprocal multiplication. Generate the multiplier with integer
+    // remainders, then correct the high product to truncation toward zero.
+    uint64_t half = uint64_t{1} << 31, t = half + (d < 0);
+    uint64_t anchor = t - 1 - t % magnitude, q1 = half / anchor, r1 = half % anchor;
+    uint64_t q2 = half / magnitude, r2 = half % magnitude, delta;
+    int p = 31;
+    do {
+      ++p; q1 *= 2; r1 *= 2; if (r1 >= anchor) { ++q1; r1 -= anchor; }
+      q2 *= 2; r2 *= 2; if (r2 >= magnitude) { ++q2; r2 -= magnitude; }
+      delta = magnitude - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+    uint32_t raw = q2 + 1; if (d < 0) raw = 0u - raw;
+    int32_t multiplier = raw;
+    line("li t2, " + std::to_string(multiplier)); line("mul t2, " + a + ", t2"); line("srai t2, t2, 32");
+    if (d > 0 && multiplier < 0) line("addw t2, t2, " + a);
+    if (d < 0 && multiplier > 0) line("subw t2, t2, " + a);
+    if (p > 32) line("sraiw t2, t2, " + std::to_string(p-32));
+    line("srliw t4, t2, 31"); line("addw t2, t2, t4");
+    if (i.op == Op::Rem) { line("li t4, " + std::to_string(d)); line("mulw t2, t2, t4"); line("subw " + dst + ", " + a + ", t2"); }
+    else move(dst, "t2", ValueType::Int);
+    return true;
+  }
   void instruction(const Instruction &i) {
-    if (i.op == Op::Constant || i.op == Op::Address || i.op == Op::String) return;
+    if (i.op == Op::Constant || i.op == Op::Address || i.op == Op::String) {
+      if (allocation.definitions[i.result]) return;
+      auto dst = destination(i.result);
+      if (i.op == Op::Address) objectAddress(i.symbol, i.immediate, dst);
+      else if (i.op == Op::String) line("la " + dst + ", " + stringLabel(i.result));
+      else if (fp(function->values[i.result])) {
+        bool wide = function->values[i.result] == ValueType::Double;
+        line("li t4, " + std::to_string(wide ? i.immediate : static_cast<int32_t>(i.immediate)));
+        line(std::string(wide ? "fmv.d.x " : "fmv.w.x ") + dst + ", t4");
+      } else line("li " + dst + ", " + std::to_string(i.immediate));
+      finish(i.result, dst); return;
+    }
     if (i.op == Op::Parameter) { parameter(i); return; }
     if (i.op == Op::Load || i.op == Op::Store) { loadStore(i); return; }
-    if (i.op == Op::Call) { call(i); return; }
-    if (i.op == Op::Jump) { line("j " + label(i.target)); return; }
-    if (i.op == Op::Branch) {
-      auto test = read(i.args[0], "t0"); line("bnez " + test + ", " + label(i.target)); line("j " + label(i.otherwise)); return;
+    if (i.op == Op::Call) { scratchConstant.reset(); call(i); return; }
+    if (i.op == Op::Jump) { if (i.target != currentBlock + 1) line("j " + label(i.target)); return; }
+    if (i.op == Op::Branch || i.op == Op::BranchCompare) {
+      bool fused = i.op == Op::BranchCompare;
+      bool inverse = i.target == currentBlock + 1;
+      int taken = inverse ? i.otherwise : i.target, fall = inverse ? i.target : i.otherwise;
+      if (fused) {
+        auto a = read(i.args[0], "t0"), b = read(i.args[1], "t1");
+        std::string op;
+        switch (static_cast<Op>(i.immediate)) {
+        case Op::Eq: op = inverse ? "bne" : "beq"; break;
+        case Op::Ne: op = inverse ? "beq" : "bne"; break;
+        case Op::Lt: op = inverse ? "bge" : "blt"; break;
+        case Op::Ge: op = inverse ? "blt" : "bge"; break;
+        case Op::Gt: op = inverse ? "bge" : "blt"; std::swap(a,b); break;
+        default: op = inverse ? "blt" : "bge"; std::swap(a,b); break;
+        }
+        line(op + " " + a + ", " + b + ", " + label(taken));
+      } else {
+        auto test = read(i.args[0], "t0"); line(std::string(inverse ? "beqz " : "bnez ") + test + ", " + label(taken));
+      }
+      if (fall != currentBlock + 1) line("j " + label(fall));
+      return;
     }
     if (i.op == Op::Return) {
-      if (!i.args.empty()) { auto type = function->values[i.args[0]]; move(fp(type) ? "fa0" : "a0", read(i.args[0], fp(type) ? "ft0" : "t0"), type); }
-      line("j .L" + std::to_string(functionId) + "_return"); return;
+      if (!i.args.empty()) { auto type = function->values[i.args[0]]; std::string dst = fp(type) ? "fa0" : "a0"; move(dst, read(i.args[0], dst), type); }
+      if (allocation.frame == 0) line("ret");
+      else line("j .L" + std::to_string(functionId) + "_return");
+      return;
     }
     if (i.op == Op::Zero) {
       if (i.immediate == 0) return;
@@ -258,13 +416,16 @@ class Assembly {
     } else if (i.op == Op::Neg) line(std::string(fp(type) ? "fneg.s " : "negw ") + dst + ", " + a);
     else {
       auto bType = function->values[i.args[1]];
-      auto b = read(i.args[1], fp(bType) ? "ft1" : "t1");
+      if (integerImmediate(i, dst, a)) { finish(i.result, dst); return; }
+      auto constant = allocation.original[i.args[1]];
+      bool immediate = i.op == Op::Offset && constant && constant->op == Op::Constant;
+      auto b = immediate ? std::string() : read(i.args[1], fp(bType) ? "ft1" : "t1");
       if (i.op == Op::Offset) {
-        auto def = allocation.definitions[i.args[1]];
+        auto def = allocation.original[i.args[1]];
         if (def && def->op == Op::Constant) {
           int64_t delta = def->immediate * i.immediate;
           if (small(delta)) line("addi " + dst + ", " + a + ", " + std::to_string(delta));
-          else { line("li t2, " + std::to_string(delta)); line("add " + dst + ", " + a + ", t2"); }
+          else { literalT2(delta); line("add " + dst + ", " + a + ", t2"); }
         } else if (i.immediate == 0) move(dst, a, type);
         else {
           if ((i.immediate & (i.immediate - 1)) == 0) {
@@ -272,6 +433,7 @@ class Assembly {
             line("slli t2, " + b + ", " + std::to_string(shift));
           } else { line("li t2, " + std::to_string(i.immediate)); line("mul t2, " + b + ", t2"); }
           line("add " + dst + ", " + a + ", t2");
+          scratchConstant.reset();
         }
       } else if (i.op >= Op::Eq && i.op <= Op::Ge) {
         if (fp(aType)) {
@@ -304,22 +466,26 @@ class Assembly {
     for (const auto &p : f.source->parameters) types.push_back(p.symbol->type.array() ? ValueType::Pointer : p.base == Base::Float ? ValueType::Float : ValueType::Int);
     incoming = arguments(types, types.size());
     out << "\n.text\n.p2align 2\n.globl " << f.source->name << "\n.type " << f.source->name << ", @function\n" << f.source->name << ":\n";
-    if (small(-allocation.frame)) line("addi sp, sp, " + std::to_string(-allocation.frame));
+    if (allocation.frame == 0) {}
+    else if (small(-allocation.frame)) line("addi sp, sp, " + std::to_string(-allocation.frame));
     else { line("li t6, " + std::to_string(allocation.frame)); line("sub sp, sp, t6"); }
     int64_t offset = allocation.saves;
-    memory("sd", "ra", offset); offset += 8;
+    if (!allocation.leaf) { memory("sd", "ra", offset); offset += 8; }
     for (int r : allocation.integers) { memory("sd", "s" + std::to_string(r), offset); offset += 8; }
     for (int r : allocation.floats) { memory("fsd", "fs" + std::to_string(r), offset); offset += 8; }
     for (size_t b = 0; b < f.blocks.size(); ++b) {
+      currentBlock = b;
+      scratchConstant.reset();
       out << label(b) << ":\n";
       for (const auto &i : f.blocks[b].instructions) instruction(i);
     }
     out << ".L" << functionId << "_return:\n";
     offset = allocation.saves;
-    memory("ld", "ra", offset); offset += 8;
+    if (!allocation.leaf) { memory("ld", "ra", offset); offset += 8; }
     for (int r : allocation.integers) { memory("ld", "s" + std::to_string(r), offset); offset += 8; }
     for (int r : allocation.floats) { memory("fld", "fs" + std::to_string(r), offset); offset += 8; }
-    if (small(allocation.frame)) line("addi sp, sp, " + std::to_string(allocation.frame));
+    if (allocation.frame == 0) {}
+    else if (small(allocation.frame)) line("addi sp, sp, " + std::to_string(allocation.frame));
     else { line("li t6, " + std::to_string(allocation.frame)); line("add sp, sp, t6"); }
     line("ret"); out << ".size " << f.source->name << ", .-" << f.source->name << '\n';
     for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.op == Op::String) {
@@ -349,11 +515,25 @@ public:
   void run() {
     out << ".option nopic\n.attribute arch, \"rv64gc\"\n";
     for (const auto &item : module.source->items) for (const auto &v : item.variables) global(v);
-    for (const auto &f : module.functions) { emitFunction(f); ++functionId; }
+    for (auto f : module.functions) { destroySSA(f); selectInstructions(f); layoutBlocks(f); emitFunction(f); ++functionId; }
     out << ".section .note.GNU-stack,\"\",@progbits\n";
   }
 };
 } // namespace
 
 void emitAssembly(const ModuleIR &module, std::ostream &out) { Assembly(module, out).run(); }
+void selectInstructions(FunctionIR &f) {
+  std::vector<int> uses(f.values.size(), 0);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) for (int a : i.args) ++uses[a];
+  for (auto &b : f.blocks) {
+    auto &code = b.instructions;
+    if (code.size() < 2 || code.back().op != Op::Branch) continue;
+    const auto compare = code[code.size()-2];
+    if (compare.op >= Op::Eq && compare.op <= Op::Ge && compare.result == code.back().args[0] &&
+        uses[compare.result] == 1 && !fp(f.values[compare.args[0]])) {
+      code.back().op = Op::BranchCompare; code.back().args = compare.args; code.back().immediate = static_cast<int>(compare.op);
+      code.erase(code.end()-2);
+    }
+  }
+}
 } // namespace sysy

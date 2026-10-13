@@ -144,14 +144,25 @@ class Lowering {
         current = no; store(address(temp), constant(Number::fromInt(0))); jump(end);
         current = end; return value(Op::Load, ValueType::Int, {address(temp)});
       }
-      const auto &a = *e.operands[0], &b = *e.operands[1];
-      Base common = a.type.base == Base::Float || b.type.base == Base::Float ? Base::Float : Base::Int;
-      int x = convertValue(expression(a), a.type.base, common);
-      int y = convertValue(expression(b), b.type.base, common);
       static const std::unordered_map<std::string, Op> ops = {
           {"+", Op::Add}, {"-", Op::Sub}, {"*", Op::Mul}, {"/", Op::Div}, {"%", Op::Rem},
           {"==", Op::Eq}, {"!=", Op::Ne}, {"<", Op::Lt}, {"<=", Op::Le}, {">", Op::Gt}, {">=", Op::Ge}};
-      return value(ops.at(e.text), valueType(e.type.base), {x, y});
+      // Preserve evaluation order without a recursive frame per left-associative
+      // operator: large generated expressions can contain thousands of terms.
+      std::vector<const Expr *> chain;
+      const Expr *cursor = &e;
+      while (cursor->kind == Expr::Kind::Binary && !cursor->constant && cursor->text != "&&" && cursor->text != "||") {
+        chain.push_back(cursor); cursor = cursor->operands[0].get();
+      }
+      int accumulated = expression(*cursor);
+      for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        const auto &op = **it, &a = *op.operands[0], &b = *op.operands[1];
+        Base common = a.type.base == Base::Float || b.type.base == Base::Float ? Base::Float : Base::Int;
+        int x = convertValue(accumulated, a.type.base, common);
+        int y = convertValue(expression(b), b.type.base, common);
+        accumulated = value(ops.at(op.text), valueType(op.type.base), {x, y});
+      }
+      return accumulated;
     }
     }
     throw std::logic_error("unknown expression");
@@ -205,7 +216,7 @@ public:
     module.source = &program;
     for (const auto &item : program.items) {
       if (!item.function) continue;
-      module.functions.push_back({item.function.get(), {}, {}, {}}); function = &module.functions.back();
+      module.functions.push_back({item.function.get(), {}, {}, {}, {}, false}); function = &module.functions.back();
       parameters.clear(); current = block("entry");
       int index = 0;
       for (const auto &v : item.function->parameters) {
@@ -225,7 +236,7 @@ public:
   }
 };
 
-bool pure(Op op) { return op != Op::Store && op != Op::Zero && op != Op::Call && op != Op::Jump && op != Op::Branch && op != Op::Return; }
+bool pure(Op op) { return op != Op::Store && op != Op::Zero && op != Op::Call && op != Op::Jump && op != Op::Branch && op != Op::Return && op != Op::BranchCompare; }
 
 void prune(FunctionIR &f) {
   std::vector<bool> seen(f.blocks.size(), false); std::queue<int> pending; pending.push(0); seen[0] = true;
@@ -240,6 +251,13 @@ void prune(FunctionIR &f) {
   for (auto &b : blocks) for (auto &i : b.instructions) {
     if (i.target >= 0) i.target = ids[i.target];
     if (i.otherwise >= 0) i.otherwise = ids[i.otherwise];
+    if (i.op == Op::Phi) {
+      std::vector<int> args, edges;
+      for (size_t n = 0; n < i.edges.size(); ++n) if (ids[i.edges[n]] >= 0) {
+        args.push_back(i.args[n]); edges.push_back(ids[i.edges[n]]);
+      }
+      i.args = std::move(args); i.edges = std::move(edges);
+    }
   }
   f.blocks = std::move(blocks);
 }
@@ -255,6 +273,7 @@ void promote(FunctionIR &f) {
   std::unordered_map<const Symbol *, int> homes;
   for (const auto *s : f.objects) if (!s->type.array() && !escaped.count(s)) {
     int id = f.values.size(); f.values.push_back(valueType(s->type.base)); homes[s] = id;
+    f.variables.push_back(id);
   }
   for (auto &b : f.blocks) for (auto &i : b.instructions) if (i.op == Op::Load || i.op == Op::Store) {
     auto def = definitions[i.args[0]];
@@ -284,16 +303,26 @@ void eliminateDead(FunctionIR &f) {
 
 ModuleIR lower(const ProgramIR &program) { return Lowering().run(program); }
 void optimize(ModuleIR &module, int level) {
-  runPasses(module, level > 0 ? "prune,promote,dce" : "prune");
+  if (level == 0) runPasses(module, "prune");
+  else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact");
+  else runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,licm,gvn,simplify,dce,strength,gvn,simplify,sccp,prune,dce,compact");
 }
 void runPasses(ModuleIR &module, const std::string &pipeline) {
   size_t start = 0;
   while (start < pipeline.size()) {
     size_t comma = pipeline.find(',', start);
     auto name = pipeline.substr(start, comma == std::string::npos ? comma : comma - start);
+    if (runAdvancedPass(module, name)) {
+      verify(module);
+      if (comma == std::string::npos) break;
+      start = comma + 1; continue;
+    }
     for (auto &f : module.functions) {
       if (name == "prune") prune(f);
-      else if (name == "promote") promote(f);
+      else if (name == "promote") {
+        if (f.ssa) throw std::runtime_error("promote must precede SSA construction");
+        promote(f);
+      }
       else if (name == "dce") eliminateDead(f);
       else throw std::runtime_error("unknown IR pass: " + name);
     }
@@ -316,7 +345,7 @@ void verify(const ModuleIR &module) {
         switch (i.op) {
         case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Convert: case Op::Branch: arity = 1; break;
         case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem:
-        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: arity = 2; break;
+        case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::BranchCompare: arity = 2; break;
         case Op::Call:
           require(i.callee != nullptr, "IR call has no callee");
           arity = i.args.size();
@@ -329,6 +358,13 @@ void verify(const ModuleIR &module) {
           require(i.callee->result == Base::Void ? i.result == -1 : i.result >= 0, "IR call result mismatch");
           break;
         case Op::Return: arity = f.source->result == Base::Void ? 0 : 1; break;
+        case Op::Phi:
+          arity = i.edges.size(); require(f.ssa, "IR phi outside SSA form");
+          for (size_t a = 0; a < arity; ++a) {
+            require(i.edges[a] >= 0 && i.edges[a] < static_cast<int>(f.blocks.size()), "IR phi edge is out of range");
+            require(f.values[i.args[a]] == f.values[i.result], "IR phi type mismatch");
+          }
+          break;
         default: break;
         }
         require(i.args.size() == arity, "IR instruction arity mismatch");
@@ -345,6 +381,8 @@ void verify(const ModuleIR &module) {
         }
         if (i.op == Op::Offset) require(a(1) == ValueType::Int && f.values[i.result] == ValueType::Pointer, "IR offset type mismatch");
         if (i.op == Op::Branch) require(a(0) == ValueType::Int, "IR branch condition must be int");
+        if (i.op == Op::BranchCompare) require(a(0) == ValueType::Int && a(1) == ValueType::Int &&
+            i.immediate >= static_cast<int>(Op::Eq) && i.immediate <= static_cast<int>(Op::Ge), "IR branch comparison type mismatch");
         if (i.op == Op::Return && arity) require(a(0) == valueType(f.source->result), "IR return type mismatch");
         if (i.op >= Op::Add && i.op <= Op::Rem) {
           require(a(0) == a(1) && a(0) == f.values[i.result], "IR arithmetic type mismatch");
@@ -353,19 +391,20 @@ void verify(const ModuleIR &module) {
         }
         if (i.op >= Op::Eq && i.op <= Op::Ge)
           require(a(0) == a(1) && f.values[i.result] == ValueType::Int, "IR comparison type mismatch");
-        bool terminal = i.op == Op::Jump || i.op == Op::Branch || i.op == Op::Return;
+        bool terminal = i.op == Op::Jump || i.op == Op::Branch || i.op == Op::BranchCompare || i.op == Op::Return;
         if (terminal != (n + 1 == b.instructions.size())) throw std::logic_error("IR terminator is misplaced");
-        if ((i.op == Op::Jump || i.op == Op::Branch) && (i.target < 0 || i.target >= static_cast<int>(f.blocks.size())))
+        if ((i.op == Op::Jump || i.op == Op::Branch || i.op == Op::BranchCompare) && (i.target < 0 || i.target >= static_cast<int>(f.blocks.size())))
           throw std::logic_error("IR branch target is out of range");
-        if (i.op == Op::Branch && (i.otherwise < 0 || i.otherwise >= static_cast<int>(f.blocks.size())))
+        if ((i.op == Op::Branch || i.op == Op::BranchCompare) && (i.otherwise < 0 || i.otherwise >= static_cast<int>(f.blocks.size())))
           throw std::logic_error("IR false target is out of range");
       }
     }
+    if (f.ssa) verifySSA(f);
   }
 }
 void printIR(const ModuleIR &module, std::ostream &out) {
   static const char *ops[] = {"constant", "address", "string", "parameter", "move", "load", "store", "offset", "zero",
-      "add", "sub", "mul", "div", "rem", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return"};
+      "add", "sub", "mul", "div", "rem", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare"};
   static const char *types[] = {"i32", "f32", "ptr", "f64"};
   for (const auto &f : module.functions) {
     out << "function " << f.source->name << " {\n";
@@ -378,6 +417,7 @@ void printIR(const ModuleIR &module, std::ostream &out) {
         if (i.symbol) out << ' ' << i.symbol->name;
         if (i.callee) out << ' ' << i.callee->linkageName;
         for (int arg : i.args) out << " %" << arg;
+        for (int edge : i.edges) out << " from b" << edge;
         if (i.op == Op::Constant || i.op == Op::Parameter || i.op == Op::Offset || i.op == Op::Zero || i.op == Op::Address) out << ' ' << i.immediate;
         if (i.op == Op::String) out << ' ' << std::quoted(i.text);
         if (i.target >= 0) out << " b" << i.target;

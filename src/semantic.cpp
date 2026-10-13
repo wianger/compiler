@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -32,6 +33,10 @@ Number convert(Number value, Base type, Location loc) {
 }
 
 namespace {
+Number arithmeticFloat(float value) {
+  if (std::isnan(value)) { uint32_t canonical = 0x7fc00000; std::memcpy(&value, &canonical, 4); }
+  return Number::fromFloat(value);
+}
 Number literal(const Expr &e) {
   std::string text = e.text;
   bool hexadecimal = text.size() > 1 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
@@ -56,10 +61,10 @@ std::optional<Number> binary(const std::string &op, Number a, Number b, Location
   if (op == "||") return Number::fromInt(a.truth() || b.truth());
   if (a.base == Base::Float || b.base == Base::Float) {
     float x = convert(a, Base::Float, loc).floating, y = convert(b, Base::Float, loc).floating;
-    if (op == "+") return Number::fromFloat(x + y);
-    if (op == "-") return Number::fromFloat(x - y);
-    if (op == "*") return Number::fromFloat(x * y);
-    if (op == "/") return Number::fromFloat(x / y);
+    if (op == "+") return arithmeticFloat(x + y);
+    if (op == "-") return arithmeticFloat(x - y);
+    if (op == "*") return arithmeticFloat(x * y);
+    if (op == "/") return arithmeticFloat(x / y);
     if (op == "==") return Number::fromInt(x == y);
     if (op == "!=") return Number::fromInt(x != y);
     if (op == "<") return Number::fromInt(x < y);
