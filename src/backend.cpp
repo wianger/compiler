@@ -1,10 +1,11 @@
-#include "machine_ir.hpp"
+#include "target_ir.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <set>
 #include <unordered_set>
 
@@ -30,9 +31,9 @@ std::vector<Argument> arguments(const std::vector<ValueType> &types, size_t name
 
 struct Allocation {
   std::vector<int> registers;
-  std::vector<int64_t> spills;
-  std::vector<const Instruction *> definitions;
-  std::vector<const Instruction *> original;
+  std::vector<int64_t> spills, slots;
+  std::vector<const MachineInstruction *> definitions;
+  std::vector<const MachineInstruction *> original;
   std::vector<int> uses;
   std::unordered_map<const Symbol *, int64_t> objects;
   std::set<int> integers, floats;
@@ -40,13 +41,13 @@ struct Allocation {
   bool leaf = true;
 };
 
-Allocation allocate(const FunctionIR &f) {
+Allocation allocate(const MachineFunction &f) {
   const size_t count = f.values.size(), blocks = f.blocks.size();
   Allocation result;
   result.registers.assign(count, -1); result.spills.assign(count, -1); result.definitions.assign(count, nullptr);
   std::vector<int> definitionCount(count, 0);
   std::vector<int> sites(count, 0);
-  auto depth = loopDepth(f);
+  const auto &depth = f.depth;
   std::vector<double> weight(count, 0);
   std::vector<std::unordered_set<int>> use(blocks), def(blocks), in(blocks), out(blocks);
   for (size_t b = 0; b < blocks; ++b) {
@@ -70,9 +71,9 @@ Allocation allocate(const FunctionIR &f) {
   for (size_t b = 0; b < blocks; ++b) for (const auto &i : f.blocks[b].instructions) for (int a : i.args) {
     const auto *source = result.original[a];
     if (!source || depth[b] <= depth[sites[a]]) continue;
-    if (source->op == Op::Address && i.op == Op::Offset) cached[a] = true;
+    if (source->op == Op::Address && i.op == Op::Target) cached[a] = true;
     if (source->op == Op::Constant && source->immediate != 0 &&
-        (fp(f.values[a]) || (!small(source->immediate) && i.op >= Op::Eq && i.op <= Op::Ge))) cached[a] = true;
+        (fp(f.values[a]) || (!small(source->immediate) && i.op == Op::BranchCompare))) cached[a] = true;
   }
   for (size_t v = 0; v < count; ++v) {
     const auto *i = result.definitions[v];
@@ -95,12 +96,25 @@ Allocation allocate(const FunctionIR &f) {
   } while (changed);
   std::vector<std::unordered_set<int>> interference(count);
   std::vector<std::vector<int>> hints(count);
-  std::vector<bool> crossesCall(count, false);
+  std::vector<uint32_t> forbidden(count,0);
+  using Range = std::pair<int,int>;
+  std::vector<std::vector<Range>> ranges(count);
+  int blockStart = 0;
   for (size_t b = 0; b < blocks; ++b) {
     auto live = out[b];
+    int blockEnd = blockStart + 2*f.blocks[b].instructions.size();
+    std::map<int,int> ends;
+    for (int v : live) if (tracked(v)) ends[v] = blockEnd;
+    int point = blockEnd;
     for (auto it = f.blocks[b].instructions.rbegin(); it != f.blocks[b].instructions.rend(); ++it) {
-      const auto &i = *it;
-      if (i.op == Op::Call) for (int v : live) if (v != i.result) crossesCall[v] = true;
+      const auto &i = *it; point -= 2;
+      if (i.result >= 0 && tracked(i.result)) {
+        auto end = ends.find(i.result);
+        ranges[i.result].push_back({point+1,end == ends.end() ? point+2 : end->second});
+        if (end != ends.end()) ends.erase(end);
+      }
+      for (int a : i.args) if (tracked(a) && !ends.count(a)) ends[a] = point+1;
+      for (int v : live) if (v != i.result) forbidden[v] |= fp(f.values[v]) ? i.floatClobbers : i.integerClobbers;
       if (i.result >= 0 && tracked(i.result)) {
         int source = i.op == Op::Move ? i.args[0] : -1;
         if (source >= 0 && tracked(source)) { hints[i.result].push_back(source); hints[source].push_back(i.result); }
@@ -111,7 +125,26 @@ Allocation allocate(const FunctionIR &f) {
       }
       for (int v : i.args) if (tracked(v)) live.insert(v);
     }
+    for (auto [v,end] : ends) ranges[v].push_back({blockStart,end});
+    blockStart = blockEnd;
   }
+  auto normalize = [](std::vector<Range> &list) {
+    std::sort(list.begin(),list.end()); std::vector<Range> merged;
+    for (auto r : list) {
+      if (!merged.empty() && r.first <= merged.back().second) merged.back().second = std::max(r.second,merged.back().second);
+      else merged.push_back(r);
+    }
+    list = std::move(merged);
+  };
+  for (auto &list : ranges) normalize(list);
+  auto intersectRanges = [](const std::vector<Range> &a, const std::vector<Range> &b) {
+    size_t x = 0, y = 0;
+    while (x < a.size() && y < b.size()) {
+      if (a[x].first < b[y].second && b[y].first < a[x].second) return true;
+      if (a[x].second <= b[y].second) ++x; else ++y;
+    }
+    return false;
+  };
   std::vector<ValueType> parameterTypes;
   for (const auto &p : f.source->parameters) parameterTypes.push_back(p.symbol->type.array() ? ValueType::Pointer : p.base == Base::Float ? ValueType::Float : ValueType::Int);
   auto incoming = arguments(parameterTypes, parameterTypes.size());
@@ -123,7 +156,7 @@ Allocation allocate(const FunctionIR &f) {
     return a.reg + (fp(f.values[v]) ? 21 : 13);
   };
   auto allowed = [&](int v, int r) {
-    if (r >= 12 && crossesCall[v]) return false;
+    if (forbidden[v] & (uint32_t{1} << r)) return false;
     const auto *i = result.original[v];
     if (i && i->op == Op::Parameter && r >= (fp(f.values[v]) ? 21 : 13) && r != preferred(v)) return false;
     return true;
@@ -157,31 +190,55 @@ Allocation allocate(const FunctionIR &f) {
       conflicts[a] = std::move(neighbors); conflicts[b].clear();
       for (int v : conflicts[a]) { conflicts[v].erase(b); conflicts[v].insert(a); }
     }
-    std::vector<int> degree(count), order;
-    for (int v : pending) degree[v] = conflicts[v].size();
-    while (!pending.empty()) {
-      int selected = -1; double cheapest = std::numeric_limits<double>::infinity();
-      for (int v : pending) {
-        int available = population(masks[v]);
-        if (degree[v] < available) { selected = v; break; }
-        double cost = weight[v] / std::max(1, degree[v]);
-        if (cost < cheapest) { cheapest = cost; selected = v; }
-      }
-      pending.erase(selected); order.push_back(selected);
-      for (int v : conflicts[selected]) if (pending.count(v)) --degree[v];
+    // Allocate precise ranges in priority order. Coalesced values form bundles;
+    // evict cheaper bundles and retry with a bounded number of attempts.
+    std::vector<std::vector<Range>> bundles(count);
+    for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v)) {
+      auto &bundle = bundles[leader(v)]; bundle.insert(bundle.end(),ranges[v].begin(),ranges[v].end());
     }
-    for (auto it = order.rbegin(); it != order.rend(); ++it) {
-      int v = *it; std::set<int> occupied;
-      for (int neighbor : conflicts[v]) if (result.registers[neighbor] >= 0) occupied.insert(result.registers[neighbor]);
-      auto choose = [&](int r) { if (r >= 0 && r < colors && (masks[v] & (uint32_t{1} << r)) && !occupied.count(r)) { result.registers[v] = r; return true; } return false; };
-      if (choose(preferred(v))) continue;
-      bool chosen = false;
-      for (int hint : hints[v]) if (choose(result.registers[leader(hint)])) { chosen = true; break; }
-      if (chosen) continue;
-      for (int r = 12; r < colors && !chosen; ++r) chosen = choose(r);
-      for (int r = 0; r < 12 && !chosen; ++r) chosen = choose(r);
+    std::vector<double> priority(count,0);
+    std::vector<int> attempts(count,0);
+    std::vector<std::set<int>> occupants(colors);
+    std::priority_queue<std::pair<double,int>> work;
+    for (int v : pending) {
+      normalize(bundles[v]); size_t length = 0;
+      for (auto r : bundles[v]) length += r.second-r.first;
+      priority[v] = weight[v]/std::sqrt(double(std::max<size_t>(1,length)));
+      work.push({priority[v],v});
+    }
+    while (!work.empty()) {
+      int v = work.top().second; work.pop(); ++attempts[v];
+      std::vector<int> order;
+      auto append = [&](int r) { if (r >= 0 && r < colors && std::find(order.begin(),order.end(),r) == order.end()) order.push_back(r); };
+      append(preferred(v));
+      for (int hint : hints[v]) append(result.registers[leader(hint)]);
+      for (int r = 12; r < colors; ++r) append(r);
+      for (int r = 0; r < 12; ++r) append(r);
+      int chosen = -1; double cheapest = std::numeric_limits<double>::infinity(); std::vector<int> victims;
+      for (int r : order) {
+        if (!(masks[v] & (uint32_t{1} << r))) continue;
+        double cost = 0; std::vector<int> conflictsHere;
+        for (int other : occupants[r]) if (intersectRanges(bundles[v],bundles[other])) {
+          conflictsHere.push_back(other);
+          cost += attempts[other] >= 3 ? std::numeric_limits<double>::infinity() : priority[other];
+        }
+        if (cost == 0) { chosen = r; victims.clear(); break; }
+        if (cost < cheapest && cost*1.25 < priority[v]) { cheapest = cost; chosen = r; victims = std::move(conflictsHere); }
+      }
+      if (chosen < 0) continue;
+      for (int other : victims) {
+        occupants[chosen].erase(other); result.registers[other] = -1; work.push({priority[other],other});
+      }
+      occupants[chosen].insert(v); result.registers[v] = chosen;
     }
     for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v)) result.registers[v] = result.registers[leader(v)];
+  }
+  // Check allocation against independently constructed interference and ABI
+  // masks, rather than trusting the interval allocator's own overlap queries.
+  for (size_t v = 0; v < count; ++v) if (result.registers[v] >= 0) {
+    if (!allowed(v,result.registers[v])) throw std::logic_error("allocation violates ABI mask");
+    for (int other : interference[v]) if (result.registers[other] == result.registers[v])
+      throw std::logic_error("allocation gives interfering values the same register");
   }
   int64_t offset = 0;
   for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.op == Op::Call) {
@@ -190,6 +247,8 @@ Allocation allocate(const FunctionIR &f) {
     auto abi = arguments(types, i.callee->timer ? 1 : i.callee->parameters.size());
     for (auto a : abi) if (a.reg < 0) offset = std::max(offset, a.offset + 8);
   }
+  offset = align(offset,8);
+  for (auto type : f.slots) { (void)type; result.slots.push_back(offset); offset += 8; }
   for (auto s : f.objects) { offset = align(offset, 4); result.objects[s] = offset; offset += s->type.elements() * 4; }
   offset = align(offset, 8);
   for (size_t v = 0; v < count; ++v) {
@@ -202,23 +261,122 @@ Allocation allocate(const FunctionIR &f) {
   return result;
 }
 
+// Split spilled live ranges into instruction-local fragments. Values passed to
+// ABI call pseudos are left intact: all their arguments are simultaneous uses.
+bool splitSpills(MachineFunction &f, const Allocation &allocation) {
+  std::set<int> excluded, selected;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.op == Op::Call)
+    excluded.insert(i.args.begin(),i.args.end());
+  for (size_t b = 0; b < f.blocks.size(); ++b) if (f.depth[b] > 0)
+    for (const auto &i : f.blocks[b].instructions) for (int v : i.args)
+      if (allocation.spills[v] >= 0 && !excluded.count(v) && selected.size() < 16) selected.insert(v);
+  if (selected.empty()) return false;
+  std::map<int,int> slots;
+  for (int v : selected) { slots[v] = f.slots.size(); f.slots.push_back(f.values[v]); }
+  auto fresh = [&](int v) { int id = f.values.size(); f.values.push_back(f.values[v]); return id; };
+  for (auto &b : f.blocks) {
+    std::vector<MachineInstruction> code;
+    for (auto i : b.instructions) {
+      std::map<int,int> reloaded;
+      for (int &a : i.args) if (slots.count(a)) {
+        int original = a;
+        if (!reloaded.count(a)) {
+          int id = fresh(a); MachineInstruction reload{Op::SpillLoad}; reload.result = id; reload.immediate = slots.at(a);
+          code.push_back(std::move(reload)); reloaded[a] = id;
+        }
+        a = reloaded.at(original);
+      }
+      int original = i.result;
+      if (slots.count(original)) i.result = fresh(original);
+      int produced = i.result; code.push_back(std::move(i));
+      if (slots.count(original)) {
+        MachineInstruction save{Op::SpillStore}; save.args = {produced}; save.immediate = slots.at(original); code.push_back(std::move(save));
+      }
+    }
+    b.instructions = std::move(code);
+  }
+  return true;
+}
+
+// Independent must-dataflow checker: a location records which current virtual
+// values it contains. At joins only facts true on every predecessor survive.
+// This verifies copy/coalescing, spill locations and call clobbers symbolically.
+void checkAllocation(const MachineFunction &f, const Allocation &a) {
+  using State = std::map<int,std::set<int>>;
+  auto location = [&](int v) {
+    if (a.definitions[v]) return -1;
+    if (a.registers[v] >= 0) return a.registers[v]+(fp(f.values[v]) ? 21 : 0);
+    return a.spills[v] >= 0 ? 50+v : -1;
+  };
+  auto slot = [&](int n) { return 50+static_cast<int>(f.values.size())+n; };
+  std::vector<std::vector<int>> pred(f.blocks.size());
+  for (size_t b = 0; b < f.blocks.size(); ++b) {
+    const auto &i = f.blocks[b].instructions.back();
+    for (int t : {i.target,i.otherwise}) if (t >= 0) pred[t].push_back(b);
+  }
+  std::vector<std::optional<State>> in(f.blocks.size()), out(f.blocks.size());
+  auto transfer = [&](size_t b, State state, bool check) {
+    for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
+      const auto &i = f.blocks[b].instructions[n]; std::set<int> source;
+      for (size_t p = 0; p < i.args.size(); ++p) {
+        int v = i.args[p], loc = location(v); auto aliases = loc < 0 ? std::set<int>{v} : state[loc];
+        if (check && !aliases.count(v)) throw std::logic_error("allocation lost %"+std::to_string(v)+" in "+f.source->name+" b"+std::to_string(b)+"."+std::to_string(n));
+        if (!p) source = std::move(aliases);
+      }
+      for (int r = 0; r < 29; ++r) {
+        if (r < 21 && (i.integerClobbers & (uint32_t{1} << r))) state.erase(r);
+        if (i.floatClobbers & (uint32_t{1} << r)) state.erase(21+r);
+      }
+      if (i.op == Op::SpillStore) state[slot(i.immediate)] = source;
+      if (i.result >= 0 && location(i.result) >= 0) {
+        if (i.op == Op::SpillLoad) source = state[slot(i.immediate)];
+        for (auto &entry : state) entry.second.erase(i.result);
+        source.erase(i.result);
+        std::set<int> contents;
+        if (i.op == Op::Move || i.op == Op::SpillLoad) contents = std::move(source);
+        contents.insert(i.result); state[location(i.result)] = std::move(contents);
+      }
+      for (auto it = state.begin(); it != state.end();) if (it->second.empty()) it = state.erase(it); else ++it;
+    }
+    return state;
+  };
+  bool changed;
+  do {
+    changed = false;
+    for (size_t b = 0; b < f.blocks.size(); ++b) {
+      std::optional<State> state;
+      if (!b) state = State{};
+      else for (int p : pred[b]) if (out[p]) {
+        if (!state) { state = *out[p]; continue; }
+        for (auto it = state->begin(); it != state->end();) {
+          auto other = out[p]->find(it->first);
+          if (other == out[p]->end()) { it = state->erase(it); continue; }
+          std::set<int> common;
+          std::set_intersection(it->second.begin(),it->second.end(),other->second.begin(),other->second.end(),std::inserter(common,common.end()));
+          if (common.empty()) it = state->erase(it); else { it->second = std::move(common); ++it; }
+        }
+      }
+      if (!state) continue;
+      auto next = transfer(b,*state,false); in[b] = std::move(state);
+      if (!out[b] || *out[b] != next) { out[b] = std::move(next); changed = true; }
+    }
+  } while (changed);
+  for (size_t b = 0; b < f.blocks.size(); ++b) if (in[b]) transfer(b,*in[b],true);
+}
+
 class Assembly {
   const ModuleIR &module;
   std::ostream &out;
-  const FunctionIR *function = nullptr;
+  Stats *stats;
+  bool check, dump;
+  const MachineFunction *function = nullptr;
   Allocation allocation;
   size_t functionId = 0;
   int privateLabel = 0;
   std::vector<Argument> incoming;
   int nextEmittedBlock = 0;
   std::vector<int> emissionTargets;
-  std::optional<int64_t> scratchConstant;
-
   void line(const std::string &text) { out << "\t" << text << '\n'; }
-  void literalT2(int64_t value) {
-    if (!scratchConstant || *scratchConstant != value) line("li t2, " + std::to_string(value));
-    scratchConstant = value;
-  }
   std::string label(int block) const { return ".L" + std::to_string(functionId) + "_b" + std::to_string(block); }
   std::string reg(int id) const {
     int r = allocation.registers[id];
@@ -278,7 +436,7 @@ class Assembly {
     auto type = function->values[id];
     memory(type == ValueType::Float ? "fsw" : type == ValueType::Double ? "fsd" : type == ValueType::Int ? "sw" : "sd", r, allocation.spills[id]);
   }
-  void loadStore(const Instruction &i) {
+  void loadStore(const MachineInstruction &i) {
     int ptr = i.args[0]; bool load = i.op == Op::Load;
     int data = load ? i.result : i.args[1]; auto type = function->values[data];
     std::string r = load ? destination(data) : read(data, fp(type) ? "ft1" : "t1");
@@ -289,7 +447,7 @@ class Assembly {
     else memory(op, r, 0, read(ptr, "t0"));
     if (load) finish(data, r);
   }
-  void parameter(const Instruction &i) {
+  void parameter(const MachineInstruction &i) {
     auto location = incoming.at(i.immediate); auto type = function->values[i.result];
     auto dst = destination(i.result);
     if (location.reg < 0) memory(type == ValueType::Float ? "flw" : type == ValueType::Pointer ? "ld" : "lw", dst, allocation.frame + location.offset);
@@ -297,7 +455,7 @@ class Assembly {
     else move(dst, (location.floating ? "fa" : "a") + std::to_string(location.reg), type);
     finish(i.result, dst);
   }
-  void call(const Instruction &i) {
+  void call(const MachineInstruction &i) {
     std::vector<ValueType> types;
     for (int arg : i.args) types.push_back(function->values[arg]);
     auto abi = arguments(types, i.callee->timer ? 1 : i.callee->parameters.size());
@@ -347,69 +505,16 @@ class Assembly {
       move(dst, fp(type) ? "fa0" : "a0", type); finish(i.result, dst);
     }
   }
-  bool integerImmediate(const Instruction &i, const std::string &dst, const std::string &a) {
-    if (i.args.size() != 2 || function->values[i.result] != ValueType::Int) return false;
-    auto constant = allocation.original[i.args[1]];
-    if (!constant || constant->op != Op::Constant) return false;
-    int32_t d = constant->immediate;
-    if (i.op == Op::And && small(d)) { line("andi " + dst + ", " + a + ", " + std::to_string(d)); return true; }
-    if (i.op == Op::Shr) { line("srliw " + dst + ", " + a + ", " + std::to_string(d & 31)); return true; }
-    if ((i.op == Op::Add && small(d)) || (i.op == Op::Sub && small(-static_cast<int64_t>(d)))) {
-      line("addiw " + dst + ", " + a + ", " + std::to_string(i.op == Op::Add ? d : -static_cast<int64_t>(d))); return true;
+  void instruction(const MachineInstruction &i) {
+    if (i.op == Op::SpillLoad || i.op == Op::SpillStore) {
+      int v = i.op == Op::SpillLoad ? i.result : i.args[0]; auto type = function->values[v];
+      bool load = i.op == Op::SpillLoad;
+      auto r = load ? destination(v) : read(v,fp(type) ? "ft0" : "t0");
+      memory(load ? (type == ValueType::Float ? "flw" : type == ValueType::Double ? "fld" : type == ValueType::Int ? "lw" : "ld") :
+                    (type == ValueType::Float ? "fsw" : type == ValueType::Double ? "fsd" : type == ValueType::Int ? "sw" : "sd"),r,allocation.slots.at(i.immediate));
+      if (load) finish(v,r);
+      return;
     }
-    uint64_t magnitude = d < 0 ? -static_cast<int64_t>(d) : d;
-    bool power = magnitude && (magnitude & (magnitude - 1)) == 0;
-    int shift = 0; if (power) for (auto n = magnitude; n > 1; n >>= 1) ++shift;
-    if (i.op == Op::Mul) {
-      if (d == 0) { move(dst, "zero", ValueType::Int); return true; }
-      if (power) {
-        if (shift) line("slliw " + dst + ", " + a + ", " + std::to_string(shift));
-        else move(dst, a, ValueType::Int);
-        if (d < 0 && shift != 31) line("negw " + dst + ", " + dst);
-        return true;
-      }
-      return false;
-    }
-    if ((i.op != Op::Div && i.op != Op::Rem) || d == 0) return false;
-    scratchConstant.reset();
-    if (power) {
-      if (shift == 0) {
-        if (i.op == Op::Rem) move(dst, "zero", ValueType::Int);
-        else if (d < 0) line("negw " + dst + ", " + a);
-        else move(dst, a, ValueType::Int);
-        return true;
-      }
-      line("sraiw t2, " + a + ", 31");
-      line("srliw t2, t2, " + std::to_string(32-shift));
-      line("addw t2, " + a + ", t2"); line("sraiw t2, t2, " + std::to_string(shift));
-      if (i.op == Op::Rem) { line("slliw t2, t2, " + std::to_string(shift)); line("subw " + dst + ", " + a + ", t2"); }
-      else if (d < 0) line("negw " + dst + ", t2");
-      else move(dst, "t2", ValueType::Int);
-      return true;
-    }
-    // Signed reciprocal multiplication. Generate the multiplier with integer
-    // remainders, then correct the high product to truncation toward zero.
-    uint64_t half = uint64_t{1} << 31, t = half + (d < 0);
-    uint64_t anchor = t - 1 - t % magnitude, q1 = half / anchor, r1 = half % anchor;
-    uint64_t q2 = half / magnitude, r2 = half % magnitude, delta;
-    int p = 31;
-    do {
-      ++p; q1 *= 2; r1 *= 2; if (r1 >= anchor) { ++q1; r1 -= anchor; }
-      q2 *= 2; r2 *= 2; if (r2 >= magnitude) { ++q2; r2 -= magnitude; }
-      delta = magnitude - r2;
-    } while (q1 < delta || (q1 == delta && r1 == 0));
-    uint32_t raw = q2 + 1; if (d < 0) raw = 0u - raw;
-    int32_t multiplier = raw;
-    line("li t2, " + std::to_string(multiplier)); line("mul t2, " + a + ", t2"); line("srai t2, t2, 32");
-    if (d > 0 && multiplier < 0) line("addw t2, t2, " + a);
-    if (d < 0 && multiplier > 0) line("subw t2, t2, " + a);
-    if (p > 32) line("sraiw t2, t2, " + std::to_string(p-32));
-    line("srliw t4, t2, 31"); line("addw t2, t2, t4");
-    if (i.op == Op::Rem) { line("li t4, " + std::to_string(d)); line("mulw t2, t2, t4"); line("subw " + dst + ", " + a + ", t2"); }
-    else move(dst, "t2", ValueType::Int);
-    return true;
-  }
-  void instruction(const Instruction &i) {
     if (i.op == Op::Constant || i.op == Op::Address || i.op == Op::String) {
       if (allocation.definitions[i.result]) return;
       auto dst = destination(i.result);
@@ -424,7 +529,7 @@ class Assembly {
     }
     if (i.op == Op::Parameter) { parameter(i); return; }
     if (i.op == Op::Load || i.op == Op::Store) { loadStore(i); return; }
-    if (i.op == Op::Call) { scratchConstant.reset(); call(i); return; }
+    if (i.op == Op::Call) { call(i); return; }
     if (i.op == Op::Jump) { int target = emissionTargets[i.target]; if (target != nextEmittedBlock) line("j " + label(target)); return; }
     if (i.op == Op::Branch || i.op == Op::BranchCompare) {
       bool fused = i.op == Op::BranchCompare;
@@ -466,62 +571,45 @@ class Assembly {
     auto type = function->values[i.result]; auto dst = destination(i.result);
     auto aType = function->values[i.args[0]];
     auto a = read(i.args[0], fp(aType) ? "ft0" : "t0");
-    if (i.op == Op::Move) move(dst, a, type);
-    else if (i.op == Op::Convert) {
-      if (type == ValueType::Int) line("fcvt.w.s " + dst + ", " + a + ", rtz");
-      else if (type == ValueType::Double) line("fcvt.d.s " + dst + ", " + a);
-      else line("fcvt.s.w " + dst + ", " + a);
-    } else if (i.op == Op::Neg) line(std::string(fp(type) ? "fneg.s " : "negw ") + dst + ", " + a);
+    if (i.op == Op::Move) move(dst,a,type);
     else {
-      auto bType = function->values[i.args[1]];
-      if (integerImmediate(i, dst, a)) { finish(i.result, dst); return; }
-      auto constant = allocation.original[i.args[1]];
-      bool immediate = i.op == Op::Offset && constant && constant->op == Op::Constant;
-      auto b = immediate ? std::string() : read(i.args[1], fp(bType) ? "ft1" : "t1");
-      if (i.op == Op::Offset) {
-        auto def = allocation.original[i.args[1]];
-        if (def && def->op == Op::Constant) {
-          int64_t delta = def->immediate * i.immediate;
-          if (small(delta)) line("addi " + dst + ", " + a + ", " + std::to_string(delta));
-          else { literalT2(delta); line("add " + dst + ", " + a + ", t2"); }
-        } else if (i.immediate == 0) move(dst, a, type);
-        else {
-          if ((i.immediate & (i.immediate - 1)) == 0) {
-            int shift = 0; for (int64_t n = i.immediate; n > 1; n >>= 1) ++shift;
-            line("slli t2, " + b + ", " + std::to_string(shift));
-          } else { line("li t2, " + std::to_string(i.immediate)); line("mul t2, " + b + ", t2"); }
-          line("add " + dst + ", " + a + ", t2");
-          scratchConstant.reset();
-        }
-      } else if (i.op >= Op::Eq && i.op <= Op::Ge) {
-        if (fp(aType)) {
-          if (i.op == Op::Eq || i.op == Op::Ne) line("feq.s " + dst + ", " + a + ", " + b);
-          else if (i.op == Op::Lt) line("flt.s " + dst + ", " + a + ", " + b);
-          else if (i.op == Op::Le) line("fle.s " + dst + ", " + a + ", " + b);
-          else if (i.op == Op::Gt) line("flt.s " + dst + ", " + b + ", " + a);
-          else line("fle.s " + dst + ", " + b + ", " + a);
-          if (i.op == Op::Ne) line("xori " + dst + ", " + dst + ", 1");
-        } else {
-          if (i.op == Op::Eq || i.op == Op::Ne) {
-            line("xor " + dst + ", " + a + ", " + b); line(std::string(i.op == Op::Eq ? "seqz " : "snez ") + dst + ", " + dst);
-          } else {
-            bool swap = i.op == Op::Gt || i.op == Op::Le;
-            line("slt " + dst + ", " + (swap ? b : a) + ", " + (swap ? a : b));
-            if (i.op == Op::Le || i.op == Op::Ge) line("xori " + dst + ", " + dst + ", 1");
-          }
-        }
-      } else if (i.op == Op::And || i.op == Op::Shr) {
-        line(std::string(i.op == Op::And ? "and " : "srlw ") + dst + ", " + a + ", " + b);
-      } else {
-        std::string op = i.op == Op::Add ? "add" : i.op == Op::Sub ? "sub" : i.op == Op::Mul ? "mul" : i.op == Op::Div ? "div" : "rem";
-        op = fp(type) ? "f" + op + ".s" : op + "w";
-        line(op + " " + dst + ", " + a + ", " + b);
+      std::string text = std::string(rvName(i.opcode)) + " " + dst + ", " + a;
+      if (i.args.size() == 2) text += ", " + read(i.args[1], fp(function->values[i.args[1]]) ? "ft1" : "t1");
+      switch (i.opcode) {
+      case RV::Addi: case RV::Addiw: case RV::Andi: case RV::Slli: case RV::Slliw:
+      case RV::Srliw: case RV::Srai: case RV::Sraiw: case RV::Xori: text += ", " + std::to_string(i.immediate); break;
+      case RV::FcvtWS: text += ", rtz"; break;
+      default: break;
       }
+      line(text);
     }
-    finish(i.result, dst);
+    finish(i.result,dst);
   }
-  void emitFunction(const FunctionIR &f) {
-    function = &f; allocation = allocate(f);
+
+  void emitFunction(MachineFunction &f) {
+    function = &f;
+    auto allocateNow = [&] { return allocate(f); };
+    allocation = stats ? stats->measure("allocation",allocateNow) : allocateNow();
+    if (splitSpills(f,allocation)) allocation = stats ? stats->measure("allocation.retry",allocateNow) : allocateNow();
+    verifyTarget(f);
+    if (check) { auto verify = [&] { checkAllocation(f,allocation); }; if (stats) stats->measure("allocation.check",verify); else verify(); }
+    if (stats) {
+      stats->count("machine.instructions",[&] { size_t n = 0; for (const auto &b : f.blocks) n += b.instructions.size(); return n; }());
+      stats->count("machine.values",f.values.size()); stats->count("allocation.split_slots",f.slots.size());
+      for (size_t v = 0; v < f.values.size(); ++v) if (allocation.spills[v] >= 0) stats->count("allocation.spills",1);
+    }
+    if (dump) {
+      out << "allocated " << f.source->name << " frame=" << allocation.frame << "\n";
+      for (size_t v = 0; v < f.values.size(); ++v) if (allocation.uses[v]) {
+        out << "  %" << v << " = ";
+        if (allocation.definitions[v]) out << "rematerialize";
+        else if (allocation.registers[v] >= 0) out << reg(v);
+        else out << "stack[" << allocation.spills[v] << ']';
+        out << '\n';
+      }
+      for (size_t n = 0; n < allocation.slots.size(); ++n) out << "  split.slot" << n << " = stack[" << allocation.slots[n] << "]\n";
+      return;
+    }
     emissionTargets.resize(f.blocks.size()); std::iota(emissionTargets.begin(), emissionTargets.end(), 0);
     std::vector<bool> neutral(f.blocks.size(), false);
     for (size_t b = 0; b < f.blocks.size(); ++b) {
@@ -553,7 +641,6 @@ class Assembly {
       if (emissionTargets[b] != static_cast<int>(b)) continue;
       nextEmittedBlock = b+1;
       while (nextEmittedBlock < static_cast<int>(f.blocks.size()) && emissionTargets[nextEmittedBlock] != nextEmittedBlock) ++nextEmittedBlock;
-      scratchConstant.reset();
       out << label(b) << ":\n";
       for (const auto &i : f.blocks[b].instructions) instruction(i);
     }
@@ -589,17 +676,18 @@ class Assembly {
     if (cursor < size) line(".zero " + std::to_string(size - cursor));
   }
 public:
-  Assembly(const ModuleIR &module, std::ostream &out) : module(module), out(out) {}
+  Assembly(const ModuleIR &module, std::ostream &out, Stats *stats, bool check, bool dump = false) : module(module), out(out), stats(stats), check(check), dump(dump) {}
   void run() {
-    out << ".option nopic\n.attribute arch, \"rv64gc\"\n";
-    for (const auto &item : module.source->items) for (const auto &v : item.variables) global(v);
-    for (auto f : module.functions) { destroySSA(f); selectInstructions(f); layoutBlocks(f); emitFunction(f); ++functionId; }
-    out << ".section .note.GNU-stack,\"\",@progbits\n";
+    if (!dump) out << ".option nopic\n.attribute arch, \"rv64gc\"\n";
+    if (!dump) for (const auto &item : module.source->items) for (const auto &v : item.variables) global(v);
+    for (const auto &source : module.functions) { auto select = [&] { return selectTarget(source); }; auto f = stats ? stats->measure("selection",select) : select(); emitFunction(f); ++functionId; }
+    if (!dump) out << ".section .note.GNU-stack,\"\",@progbits\n";
   }
 };
 } // namespace
 
-void emitAssembly(const ModuleIR &module, std::ostream &out) { Assembly(module, out).run(); }
+void emitAssembly(const ModuleIR &module, std::ostream &out, Stats *stats, bool check) { Assembly(module,out,stats,check).run(); }
+void printAllocated(const ModuleIR &module, std::ostream &out, Stats *stats, bool check) { Assembly(module,out,stats,check,true).run(); }
 void selectInstructions(FunctionIR &f) {
   std::vector<int> uses(f.values.size(), 0);
   for (const auto &b : f.blocks) for (const auto &i : b.instructions) for (int a : i.args) ++uses[a];

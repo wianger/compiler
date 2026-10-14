@@ -118,8 +118,8 @@ class Resolver {
   void numeric(const Expr &e) {
     if (!e.type.numeric()) throw Error(e.location, "expected numeric value, found " + e.type.str());
   }
-  void expr(Expr &e) {
-    for (auto &operand : e.operands) expr(*operand);
+  void expr(Expr &e) { visitExpressions(e,[&](Expr &node) { resolveNode(node); }); }
+  void resolveNode(Expr &e) {
     switch (e.kind) {
     case Expr::Kind::Number:
       e.constant = literal(e); e.type.base = e.constant->base; return;

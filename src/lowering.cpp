@@ -302,35 +302,33 @@ void eliminateDead(FunctionIR &f) {
 } // namespace
 
 ModuleIR lower(const ProgramIR &program) { return Lowering().run(program); }
-void optimize(ModuleIR &module, int level) {
-  if (level == 0) runPasses(module, "prune");
-  else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact");
+void optimize(ModuleIR &module, int level, Stats *stats) {
+  if (level == 0) runPasses(module, "prune", stats);
+  else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact", stats);
   else {
-    runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,memory,simplify,dce,tail,prune,licm,gvn,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,gvn,memory,simplify,dce");
-    if (level >= 3) runPasses(module, "unroll,gvn,memory,simplify,dce");
-    runPasses(module, "sccp,prune,dce,compact");
+    runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,memory,simplify,dce,tail,prune,licm,gvn,simplify,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,gvn,memory,simplify,dce", stats);
+    if (level >= 3) runPasses(module, "unroll,gvn,memory,simplify,dce", stats);
+    runPasses(module, "sccp,prune,dce,compact", stats);
   }
 }
-void runPasses(ModuleIR &module, const std::string &pipeline) {
+void runPasses(ModuleIR &module, const std::string &pipeline, Stats *stats) {
   size_t start = 0;
   while (start < pipeline.size()) {
     size_t comma = pipeline.find(',', start);
     auto name = pipeline.substr(start, comma == std::string::npos ? comma : comma - start);
-    if (runAdvancedPass(module, name)) {
-      verify(module);
-      if (comma == std::string::npos) break;
-      start = comma + 1; continue;
-    }
-    for (auto &f : module.functions) {
-      if (name == "prune") prune(f);
-      else if (name == "promote") {
-        if (f.ssa) throw std::runtime_error("promote must precede SSA construction");
-        promote(f);
+    auto work = [&] {
+      if (!runAdvancedPass(module, name)) for (auto &f : module.functions) {
+        if (name == "prune") prune(f);
+        else if (name == "promote") {
+          if (f.ssa) throw std::runtime_error("promote must precede SSA construction");
+          promote(f);
+        } else if (name == "dce") eliminateDead(f);
+        else throw std::runtime_error("unknown IR pass: " + name);
       }
-      else if (name == "dce") eliminateDead(f);
-      else throw std::runtime_error("unknown IR pass: " + name);
-    }
-    verify(module);
+    };
+    if (stats) stats->measure("pass."+name, work); else work();
+    auto check = [&] { verify(module); };
+    if (stats) stats->measure("verify", check); else check();
     if (comma == std::string::npos) break;
     start = comma + 1;
   }

@@ -36,6 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path, nargs="?")
+    parser.add_argument("--tests", type=Path, default=ROOT / "test/performance")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--filter", default="")
@@ -51,11 +52,11 @@ def main():
     if hasattr(os, "sched_getaffinity"):
         os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
     results = []
-    for source in sorted((ROOT / "test/performance").glob("*.sy")):
+    for source in sorted(opts.tests.glob("*.sy")):
         if opts.filter not in source.stem:
             continue
         versions = [opts.baseline] + ([opts.candidate] if opts.candidate else [])
-        executables = [v / "performance" / source.stem / "program" for v in versions]
+        executables = [v / source.parent.name / source.stem / "program" for v in versions]
         if not all(p.exists() for p in executables):
             raise RuntimeError(f"Missing executables for {source.name}; run tools/test.py first")
         data = source.with_suffix(".in").read_bytes() if source.with_suffix(".in").exists() else b""

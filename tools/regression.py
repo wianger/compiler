@@ -142,11 +142,14 @@ INVALID = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--benchmark", action="store_true", help="write a timed pressure fixture and exit")
     parser.add_argument("--compiler", type=Path, default=ROOT / "build/compiler")
     opts = parser.parse_args()
     directory = ROOT / "build/regressions"
     directory.mkdir(parents=True, exist_ok=True)
     cases = dict(CASES)
+    cases["deep_expression"] = ("int main(){int x=getint();putint(x"+"+1"*20000+");return 0;}", "20007\n0\n")
+    (directory / "deep_expression.in").write_text("7\n")
     # All parameters survive another call: exercise both argument banks,
     # incoming stack slots, spilling, and preservation across calls.
     params = ",".join(f"int i{n}" for n in range(12)) + "," + ",".join(f"float f{n}" for n in range(12))
@@ -211,6 +214,55 @@ def main():
         for _ in range(n): value = f32(value+f32(0.1))
         cases[f"alias_generated_{k:02d}"] = (source, f"{value.hex()} {total} {a0} 31\n0\n")
         (directory / f"alias_generated_{k:02d}.in").write_text(f"{n}\n")
+    # Create pressure deliberately through overlapping loop-carried values,
+    # then compare with a separate arithmetic model rather than another compiler.
+    pressure_rng = random.Random(260626)
+    wrap = lambda x: (x + 2**31) % 2**32 - 2**31
+    for k in range(24):
+        width = pressure_rng.randrange(25,49)
+        iterations = pressure_rng.randrange(1,9)
+        data = [pressure_rng.randrange(-1000000000,1000000000) for _ in range(width)]
+        c1,c2 = pressure_rng.randrange(-31,32),pressure_rng.randrange(-31,32)
+        declarations = "".join(f"int v{n}=getint();" for n in range(width))
+        updates = "".join(f"v{n}=(v{n}*({c1})+v{n}*({c2}))+v{(n+1)%width};" for n in range(width))
+        source = f"int main(){{{declarations}int n=getint();int i=0;while(i<n){{{updates}if(i%2==0){{int t=v0;v0=v1;v1=t;}}i=i+1;}}putint({'+'.join(f'v{n}' for n in range(width))});return 0;}}"
+        model = data[:]
+        for i in range(iterations):
+            for n in range(width): model[n] = wrap(model[n]*c1+model[n]*c2+model[(n+1)%width])
+            if i%2 == 0: model[0],model[1] = model[1],model[0]
+        if k == 1 and opts.benchmark:
+            # Model the two-iteration recurrence over Z/(2^32), then exponentiate
+            # its matrix. This computes a million iterations independently.
+            count = 1000000
+            def step(v, swap):
+                v = v[:]
+                for n in range(width): v[n] = wrap(v[n]*c1+v[n]*c2+v[(n+1)%width])
+                if swap: v[0],v[1] = v[1],v[0]
+                return v
+            columns = [step(step([int(i==j) for i in range(width)],True),False) for j in range(width)]
+            matrix = [[columns[j][i] & 0xffffffff for j in range(width)] for i in range(width)]
+            vector, power = data[:], count//2
+            while power:
+                if power & 1: vector = [sum(a*b for a,b in zip(row,vector)) & 0xffffffff for row in matrix]
+                power >>= 1
+                if power: matrix = [[sum(matrix[i][k]*matrix[k][j] for k in range(width)) & 0xffffffff for j in range(width)] for i in range(width)]
+            fixture = ROOT / "build/pressure-fixture/performance"
+            fixture.mkdir(parents=True,exist_ok=True)
+            timed = source.replace("int i=0;while", "int i=0;starttime();while").replace("putint(","stoptime();putint(")
+            (fixture / "pressure.sy").write_text(timed)
+            (fixture / "pressure.in").write_text(" ".join(map(str,data+[count]))+"\n")
+            (fixture / "pressure.out").write_text(f"{wrap(sum(vector))}\n0\n")
+            print(f"Wrote {width} live integers, coefficients {c1} and {c2}, {count} iterations to {fixture}")
+            return
+        name = f"pressure_generated_{k:02d}"
+        cases[name] = (source,f"{wrap(sum(model))}\n0\n")
+        (directory / f"{name}.in").write_text(" ".join(map(str,data+[iterations]))+"\n")
+    cases["tensor_wide_ordered"] = ('''tensor float a[2][9];tensor float b[9][11];tensor float c[2][11];
+      int main(){int i=0;while(i<2){int k=0;while(k<9){a[i][k]=(i+k+1)*0.1;k=k+1;}i=i+1;}
+        int k=0;while(k<9){int j=0;while(j<11){b[k][j]=(k-j)*0.3;j=j+1;}k=k+1;}c=a@b;
+        int bad=0;i=0;while(i<2){int j=0;while(j<11){float sum=0;k=0;
+          while(k<9){sum=sum+a[i][k]*b[k][j];k=k+1;}if(sum!=c[i][j])bad=bad+1;j=j+1;}i=i+1;}
+        putint(bad);return 0;}''', "0\n0\n")
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)
@@ -227,7 +279,7 @@ def main():
     (directory / "signed_mask_tests.in").write_text("137 -99\n")
     for opt in (0, 2, 3):
         subprocess.run(["python3", str(ROOT / "tools/test.py"), str(directory), "--compiler", str(opts.compiler),
-                        "--opt", str(opt), "--output", str(ROOT / f"build/regression-o{opt}")], check=True)
+                        "--opt", str(opt), "--check-alloc", "--output", str(ROOT / f"build/regression-o{opt}")], check=True)
     invalid_dir = ROOT / "build/invalid"
     invalid_dir.mkdir(parents=True, exist_ok=True)
     for name, (source, message) in INVALID.items():

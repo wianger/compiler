@@ -9,67 +9,71 @@
 
 namespace sysy {
 namespace {
-using E = std::unique_ptr<Expr>;
-using S = std::unique_ptr<Stmt>;
+using E = ExprRef;
+using S = StmtRef;
 
-E clone(const Expr &source) {
-  auto e = std::make_unique<Expr>(source.kind, source.location, source.text);
-  e->type = source.type; e->constant = source.constant; e->symbol = source.symbol; e->callee = source.callee;
-  e->uniformProduct = source.uniformProduct;
-  for (const auto &operand : source.operands) e->operands.push_back(clone(*operand));
-  return e;
-}
-E reference(Symbol *symbol) {
-  auto e = std::make_unique<Expr>(Expr::Kind::Variable, Location{}, symbol->name);
-  e->symbol = symbol; e->type = symbol->type; return e;
-}
-E integer(int64_t n) {
-  if (n < INT32_MIN || n > INT32_MAX) throw Error({}, "tensor lowering requires an int-sized iteration space");
-  auto e = std::make_unique<Expr>(Expr::Kind::Number, Location{}, std::to_string(n));
-  e->constant = Number::fromInt(n); return e;
-}
-E zero(Base base) {
-  auto e = integer(0);
-  if (base == Base::Float) { e->type.base = base; e->constant = Number::fromFloat(0); }
-  return e;
-}
-E boolean(E source) {
-  auto inner = std::make_unique<Expr>(Expr::Kind::Unary, source->location, "!");
-  inner->operands.push_back(std::move(source));
-  auto outer = std::make_unique<Expr>(Expr::Kind::Unary, inner->location, "!");
-  outer->operands.push_back(std::move(inner)); return outer;
-}
-E binary(std::string op, E a, E b) {
-  auto e = std::make_unique<Expr>(Expr::Kind::Binary, a->location, op);
-  e->type.base = op == "<" ? Base::Int : (a->type.base == Base::Float || b->type.base == Base::Float ? Base::Float : Base::Int);
-  e->operands.push_back(std::move(a)); e->operands.push_back(std::move(b)); return e;
-}
-E element(E array, E index) {
-  auto e = std::make_unique<Expr>(Expr::Kind::Element, array->location, "element");
-  e->type.base = array->type.base;
-  e->operands.push_back(std::move(array)); e->operands.push_back(std::move(index)); return e;
-}
-S block() { return std::make_unique<Stmt>(Stmt::Kind::Block, Location{}); }
-S assign(E target, E expression) {
-  auto s = std::make_unique<Stmt>(Stmt::Kind::Assignment, target->location);
-  s->target = std::move(target); s->expression = std::move(expression); return s;
-}
-S eval(E expression) {
-  auto s = std::make_unique<Stmt>(Stmt::Kind::Expression, expression->location);
-  s->expression = std::move(expression); return s;
-}
-S declare(Symbol *symbol, E initial = {}) {
-  Variable v; v.name = symbol->name; v.symbol = symbol; v.base = symbol->type.base; v.tensor = symbol->type.tensor;
-  if (initial) {
-    v.initializer.emplace(); v.initializer->value = std::move(initial);
-    v.initializers.emplace_back(0, v.initializer->value.get());
-  }
-  auto s = std::make_unique<Stmt>(Stmt::Kind::Declaration, Location{});
-  s->variables.push_back(std::move(v)); return s;
-}
-
-class TensorExpansion {
+struct NodeBuilder {
   ProgramIR &program;
+  explicit NodeBuilder(ProgramIR &p) : program(p) {}
+  E clone(const Expr &source) {
+    auto e = program.expressions->make(source.kind, source.location, source.text);
+    e->type = source.type; e->constant = source.constant; e->symbol = source.symbol; e->callee = source.callee;
+    e->uniformProduct = source.uniformProduct; e->schedule = source.schedule;
+    for (const auto &operand : source.operands) e->operands.push_back(clone(*operand));
+    return e;
+  }
+  E reference(Symbol *symbol) {
+    auto e = program.expressions->make(Expr::Kind::Variable, Location{}, symbol->name);
+    e->symbol = symbol; e->type = symbol->type; return e;
+  }
+  E integer(int64_t n) {
+    if (n < INT32_MIN || n > INT32_MAX) throw Error({}, "tensor lowering requires an int-sized iteration space");
+    auto e = program.expressions->make(Expr::Kind::Number, Location{}, std::to_string(n));
+    e->constant = Number::fromInt(n); return e;
+  }
+  E zero(Base base) {
+    auto e = integer(0);
+    if (base == Base::Float) { e->type.base = base; e->constant = Number::fromFloat(0); }
+    return e;
+  }
+  E boolean(E source) {
+    auto inner = program.expressions->make(Expr::Kind::Unary, source->location, "!");
+    inner->operands.push_back(std::move(source));
+    auto outer = program.expressions->make(Expr::Kind::Unary, inner->location, "!");
+    outer->operands.push_back(std::move(inner)); return outer;
+  }
+  E binary(std::string op, E a, E b) {
+    auto e = program.expressions->make(Expr::Kind::Binary, a->location, op);
+    e->type.base = op == "<" ? Base::Int : (a->type.base == Base::Float || b->type.base == Base::Float ? Base::Float : Base::Int);
+    e->operands.push_back(std::move(a)); e->operands.push_back(std::move(b)); return e;
+  }
+  E element(E array, E index) {
+    auto e = program.expressions->make(Expr::Kind::Element, array->location, "element");
+    e->type.base = array->type.base;
+    e->operands.push_back(std::move(array)); e->operands.push_back(std::move(index)); return e;
+  }
+  S block() { return program.statements->make(Stmt::Kind::Block, Location{}); }
+  S assign(E target, E expression) {
+    auto s = program.statements->make(Stmt::Kind::Assignment, target->location);
+    s->target = std::move(target); s->expression = std::move(expression); return s;
+  }
+  S eval(E expression) {
+    auto s = program.statements->make(Stmt::Kind::Expression, expression->location);
+    s->expression = std::move(expression); return s;
+  }
+  S declare(Symbol *symbol, E initial = {}) {
+    Variable v; v.name = symbol->name; v.symbol = symbol; v.base = symbol->type.base; v.tensor = symbol->type.tensor;
+    if (initial) {
+      v.initializer.emplace(); v.initializer->value = std::move(initial);
+      v.initializers.emplace_back(0, v.initializer->value.get());
+    }
+    auto s = program.statements->make(Stmt::Kind::Declaration, Location{});
+    s->variables.push_back(std::move(v)); return s;
+  }
+
+};
+
+class TensorExpansion : NodeBuilder {
   std::unordered_map<const Function *, Symbol *> results;
   Function *current = nullptr;
   int serial = 0;
@@ -83,7 +87,7 @@ class TensorExpansion {
     auto outer = block(); outer->children.push_back(declare(index, integer(0)));
     if (count == 0) return outer;
     if (count == 1) { outer->children.push_back(body(index)); return outer; }
-    auto w = std::make_unique<Stmt>(Stmt::Kind::While, Location{});
+    auto w = program.statements->make(Stmt::Kind::While, Location{});
     w->expression = binary("<", reference(index), integer(count));
     auto inner = block(); inner->children.push_back(body(index));
     inner->children.push_back(assign(reference(index), binary("+", reference(index), integer(1))));
@@ -94,7 +98,7 @@ class TensorExpansion {
     if (e.kind == Expr::Kind::Variable) return element(clone(e), clone(index));
     if (e.kind == Expr::Kind::Binary) return binary(e.text, scalarize(*e.operands[0], index), scalarize(*e.operands[1], index));
     if (e.kind == Expr::Kind::Unary) {
-      auto result = std::make_unique<Expr>(Expr::Kind::Unary, e.location, e.text);
+      auto result = program.expressions->make(Expr::Kind::Unary, e.location, e.text);
       result->type.base = e.type.base; result->operands.push_back(scalarize(*e.operands[0], index)); return result;
     }
     throw std::logic_error("unexpanded tensor operand");
@@ -104,7 +108,7 @@ class TensorExpansion {
       return assign(element(clone(*target), reference(i)), scalarize(*expression, *reference(i)));
     });
   }
-  S matmul(Symbol *target, const Expr &a, const Expr &b) {
+  S matmul(Symbol *target, const Expr &a, const Expr &b, int width) {
     int64_t rows = a.type.shape[0], inner = a.type.shape[1], columns = b.type.shape[1];
     return loop(rows, [&](Symbol *i) {
       auto row = block();
@@ -130,8 +134,8 @@ class TensorExpansion {
         }
         return body;
       };
-      if (columns >= 4) row->children.push_back(loop(columns/4, [&](Symbol *j) { return tile(j, 4, 0, 4); }));
-      if (columns % 4) row->children.push_back(loop(columns%4, [&](Symbol *j) { return tile(j, 1, columns/4*4, 1); }));
+      if (columns >= width) row->children.push_back(loop(columns/width, [&](Symbol *j) { return tile(j, width, 0, width); }));
+      if (columns % width) row->children.push_back(loop(columns%width, [&](Symbol *j) { return tile(j, 1, columns/width*width, 1); }));
       return row;
     });
   }
@@ -176,7 +180,9 @@ class TensorExpansion {
       for (auto &operand : e->operands)
         if (operand->kind != Expr::Kind::Variable) operand = materialize(std::move(operand), prefix);
       auto result = temporary(e->type); prefix.push_back(declare(result));
-      prefix.push_back(e->uniformProduct ? uniformMatmul(result, *e->operands[0], *e->operands[1]) : matmul(result, *e->operands[0], *e->operands[1])); e = reference(result);
+      if (e->schedule < 0) throw std::logic_error("tensor product has no schedule");
+      const auto &schedule = program.schedules.at(e->schedule);
+      prefix.push_back(schedule.uniform ? uniformMatmul(result, *e->operands[0], *e->operands[1]) : matmul(result, *e->operands[0], *e->operands[1],schedule.columnTile)); e = reference(result);
     }
   }
   void rewrite(E &e, std::vector<S> &prefix) {
@@ -191,7 +197,7 @@ class TensorExpansion {
       auto rhs = block();
       for (auto &before : right) rhs->children.push_back(std::move(before));
       rhs->children.push_back(assign(reference(result), boolean(std::move(e->operands[1]))));
-      auto branch = std::make_unique<Stmt>(Stmt::Kind::If, e->location);
+      auto branch = program.statements->make(Stmt::Kind::If, e->location);
       branch->expression = std::move(e->operands[0]);
       if (e->text == "&&") {
         branch->children.push_back(std::move(rhs)); branch->children.push_back(assign(reference(result), integer(0)));
@@ -214,7 +220,13 @@ class TensorExpansion {
       }
       return;
     }
-    for (auto &operand : e->operands) rewrite(operand, prefix);
+    std::vector<E *> work;
+    for (auto it = e->operands.rbegin(); it != e->operands.rend(); ++it) work.push_back(&*it);
+    while (!work.empty()) {
+      E &child = *work.back(); work.pop_back();
+      if (child->kind == Expr::Kind::Call || (child->kind == Expr::Kind::Binary && (child->text == "&&" || child->text == "||"))) rewrite(child,prefix);
+      else for (auto it = child->operands.rbegin(); it != child->operands.rend(); ++it) work.push_back(&*it);
+    }
   }
   void initializer(Initializer &init, std::vector<S> &prefix, std::unordered_map<Expr *, Expr *> &replacements) {
     if (init.value) {
@@ -232,7 +244,7 @@ class TensorExpansion {
         if (v.initializer) initializer(*v.initializer, prefix, replacements);
         for (auto &entry : v.initializers) entry.second = replacements.at(entry.second);
         for (auto &before : prefix) replacement->children.push_back(std::move(before));
-        auto d = std::make_unique<Stmt>(Stmt::Kind::Declaration, v.location);
+        auto d = program.statements->make(Stmt::Kind::Declaration, v.location);
         d->variables.push_back(std::move(v)); replacement->children.push_back(std::move(d));
       }
       s = std::move(replacement); return;
@@ -249,16 +261,16 @@ class TensorExpansion {
       auto expanded = block();
       for (auto &before : prefix) expanded->children.push_back(std::move(before));
       expanded->children.push_back(copy(std::move(target), std::move(s->expression), count));
-      if (s->kind == Stmt::Kind::Return) expanded->children.push_back(std::make_unique<Stmt>(Stmt::Kind::Return, s->location));
+      if (s->kind == Stmt::Kind::Return) expanded->children.push_back(program.statements->make(Stmt::Kind::Return, s->location));
       s = std::move(expanded); return;
     }
     rewrite(s->target, prefix); rewrite(s->expression, prefix);
     if (prefix.empty()) return;
     if (s->kind == Stmt::Kind::While) {
-      auto guard = std::make_unique<Stmt>(Stmt::Kind::If, s->location);
-      guard->expression = std::make_unique<Expr>(Expr::Kind::Unary, s->location, "!");
+      auto guard = program.statements->make(Stmt::Kind::If, s->location);
+      guard->expression = program.expressions->make(Expr::Kind::Unary, s->location, "!");
       guard->expression->operands.push_back(std::move(s->expression));
-      guard->children.push_back(std::make_unique<Stmt>(Stmt::Kind::Break, s->location));
+      guard->children.push_back(program.statements->make(Stmt::Kind::Break, s->location));
       auto body = block();
       for (auto &before : prefix) body->children.push_back(std::move(before));
       body->children.push_back(std::move(guard)); body->children.push_back(std::move(s->children[0]));
@@ -270,7 +282,7 @@ class TensorExpansion {
     }
   }
 public:
-  explicit TensorExpansion(ProgramIR &program) : program(program) {}
+  explicit TensorExpansion(ProgramIR &program) : NodeBuilder(program) {}
   void run() {
     for (auto &item : program.items) if (item.function && item.function->tensorResult) {
       auto &f = *item.function;
@@ -409,8 +421,8 @@ class TensorStructure {
     for (auto symbol : invalid) result.erase(symbol);
     return result;
   }
-  static void expr(Expr &e, State &state) {
-    for (auto &a : e.operands) expr(*a, state);
+  static void expr(Expr &e, State &state) { visitExpressions(e,[&](Expr &node) { expressionNode(node,state); }); }
+  static void expressionNode(Expr &e, State &state) {
     if (e.kind == Expr::Kind::Call) {
       if (!e.callee->runtime) {
         state.arrays.clear();
@@ -472,8 +484,7 @@ public:
 // Factor repeated, read-only loop bodies with integer additive reductions.
 // Definite assignment proves that auxiliary state resets each iteration; reads
 // of carried reductions, array writes, and impure calls prevent the transform.
-class Repetition {
-  ProgramIR &program;
+class Repetition : NodeBuilder {
   struct Summary { int state = 0; bool pure = false; std::set<const Symbol *> reads; };
   std::map<const Function *, Summary> summaries;
   std::map<const Symbol *, int32_t> initial;
@@ -602,7 +613,7 @@ class Repetition {
     s = std::move(result);
   }
 public:
-  explicit Repetition(ProgramIR &program) : program(program) {}
+  explicit Repetition(ProgramIR &program) : NodeBuilder(program) {}
   void run() {
     for (auto &item : program.items) if (item.function) {
       initial.clear(); assignments.clear(); facts(*item.function->body); optimize(item.function->body);
@@ -610,6 +621,28 @@ public:
   }
 };
 } // namespace
+
+void planTensors(ProgramIR &program, int tile) {
+  program.schedules.clear();
+  for (uint32_t n = 0; n < program.expressions->size(); ++n) {
+    auto &e = program.expressions->at(n);
+    if (e.kind != Expr::Kind::Binary || e.text != "@") continue;
+    const auto &a = e.operands[0]->type, &b = e.operands[1]->type;
+    if (a.shape.size() != 2 || b.shape.size() != 2 || a.shape[1] != b.shape[0]) throw std::logic_error("invalid tensor iteration domain");
+    // Independent columns preserve each dot product's reduction order. Eight
+    // float accumulators fit the FP bank; integer kernels also need index and
+    // pointer registers, so their conservative schedule uses four columns.
+    int width = tile ? tile : e.type.base == Base::Float && b.shape[1] >= 8 && a.shape[1] >= 8 ? 8 : 4;
+    if (width != 1 && width != 2 && width != 4 && width != 8) throw std::runtime_error("tensor tile must be 1, 2, 4 or 8");
+    e.schedule = program.schedules.size();
+    program.schedules.push_back({n,a.shape[0],a.shape[1],b.shape[1],width,e.uniformProduct,e.type.base});
+  }
+}
+void printTensorPlan(const ProgramIR &program, std::ostream &out) {
+  for (const auto &s : program.schedules) out << "product n" << s.node << " domain=[" << s.rows << ',' << s.columns << ',' << s.reduction
+      << "] tile=[1," << s.columnTile << "] remainder=scalar reduction=ordered snapshot=result algorithm="
+      << (s.uniform ? "proved-uniform" : "dot-product") << '\n';
+}
 
 void expandTensors(ProgramIR &program) { TensorExpansion(program).run(); }
 void analyzeTensors(ProgramIR &program) { TensorStructure::run(program); }

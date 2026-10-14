@@ -1,0 +1,224 @@
+#include "target_ir.hpp"
+#include <algorithm>
+#include <functional>
+
+namespace sysy {
+const char *rvName(RV op) {
+  static const char *names[] = {"pseudo","add","addi","addw","addiw","subw","mul","mulw","divw","remw","and","andi",
+    "slli","slliw","srlw","srliw","srai","sraiw","negw","xor","xori","slt","seqz","snez",
+    "fadd.s","fsub.s","fmul.s","fdiv.s","fneg.s","feq.s","flt.s","fle.s",
+    "fcvt.w.s","fcvt.s.w","fcvt.d.s","fmv.w.x","fmv.d.x"};
+  return names[static_cast<size_t>(op)];
+}
+namespace {
+bool small(int64_t n) { return n >= -2048 && n <= 2047; }
+bool floating(ValueType t) { return t == ValueType::Float || t == ValueType::Double; }
+class Selector {
+  MachineFunction result;
+  const FunctionIR &input;
+  std::vector<const Instruction *> defs;
+  std::vector<MachineInstruction> *output = nullptr;
+  int value(ValueType type) { int id = result.values.size(); result.values.push_back(type); return id; }
+  int constant(int64_t n, ValueType type = ValueType::Int) {
+    int id = value(type); MachineInstruction i{Op::Constant}; i.result = id; i.immediate = n; output->push_back(std::move(i)); return id;
+  }
+  int emit(RV op, MachineArgs args, int64_t imm = 0, int dst = -1, ValueType type = ValueType::Int) {
+    if (dst < 0) dst = value(type);
+    MachineInstruction i{Op::Target}; i.opcode = op; i.args = std::move(args); i.result = dst; i.immediate = imm;
+    output->push_back(std::move(i)); return dst;
+  }
+  void copy(int dst, int src) { MachineInstruction i{Op::Move}; i.result = dst; i.args = {src}; output->push_back(std::move(i)); }
+  std::optional<int64_t> literal(int id) const {
+    const auto *d = defs.at(id);
+    if (d && d->op == Op::Constant && !floating(input.values[id])) return d->immediate;
+    return {};
+  }
+  bool immediate(const Instruction &i) {
+    if (i.args.size() != 2 || input.values[i.result] != ValueType::Int) return false;
+    auto c = literal(i.args[1]); if (!c) return false;
+    int a = i.args[0], dst = i.result; int32_t d = *c;
+    if (i.op == Op::And && small(d)) { emit(RV::Andi,{a},d,dst); return true; }
+    if (i.op == Op::Shr) { emit(RV::Srliw,{a},d&31,dst); return true; }
+    if ((i.op == Op::Add && small(d)) || (i.op == Op::Sub && small(-int64_t(d)))) {
+      emit(RV::Addiw,{a},i.op == Op::Add ? d : -int64_t(d),dst); return true;
+    }
+    uint64_t magnitude = d < 0 ? -int64_t(d) : d;
+    bool power = magnitude && !(magnitude & (magnitude-1)); int shift = 0;
+    if (power) for (auto n = magnitude; n > 1; n >>= 1) ++shift;
+    if (i.op == Op::Mul) {
+      if (!d) { copy(dst,constant(0)); return true; }
+      if (!power) return false;
+      int product = a;
+      if (shift) product = emit(RV::Slliw,{a},shift,d < 0 && shift != 31 ? -1 : dst);
+      if (d < 0 && shift != 31) emit(RV::Negw,{product},0,dst);
+      else if (!shift) copy(dst,a);
+      return true;
+    }
+    if ((i.op != Op::Div && i.op != Op::Rem) || !d) return false;
+    int quotient = a;
+    if (power) {
+      if (!shift) {
+        if (i.op == Op::Rem) copy(dst,constant(0));
+        else if (d < 0) emit(RV::Negw,{a},0,dst);
+        else copy(dst,a);
+        return true;
+      }
+      int bias = emit(RV::Sraiw,{a},31);
+      bias = emit(RV::Srliw,{bias},32-shift);
+      quotient = emit(RV::Addw,{a,bias});
+      quotient = emit(RV::Sraiw,{quotient},shift);
+      if (i.op == Op::Rem) {
+        int product = emit(RV::Slliw,{quotient},shift); emit(RV::Subw,{a,product},0,dst);
+      } else if (d < 0) emit(RV::Negw,{quotient},0,dst);
+      else copy(dst,quotient);
+      return true;
+    }
+    uint64_t half = uint64_t{1} << 31, t = half+(d<0), anchor = t-1-t%magnitude;
+    uint64_t q1 = half/anchor, r1 = half%anchor, q2 = half/magnitude, r2 = half%magnitude, delta;
+    int p = 31;
+    do {
+      ++p; q1 *= 2; r1 *= 2; if (r1 >= anchor) { ++q1; r1 -= anchor; }
+      q2 *= 2; r2 *= 2; if (r2 >= magnitude) { ++q2; r2 -= magnitude; }
+      delta = magnitude-r2;
+    } while (q1 < delta || (q1 == delta && !r1));
+    uint32_t raw = q2+1; if (d < 0) raw = 0u-raw; int32_t multiplier = raw;
+    int product = emit(RV::Mul,{a,constant(multiplier)},0,-1,ValueType::Pointer);
+    quotient = emit(RV::Srai,{product},32);
+    if (d > 0 && multiplier < 0) quotient = emit(RV::Addw,{quotient,a});
+    if (d < 0 && multiplier > 0) quotient = emit(RV::Subw,{quotient,a});
+    if (p > 32) quotient = emit(RV::Sraiw,{quotient},p-32);
+    int sign = emit(RV::Srliw,{quotient},31); quotient = emit(RV::Addw,{quotient,sign});
+    if (i.op == Op::Rem) {
+      product = emit(RV::Mulw,{quotient,constant(d)}); emit(RV::Subw,{a,product},0,dst);
+    } else copy(dst,quotient);
+    return true;
+  }
+  void select(const Instruction &i) {
+    // Pseudos expose their virtual operands too; their reserved scratch and ABI
+    // clobbers are checked by allocation. No arithmetic expansion follows RA.
+    if (i.op == Op::Constant && floating(input.values[i.result])) {
+      int bits = constant(input.values[i.result] == ValueType::Float ? static_cast<int32_t>(i.immediate) : i.immediate,ValueType::Pointer);
+      emit(input.values[i.result] == ValueType::Float ? RV::FmvWX : RV::FmvDX,{bits},0,i.result,input.values[i.result]); return;
+    }
+    if (i.op <= Op::Store || i.op == Op::Zero || i.op == Op::Call || i.op == Op::Jump || i.op == Op::Branch || i.op == Op::Return || i.op == Op::BranchCompare) {
+      MachineInstruction selected{i.op}; selected.result = i.result; selected.args = i.args; selected.immediate = i.immediate;
+      selected.symbol = i.symbol; selected.callee = i.callee; selected.text = i.text;
+      selected.target = i.target; selected.otherwise = i.otherwise;
+      if (i.op == Op::Call) { selected.integerClobbers = ((1u<<21)-1) & ~((1u<<12)-1); selected.floatClobbers = ((1u<<29)-1) & ~((1u<<12)-1); }
+      output->push_back(std::move(selected)); return;
+    }
+    int dst = i.result; auto type = input.values[dst]; bool fp = floating(type);
+    int a = i.args[0];
+    if (i.op == Op::Convert) { emit(type == ValueType::Int ? RV::FcvtWS : type == ValueType::Double ? RV::FcvtDS : RV::FcvtSW,{a},0,dst,type); return; }
+    if (i.op == Op::Neg) { emit(fp ? RV::FnegS : RV::Negw,{a},0,dst,type); return; }
+    if (immediate(i)) return;
+    int b = i.args[1];
+    if (i.op == Op::Offset) {
+      auto c = literal(b);
+      if (c) {
+        int64_t delta = *c*i.immediate;
+        if (small(delta)) emit(RV::Addi,{a},delta,dst,type);
+        else emit(RV::Add,{a,constant(delta,ValueType::Pointer)},0,dst,type);
+      } else if (!i.immediate) copy(dst,a);
+      else {
+        int scaled;
+        if (!(i.immediate & (i.immediate-1))) {
+          int shift = 0; for (int64_t n = i.immediate; n > 1; n >>= 1) ++shift;
+          scaled = emit(RV::Slli,{b},shift,-1,ValueType::Pointer);
+        } else scaled = emit(RV::Mul,{b,constant(i.immediate,ValueType::Pointer)},0,-1,ValueType::Pointer);
+        emit(RV::Add,{a,scaled},0,dst,type);
+      }
+      return;
+    }
+    if (i.op >= Op::Eq && i.op <= Op::Ge) {
+      bool swap = i.op == Op::Gt || i.op == Op::Le;
+      if (floating(input.values[a])) {
+        RV op = i.op == Op::Eq || i.op == Op::Ne ? RV::FeqS : i.op == Op::Lt || i.op == Op::Gt ? RV::FltS : RV::FleS;
+        bool reverse = i.op == Op::Gt || i.op == Op::Ge;
+        if (i.op == Op::Ne) { int eq = emit(op,{a,b}); emit(RV::Xori,{eq},1,dst); }
+        else emit(op,reverse ? MachineArgs{b,a} : MachineArgs{a,b},0,dst);
+      } else if (i.op == Op::Eq || i.op == Op::Ne) {
+        int diff = emit(RV::Xor,{a,b},0,-1,ValueType::Pointer);
+        emit(i.op == Op::Eq ? RV::Seqz : RV::Snez,{diff},0,dst);
+      } else {
+        int cmp = emit(RV::Slt,swap ? MachineArgs{b,a} : MachineArgs{a,b},0,
+                       i.op == Op::Le || i.op == Op::Ge ? -1 : dst);
+        if (i.op == Op::Le || i.op == Op::Ge) emit(RV::Xori,{cmp},1,dst);
+      }
+      return;
+    }
+    RV op = i.op == Op::And ? RV::And : i.op == Op::Shr ? RV::Srlw :
+      fp ? (i.op == Op::Add ? RV::FaddS : i.op == Op::Sub ? RV::FsubS : i.op == Op::Mul ? RV::FmulS : RV::FdivS) :
+      i.op == Op::Add ? RV::Addw : i.op == Op::Sub ? RV::Subw : i.op == Op::Mul ? RV::Mulw : i.op == Op::Div ? RV::Divw : RV::Remw;
+    emit(op,{a,b},0,dst,type);
+  }
+public:
+  explicit Selector(const FunctionIR &f) : input(f), defs(f.values.size(),nullptr) {
+    result.source = f.source; result.values = f.values; result.objects = f.objects; result.depth = loopDepth(f);
+    std::vector<int> counts(f.values.size(),0);
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.result >= 0) { defs[i.result] = &i; ++counts[i.result]; }
+    for (size_t v = 0; v < defs.size(); ++v) if (counts[v] != 1) defs[v] = nullptr;
+  }
+  MachineFunction run() {
+    for (const auto &b : input.blocks) {
+      result.blocks.push_back({b.name,{}}); output = &result.blocks.back().instructions;
+      for (const auto &i : b.instructions) select(i);
+    }
+    return std::move(result);
+  }
+};
+} // namespace
+MachineFunction selectTarget(FunctionIR f) {
+  destroySSA(f); selectInstructions(f); layoutBlocks(f);
+  auto result = Selector(f).run(); verifyTarget(result); return result;
+}
+void verifyTarget(const MachineFunction &f) {
+  for (const auto &b : f.blocks) {
+    if (b.instructions.empty()) throw std::logic_error("empty machine block");
+    auto terminal = b.instructions.back().op;
+    if (terminal != Op::Jump && terminal != Op::Branch && terminal != Op::BranchCompare && terminal != Op::Return) throw std::logic_error("unterminated machine block");
+    for (const auto &i : b.instructions) {
+      for (int a : i.args) if (a < 0 || a >= static_cast<int>(f.values.size())) throw std::logic_error("invalid machine use");
+      if (i.result >= static_cast<int>(f.values.size())) throw std::logic_error("invalid machine definition");
+      if (i.op == Op::Target && (i.result < 0 || i.opcode == RV::Pseudo)) throw std::logic_error("unselected instruction");
+      if (i.op == Op::Target) {
+        bool unary = i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi ||
+          (i.opcode >= RV::Slli && i.opcode <= RV::Negw && i.opcode != RV::Srlw) || i.opcode == RV::Xori ||
+          i.opcode == RV::Seqz || i.opcode == RV::Snez || i.opcode == RV::FnegS || i.opcode >= RV::FcvtWS;
+        if (i.args.size() != (unary ? 1u : 2u)) throw std::logic_error("invalid target arity");
+        if ((i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi || i.opcode == RV::Xori) && !small(i.immediate)) throw std::logic_error("target immediate out of range");
+        if ((i.opcode == RV::Slli || i.opcode == RV::Srai) && (i.immediate < 0 || i.immediate > 63)) throw std::logic_error("invalid 64-bit shift");
+        if ((i.opcode == RV::Slliw || i.opcode == RV::Srliw || i.opcode == RV::Sraiw) && (i.immediate < 0 || i.immediate > 31)) throw std::logic_error("invalid 32-bit shift");
+        bool fpResult = (i.opcode >= RV::FaddS && i.opcode <= RV::FnegS) || i.opcode >= RV::FcvtSW;
+        if (floating(f.values[i.result]) != fpResult) throw std::logic_error("invalid target register bank");
+      }
+      if ((i.op == Op::SpillLoad || i.op == Op::SpillStore) && (i.immediate < 0 || i.immediate >= static_cast<int64_t>(f.slots.size()))) throw std::logic_error("invalid split spill slot");
+
+      if (i.op == Op::Phi || (i.op > Op::Zero && i.op < Op::Call)) throw std::logic_error("generic operation in target IR");
+    }
+  }
+}
+void printTarget(const ModuleIR &module, std::ostream &out) {
+  for (const auto &source : module.functions) {
+    auto f = selectTarget(source); out << "machine " << f.source->name << " rv64gc lp64d\n";
+    for (size_t b = 0; b < f.blocks.size(); ++b) {
+      out << "b" << b << ":\n";
+      for (const auto &i : f.blocks[b].instructions) {
+        out << "  "; if (i.result >= 0) out << '%' << i.result << " = ";
+        if (i.op == Op::Target) out << rvName(i.opcode);
+        else {
+          static const char *pseudo[] = {"constant","frame.address","string.address","abi.parameter","copy","load","store","offset","zero"};
+          if (i.op <= Op::Zero) out << pseudo[static_cast<size_t>(i.op)];
+          else out << (i.op == Op::Call ? "abi.call" : i.op == Op::Return ? "abi.return" : i.op == Op::Jump ? "jump" : "branch");
+        }
+        for (int a : i.args) out << " %" << a << (floating(f.values[a]) ? ":fp:early" : ":gp:early");
+        out << " imm=" << i.immediate;
+        if (i.target >= 0) out << " b" << i.target;
+        if (i.otherwise >= 0) out << " b" << i.otherwise;
+        if (i.callee) out << " @" << i.callee->linkageName << " clobber=gp:" << i.integerClobbers << ",fp:" << i.floatClobbers;
+        out << '\n';
+      }
+    }
+  }
+}
+} // namespace sysy

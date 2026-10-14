@@ -1,11 +1,14 @@
 #pragma once
+#include "arena.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -22,8 +25,19 @@ struct Error : std::runtime_error {
 
 struct Source { std::string path, text; };
 enum class TokenKind { Identifier, Number, String, Punctuation, End };
-struct Token { TokenKind kind; std::string text; Location location; };
-using TokenIR = std::vector<Token>;
+struct Token { TokenKind kind; std::string_view text; Location location; };
+struct TokenIR {
+  std::vector<Token> tokens;
+  std::deque<std::string> strings;
+  TokenIR() = default;
+  TokenIR(TokenIR &&) = default;
+  TokenIR &operator=(TokenIR &&) = default;
+  TokenIR(const TokenIR &) = delete;
+  auto begin() const { return tokens.begin(); }
+  auto end() const { return tokens.end(); }
+  const Token &at(size_t n) const { return tokens.at(n); }
+  void push_back(Token t) { tokens.push_back(t); }
+};
 
 enum class Base { Int, Float, Void, String };
 struct Type {
@@ -50,26 +64,43 @@ Number convert(Number value, Base type, Location loc);
 
 struct Symbol;
 struct Function;
+struct Expr;
+struct Stmt;
+using ExprRef = NodeRef<Expr>;
+using StmtRef = NodeRef<Stmt>;
 struct Expr {
   enum class Kind { Number, String, Variable, Call, Unary, Binary, Element };
   Kind kind;
   Location location;
   std::string text;
-  std::vector<std::unique_ptr<Expr>> operands;
+  std::vector<ExprRef> operands;
   // The semantic pass fills these fields; subsequent passes consume them.
   Type type;
   std::optional<Number> constant;
   Symbol *symbol = nullptr;
   Function *callee = nullptr;
   bool uniformProduct = false;
-  Expr(Kind kind, Location loc, std::string text = {})
-      : kind(kind), location(loc), text(std::move(text)) {}
+  int schedule = -1;
+  Expr(Kind kind, Location loc, std::string_view text = {})
+      : kind(kind), location(loc), text(text) {}
 };
+
+// Visit children in source order, then the parent, without using the host stack.
+template<class F> void visitExpressions(Expr &root, F body) {
+  std::vector<std::pair<Expr *,size_t>> stack{{&root,0}};
+  while (!stack.empty()) {
+    auto &frame = stack.back();
+    if (frame.second < frame.first->operands.size()) {
+      auto child = frame.first->operands[frame.second++].get();
+      stack.push_back({child,0});
+    } else { auto node = frame.first; stack.pop_back(); body(*node); }
+  }
+}
 
 struct Initializer {
   Location location;
   bool list = false;
-  std::unique_ptr<Expr> value;
+  ExprRef value;
   std::vector<Initializer> children;
 };
 
@@ -78,7 +109,7 @@ struct Variable {
   std::string name;
   Base base = Base::Int;
   bool isConst = false, arrayParameter = false, tensor = false;
-  std::vector<std::unique_ptr<Expr>> dimensions;
+  std::vector<ExprRef> dimensions;
   std::optional<Initializer> initializer;
   Symbol *symbol = nullptr;
   // Sparse row-major initialization: missing entries are zero. Expressions
@@ -90,9 +121,9 @@ struct Stmt {
   enum class Kind { Block, Declaration, Expression, Assignment, If, While, Break, Continue, Return };
   Kind kind;
   Location location;
-  std::vector<std::unique_ptr<Stmt>> children;
+  std::vector<StmtRef> children;
   std::vector<Variable> variables;
-  std::unique_ptr<Expr> expression, target;
+  ExprRef expression, target;
   Stmt(Kind kind, Location loc) : kind(kind), location(loc) {}
 };
 
@@ -109,7 +140,7 @@ struct Function {
   std::string name, linkageName;
   Base result = Base::Void;
   std::vector<Variable> parameters;
-  std::unique_ptr<Stmt> body;
+  StmtRef body;
   bool runtime = false, variadic = false, timer = false;
   bool tensorResult = false;
   std::vector<int64_t> resultShape;
@@ -120,7 +151,17 @@ struct Item {
   std::unique_ptr<Function> function;
 };
 
+struct TensorSchedule {
+  uint32_t node;
+  int64_t rows, reduction, columns;
+  int columnTile;
+  bool uniform;
+  Base base;
+};
 struct ProgramIR {
+  std::unique_ptr<NodeArena<Expr>> expressions = std::make_unique<NodeArena<Expr>>();
+  std::unique_ptr<NodeArena<Stmt>> statements = std::make_unique<NodeArena<Stmt>>();
+  std::vector<TensorSchedule> schedules;
   std::vector<Item> items;
   std::vector<std::unique_ptr<Symbol>> symbols;
   std::vector<std::unique_ptr<Function>> runtime;
@@ -129,6 +170,8 @@ struct ProgramIR {
 TokenIR tokenize(const Source &source);
 ProgramIR parse(const TokenIR &tokens);
 void resolve(ProgramIR &program);
+void planTensors(ProgramIR &program, int tile = 0);
+void printTensorPlan(const ProgramIR &program, std::ostream &out);
 void expandTensors(ProgramIR &program);
 void analyzeTensors(ProgramIR &program);
 void optimizeHighIR(ProgramIR &program, int level);

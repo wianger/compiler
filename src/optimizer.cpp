@@ -11,50 +11,61 @@
 #include <unordered_set>
 
 namespace sysy {
-namespace {
-struct Graph {
-  std::vector<std::vector<int>> pred, succ, children;
-  std::vector<int> order, rank, idom;
-  explicit Graph(const FunctionIR &f) {
-    int count = f.blocks.size(); pred.resize(count); succ.resize(count); children.resize(count);
-    rank.assign(count, -1); idom.assign(count, -1);
-    for (int b = 0; b < count; ++b) {
-      const auto &last = f.blocks[b].instructions.back();
-      for (int next : {last.target, last.otherwise}) if (next >= 0 && std::find(succ[b].begin(), succ[b].end(), next) == succ[b].end()) {
-        succ[b].push_back(next); pred[next].push_back(b);
-      }
+CFGAnalysis::CFGAnalysis(const FunctionIR &f) {
+  int count = f.blocks.size(); pred.resize(count); succ.resize(count); children.resize(count);
+  rank.assign(count, -1); idom.assign(count, -1);
+  for (int b = 0; b < count; ++b) {
+    const auto &last = f.blocks[b].instructions.back();
+    for (int next : {last.target, last.otherwise}) if (next >= 0 && std::find(succ[b].begin(), succ[b].end(), next) == succ[b].end()) {
+      succ[b].push_back(next); pred[next].push_back(b);
     }
-    std::vector<bool> seen(count, false);
-    std::function<void(int)> visit = [&](int b) {
-      if (seen[b]) return;
-      seen[b] = true; for (auto it = succ[b].rbegin(); it != succ[b].rend(); ++it) visit(*it); order.push_back(b);
-    };
-    visit(0); std::reverse(order.begin(), order.end());
-    for (size_t n = 0; n < order.size(); ++n) rank[order[n]] = n;
-    idom[0] = 0;
-    auto intersect = [&](int a, int b) {
-      while (a != b) {
-        while (rank[a] > rank[b]) a = idom[a];
-        while (rank[b] > rank[a]) b = idom[b];
-      }
-      return a;
-    };
-    bool changed;
-    do {
-      changed = false;
-      for (int b : order) if (b != 0) {
-        int parent = -1;
-        for (int p : pred[b]) if (idom[p] >= 0) parent = parent < 0 ? p : intersect(parent, p);
-        if (parent != idom[b]) { idom[b] = parent; changed = true; }
-      }
-    } while (changed);
-    for (int b : order) if (b != 0) children[idom[b]].push_back(b);
   }
-  bool dominates(int a, int b) const {
-    while (b >= 0 && b != a && b != idom[b]) b = idom[b];
-    return a == b;
+  std::vector<bool> seen(count, false);
+  std::function<void(int)> visit = [&](int b) {
+    if (seen[b]) return;
+    seen[b] = true; for (auto it = succ[b].rbegin(); it != succ[b].rend(); ++it) visit(*it); order.push_back(b);
+  };
+  visit(0); std::reverse(order.begin(), order.end());
+  for (size_t n = 0; n < order.size(); ++n) rank[order[n]] = n;
+  idom[0] = 0;
+  auto intersect = [&](int a, int b) {
+    while (a != b) {
+      while (rank[a] > rank[b]) a = idom[a];
+      while (rank[b] > rank[a]) b = idom[b];
+    }
+    return a;
+  };
+  bool changed;
+  do {
+    changed = false;
+    for (int b : order) if (b != 0) {
+      int parent = -1;
+      for (int p : pred[b]) if (idom[p] >= 0) parent = parent < 0 ? p : intersect(parent, p);
+      if (parent != idom[b]) { idom[b] = parent; changed = true; }
+    }
+  } while (changed);
+  for (int b : order) if (b != 0) children[idom[b]].push_back(b);
+  for (const auto &block : f.blocks) {
+    const auto &last = block.instructions.back();
+    topology.push_back({last.target, last.otherwise});
   }
-};
+}
+bool CFGAnalysis::dominates(int a, int b) const {
+  while (b >= 0 && b != a && b != idom[b]) b = idom[b];
+  return a == b;
+}
+const CFGAnalysis &controlFlow(const FunctionIR &f) {
+  bool valid = f.cfg && f.cfg->topology.size() == f.blocks.size();
+  for (size_t b = 0; valid && b < f.blocks.size(); ++b) {
+    const auto &i = f.blocks[b].instructions.back();
+    valid = f.cfg->topology[b] == std::array<int, 2>{i.target, i.otherwise};
+  }
+  if (!valid) { f.cfg = std::make_shared<CFGAnalysis>(f); ++f.cfgBuilds; }
+  else ++f.cfgHits;
+  return *f.cfg;
+}
+namespace {
+using Graph = CFGAnalysis;
 
 bool effect(Op op) { return op == Op::Store || op == Op::Zero || op == Op::Call || op == Op::Jump || op == Op::Branch || op == Op::Return || op == Op::BranchCompare; }
 int newValue(FunctionIR &f, ValueType type) { int id = f.values.size(); f.values.push_back(type); return id; }
@@ -154,7 +165,7 @@ bool constantCall(const Instruction &i, const Summaries &summaries) {
 
 void ssa(FunctionIR &f) {
   if (f.ssa) return;
-  Graph graph(f);
+  const auto &graph = controlFlow(f);
   std::set<int> variables(f.variables.begin(), f.variables.end());
   std::vector<std::set<int>> use(f.blocks.size()), def(f.blocks.size()), live(f.blocks.size()), frontier(f.blocks.size());
   std::map<int, std::set<int>> sites;
@@ -352,11 +363,13 @@ void simplify(FunctionIR &f) {
 
 void deadSSA(FunctionIR &f) {
   auto defs = definitions(f); std::vector<bool> live(f.values.size(), false);
-  std::function<void(int)> mark = [&](int v) {
-    if (live[v]) return;
-    live[v] = true; if (defs[v]) for (int arg : defs[v]->args) mark(arg);
-  };
-  for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (effect(i.op)) for (int arg : i.args) mark(arg);
+  std::vector<int> work;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (effect(i.op)) work.insert(work.end(),i.args.begin(),i.args.end());
+  while (!work.empty()) {
+    int v = work.back(); work.pop_back();
+    if (live[v]) continue;
+    live[v] = true; if (defs[v]) work.insert(work.end(),defs[v]->args.begin(),defs[v]->args.end());
+  }
   for (auto &b : f.blocks) b.instructions.erase(std::remove_if(b.instructions.begin(), b.instructions.end(), [&](const Instruction &i) {
     return !effect(i.op) && i.result >= 0 && !live[i.result];
   }), b.instructions.end());
@@ -371,51 +384,65 @@ void sccp(FunctionIR &f) {
   std::vector<const Instruction *> known(f.values.size(), nullptr);
   std::vector<bool> executable(f.blocks.size(), false); executable[0] = true;
   std::set<std::pair<int, int>> edges;
-  bool changed;
-  do {
-    changed = false;
-    auto merge = [&](int v, Lattice next) {
-      auto &old = lattice[v];
-      if (old.kind == 2 || next.kind == 0) return;
-      if (old.kind == 1 && next.kind == 1 && old.value != next.value) next.kind = 2;
-      if (old.kind != next.kind || (old.kind == 0 && next.kind == 1)) {
-        old = next; changed = true;
-        if (old.kind == 1) { constants[v].immediate = old.value; known[v] = &constants[v]; }
-        else known[v] = nullptr;
-      }
-    };
-    for (size_t b = 0; b < f.blocks.size(); ++b) if (executable[b]) {
-      for (const auto &i : f.blocks[b].instructions) {
-        if (i.result < 0) continue;
-        Lattice next;
-        if (i.op == Op::Constant) next = {1, i.immediate};
-        else if (i.op == Op::Move) next = lattice[i.args[0]];
-        else if (i.op == Op::Phi) {
-          for (size_t n = 0; n < i.args.size(); ++n) if (edges.count({i.edges[n], static_cast<int>(b)})) {
-            auto incoming = lattice[i.args[n]];
-            if (incoming.kind == 0) continue;
-            if (next.kind == 0) next = incoming;
-            else if (incoming.kind == 2 || (next.kind == 1 && incoming.value != next.value)) next.kind = 2;
-          }
-        } else if (i.op == Op::Parameter || i.op == Op::Load || i.op == Op::Call || i.op == Op::Address || i.op == Op::String || i.op == Op::Offset) next.kind = 2;
-        else {
-          bool all = true, over = false;
-          for (int a : i.args) { all &= lattice[a].kind == 1; over |= lattice[a].kind == 2; }
-          if (all) { auto value = fold(i, f, known); next = value ? Lattice{1, *value} : Lattice{2, 0}; }
-          else if (over) next.kind = 2;
+  using Site = std::pair<int,int>;
+  std::vector<std::vector<Site>> users(f.values.size());
+  std::vector<std::vector<bool>> pending(f.blocks.size());
+  std::queue<Site> work;
+  auto enqueue = [&](int b, int n) {
+    if (executable[b] && !pending[b][n]) { pending[b][n] = true; work.push({b,n}); }
+  };
+  for (size_t b = 0; b < f.blocks.size(); ++b) {
+    pending[b].resize(f.blocks[b].instructions.size(),false);
+    for (size_t n = 0; n < pending[b].size(); ++n)
+      for (int a : f.blocks[b].instructions[n].args) users[a].push_back({b,n});
+  }
+  for (size_t n = 0; n < pending[0].size(); ++n) enqueue(0,n);
+  auto merge = [&](int v, Lattice next) {
+    auto &old = lattice[v];
+    if (old.kind == 2 || next.kind == 0) return;
+    if (old.kind == 1 && next.kind == 1 && old.value != next.value) next.kind = 2;
+    if (old.kind == next.kind) return;
+    old = next;
+    if (old.kind == 1) { constants[v].immediate = old.value; known[v] = &constants[v]; }
+    else known[v] = nullptr;
+    for (auto [b,n] : users[v]) enqueue(b,n);
+  };
+  while (!work.empty()) {
+    auto [b,n] = work.front(); work.pop(); pending[b][n] = false;
+    const auto &i = f.blocks[b].instructions[n];
+    if (i.result >= 0) {
+      Lattice next;
+      if (i.op == Op::Constant) next = {1,i.immediate};
+      else if (i.op == Op::Move) next = lattice[i.args[0]];
+      else if (i.op == Op::Phi) {
+        for (size_t p = 0; p < i.args.size(); ++p) if (edges.count({i.edges[p],b})) {
+          auto incoming = lattice[i.args[p]];
+          if (!incoming.kind) continue;
+          if (!next.kind) next = incoming;
+          else if (incoming.kind == 2 || (next.kind == 1 && incoming.value != next.value)) next.kind = 2;
         }
-        merge(i.result, next);
+      } else if (i.op == Op::Parameter || i.op == Op::Load || i.op == Op::Call || i.op == Op::Address || i.op == Op::String || i.op == Op::Offset) next.kind = 2;
+      else {
+        bool all = true, over = false;
+        for (int a : i.args) { all &= lattice[a].kind == 1; over |= lattice[a].kind == 2; }
+        if (all) { auto value = fold(i,f,known); next = value ? Lattice{1,*value} : Lattice{2,0}; }
+        else if (over) next.kind = 2;
       }
-      const auto &last = f.blocks[b].instructions.back();
-      auto activate = [&](int s) { if (s >= 0) { changed |= edges.emplace(b, s).second; executable[s] = true; } };
-      if (last.op == Op::Jump) activate(last.target);
-      if (last.op == Op::Branch) {
-        auto test = lattice[last.args[0]];
-        if (test.kind == 1) activate(test.value ? last.target : last.otherwise);
-        if (test.kind == 2) { activate(last.target); activate(last.otherwise); }
-      }
+      merge(i.result,next);
     }
-  } while (changed);
+    auto activate = [&](int successor) {
+      if (successor < 0 || !edges.emplace(b,successor).second) return;
+      bool first = !executable[successor]; executable[successor] = true;
+      for (size_t p = 0; p < pending[successor].size(); ++p)
+        if (first || f.blocks[successor].instructions[p].op == Op::Phi) enqueue(successor,p);
+    };
+    if (i.op == Op::Jump) activate(i.target);
+    if (i.op == Op::Branch) {
+      auto test = lattice[i.args[0]];
+      if (test.kind == 1) activate(test.value ? i.target : i.otherwise);
+      else if (test.kind == 2) { activate(i.target); activate(i.otherwise); }
+    }
+  }
   for (auto &b : f.blocks) for (auto &i : b.instructions) {
     if (i.result >= 0 && lattice[i.result].kind == 1 && !effect(i.op)) {
       i.op = Op::Constant; i.immediate = lattice[i.result].value; i.args.clear(); i.edges.clear(); i.symbol = nullptr;
@@ -429,11 +456,30 @@ void sccp(FunctionIR &f) {
 
 void gvn(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
-  Graph graph(f); std::vector<int> aliases(f.values.size());
+  const auto &graph = controlFlow(f); std::vector<int> aliases(f.values.size());
   for (size_t v = 0; v < aliases.size(); ++v) aliases[v] = v;
-  using Table = std::map<std::string, int>;
-  std::function<void(int, Table)> visit = [&](int b, Table expressions) {
-    std::map<int, int> memory;
+  struct Key {
+    Op op; ValueType type; int64_t immediate;
+    const Symbol *symbol; const Function *callee;
+    std::string text; std::vector<int> args;
+    bool operator==(const Key &other) const {
+      return op == other.op && type == other.type && immediate == other.immediate &&
+          symbol == other.symbol && callee == other.callee && text == other.text && args == other.args;
+    }
+  };
+  struct Hash {
+    size_t operator()(const Key &k) const {
+      size_t h = static_cast<size_t>(k.op);
+      auto mix = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ull+(h<<6)+(h>>2); };
+      mix(static_cast<size_t>(k.type)); mix(k.immediate); mix(reinterpret_cast<uintptr_t>(k.symbol));
+      mix(reinterpret_cast<uintptr_t>(k.callee)); mix(std::hash<std::string>{}(k.text));
+      for (int a : k.args) mix(a);
+      return h;
+    }
+  };
+  std::unordered_map<Key,int,Hash> expressions;
+  std::function<void(int)> visit = [&](int b) {
+    std::map<int, int> memory; std::vector<Key> insertedKeys;
     for (auto &i : f.blocks[b].instructions) {
       for (int &a : i.args) a = root(aliases, a);
       if (i.op == Op::Store) { memory.clear(); memory[i.args[0]] = i.args[1]; }
@@ -447,18 +493,17 @@ void gvn(FunctionIR &f, const Summaries &summaries) {
         continue;
       }
       if (i.op == Op::Phi || i.op == Op::Parameter || (i.op == Op::Call && !constantCall(i, summaries))) continue;
-      std::ostringstream key;
-      key << static_cast<int>(i.op) << ':' << static_cast<int>(f.values[i.result]) << ':' << i.immediate << ':' << i.symbol << ':' << i.callee << ':' << i.text;
-      auto args = i.args;
-      if (args.size() == 2 && (i.op == Op::Eq || i.op == Op::Ne ||
-          ((i.op == Op::Add || i.op == Op::Mul) && f.values[i.result] == ValueType::Int)) && args[0] > args[1]) std::swap(args[0], args[1]);
-      for (int a : args) key << ':' << a;
-      auto inserted = expressions.emplace(key.str(), i.result);
+      Key key{i.op,f.values[i.result],i.immediate,i.symbol,i.callee,i.text,i.args};
+      if (key.args.size() == 2 && (i.op == Op::Eq || i.op == Op::Ne ||
+          ((i.op == Op::Add || i.op == Op::Mul) && f.values[i.result] == ValueType::Int)) && key.args[0] > key.args[1]) std::swap(key.args[0],key.args[1]);
+      auto inserted = expressions.emplace(key, i.result);
       if (!inserted.second) aliases[i.result] = inserted.first->second;
+      else insertedKeys.push_back(std::move(key));
     }
-    for (int child : graph.children[b]) visit(child, expressions);
+    for (int child : graph.children[b]) visit(child);
+    for (const auto &key : insertedKeys) expressions.erase(key);
   };
-  visit(0, {});
+  visit(0);
   for (auto &b : f.blocks) for (auto &i : b.instructions) {
     for (int &a : i.args) a = root(aliases, a);
     if (i.result >= 0 && aliases[i.result] != i.result) { i.op = Op::Move; i.args = {root(aliases, i.result)}; i.edges.clear(); }
@@ -467,57 +512,122 @@ void gvn(FunctionIR &f, const Summaries &summaries) {
 
 struct Loop { int header; std::set<int> blocks; };
 
-void memoryForward(FunctionIR &f, const Summaries &summaries) {
-  if (!f.ssa) return;
-  Graph graph(f); auto roots = provenance(f);
-  using Key = std::pair<int, ValueType>;
-  using State = std::map<Key, int>;
-  std::vector<State> in(f.blocks.size()), out(f.blocks.size());
-  auto transfer = [&](int b, State state) {
-    auto invalidate = [&](const Regions &writes) {
-      for (auto it = state.begin(); it != state.end();)
-        if (overlaps(roots[it->first.first], writes)) it = state.erase(it); else ++it;
-    };
-    for (const auto &i : f.blocks[b].instructions) {
-      if (i.op == Op::Store || i.op == Op::Zero) invalidate(roots[i.args[0]]);
-      if (i.op == Op::Call) invalidate(callEffects(i, roots, summaries).writes);
-      if (i.op == Op::Store) state[{i.args[0], f.values[i.args[1]]}] = i.args[1];
-      if (i.op == Op::Load) state.emplace(Key{i.args[0], f.values[i.result]}, i.result);
-    }
-    return state;
-  };
-  bool changed;
-  do {
-    changed = false;
-    for (int b : graph.order) {
-      State available;
-      if (b != 0 && !graph.pred[b].empty()) {
-        available = out[graph.pred[b][0]];
-        for (int p : graph.pred[b]) for (auto it = available.begin(); it != available.end();) {
-          auto other = out[p].find(it->first);
-          if (other == out[p].end() || other->second != it->second) it = available.erase(it); else ++it;
+// Whole-memory SSA keeps potentially aliasing parameters in one chain. The
+// walker skips only writes proven disjoint by provenance and call summaries.
+struct MemoryNode {
+  enum Kind { Entry, Def, Phi } kind = Entry;
+  int block = 0, position = -1, previous = 0;
+  Regions writes;
+  std::vector<int> inputs;
+};
+struct MemorySSA {
+  std::vector<MemoryNode> nodes{MemoryNode{}};
+  std::vector<std::vector<int>> before;
+  std::vector<int> incoming, outgoing, phis;
+  mutable std::map<std::pair<int,Regions>,int> answers;
+  MemorySSA(const FunctionIR &f, const Summaries &summaries, const std::vector<Regions> &roots) {
+    const auto &g = controlFlow(f);
+    size_t count = f.blocks.size();
+    before.resize(count); incoming.assign(count, 0); outgoing.assign(count, 0); phis.assign(count, 0);
+    std::vector<std::vector<int>> defs(count);
+    for (size_t b = 0; b < count; ++b) {
+      if (g.pred[b].size() > 1) {
+        phis[b] = nodes.size(); MemoryNode phi; phi.kind = MemoryNode::Phi; phi.block = b;
+        phi.inputs.resize(g.pred[b].size()); nodes.push_back(std::move(phi));
+      }
+      before[b].resize(f.blocks[b].instructions.size()); defs[b].resize(before[b].size());
+      for (size_t n = 0; n < before[b].size(); ++n) {
+        const auto &i = f.blocks[b].instructions[n]; Regions writes;
+        if (i.op == Op::Store || i.op == Op::Zero) writes = roots[i.args[0]];
+        else if (i.op == Op::Call) writes = callEffects(i, roots, summaries).writes;
+        if (!writes.empty()) {
+          defs[b][n] = nodes.size(); MemoryNode d; d.kind = MemoryNode::Def; d.block = b;
+          d.position = n; d.writes = std::move(writes); nodes.push_back(std::move(d));
         }
       }
-      auto next = transfer(b, available);
-      if (next != out[b] || available != in[b]) { in[b] = std::move(available); out[b] = std::move(next); changed = true; }
     }
-  } while (changed);
-  for (int b : graph.order) {
-    auto state = in[b];
-    auto invalidate = [&](const Regions &writes) {
-      for (auto it = state.begin(); it != state.end();)
-        if (overlaps(roots[it->first.first], writes)) it = state.erase(it); else ++it;
-    };
-    for (auto &i : f.blocks[b].instructions) {
-      if (i.op == Op::Store || i.op == Op::Zero) invalidate(roots[i.args[0]]);
-      if (i.op == Op::Call) invalidate(callEffects(i, roots, summaries).writes);
-      if (i.op == Op::Store) state[{i.args[0], f.values[i.args[1]]}] = i.args[1];
-      if (i.op == Op::Load) {
-        auto inserted = state.emplace(Key{i.args[0], f.values[i.result]}, i.result);
-        if (!inserted.second && inserted.first->second != i.result) { i.op = Op::Move; i.args = {inserted.first->second}; }
+    bool changed;
+    do {
+      changed = false;
+      for (int b : g.order) {
+        int v = phis[b] ? phis[b] : b == 0 || g.pred[b].empty() ? 0 : outgoing[g.pred[b][0]];
+        incoming[b] = v;
+        for (size_t n = 0; n < defs[b].size(); ++n) {
+          before[b][n] = v;
+          if (defs[b][n]) { nodes[defs[b][n]].previous = v; v = defs[b][n]; }
+        }
+        if (v != outgoing[b]) { outgoing[b] = v; changed = true; }
       }
+    } while (changed);
+    for (size_t b = 0; b < count; ++b) if (phis[b])
+      for (size_t n = 0; n < g.pred[b].size(); ++n) nodes[phis[b]].inputs[n] = outgoing[g.pred[b][n]];
+    for (size_t id = 1; id < nodes.size(); ++id) {
+      const auto &node = nodes[id];
+      if (node.kind == MemoryNode::Def && node.previous == static_cast<int>(id))
+        throw std::logic_error("self-referencing memory definition");
     }
   }
+  int clobber(int version, const Regions &reads) const {
+    if (reads.empty()) return 0;
+    auto key = std::make_pair(version,reads); auto cached = answers.find(key);
+    if (cached != answers.end()) return cached->second;
+    std::set<int> terminal; std::vector<int> work{version};
+    std::vector<bool> visited(nodes.size(), false); int firstPhi = -1;
+    while (!work.empty()) {
+      int v = work.back(); work.pop_back();
+      if (visited[v]) continue;
+      visited[v] = true; const auto &node = nodes[v];
+      if (node.kind == MemoryNode::Entry || (node.kind == MemoryNode::Def && overlaps(node.writes, reads))) terminal.insert(v);
+      else if (node.kind == MemoryNode::Def) work.push_back(node.previous);
+      else {
+        if (firstPhi < 0) firstPhi = v;
+        work.insert(work.end(), node.inputs.begin(), node.inputs.end());
+      }
+    }
+    int answer = terminal.size() == 1 ? *terminal.begin() : firstPhi < 0 ? version : firstPhi;
+    answers.emplace(std::move(key),answer); return answer;
+  }
+};
+
+void memoryForward(FunctionIR &f, const Summaries &summaries) {
+  if (!f.ssa) return;
+  const auto &graph = controlFlow(f); auto roots = provenance(f);
+  MemorySSA memory(f, summaries, roots);
+  using Key = std::tuple<int, ValueType, int>;
+  std::map<Key, int> loads;
+  std::map<std::string, int> calls;
+  std::function<void(int)> visit = [&](int b) {
+    std::vector<Key> addedLoads; std::vector<std::string> addedCalls;
+    for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
+      auto &i = f.blocks[b].instructions[n];
+      if (i.op == Op::Load) {
+        int version = memory.clobber(memory.before[b][n], roots[i.args[0]]);
+        Key key{i.args[0], f.values[i.result], version}; int available = -1;
+        auto previous = loads.find(key);
+        if (previous != loads.end()) available = previous->second;
+        const auto &node = memory.nodes[version];
+        if (available < 0 && node.kind == MemoryNode::Def && graph.dominates(node.block, b) &&
+            (node.block != b || node.position < static_cast<int>(n))) {
+          const auto &store = f.blocks[node.block].instructions[node.position];
+          if (store.op == Op::Store && store.args[0] == i.args[0] && f.values[store.args[1]] == f.values[i.result]) available = store.args[1];
+        }
+        if (available >= 0) { i.op = Op::Move; i.args = {available}; }
+        else { loads.emplace(key, i.result); addedLoads.push_back(key); }
+      } else if (i.op == Op::Call && i.result >= 0) {
+        auto e = callEffects(i, roots, summaries);
+        if (e.observable || !e.writes.empty()) continue;
+        std::ostringstream text; text << i.callee << ':' << memory.clobber(memory.before[b][n], e.reads);
+        for (int a : i.args) text << ':' << a;
+        auto key = text.str(); auto previous = calls.find(key);
+        if (previous != calls.end()) { i.op = Op::Move; i.args = {previous->second}; i.callee = nullptr; }
+        else { calls.emplace(key, i.result); addedCalls.push_back(key); }
+      }
+    }
+    for (int child : graph.children[b]) visit(child);
+    for (const auto &key : addedLoads) loads.erase(key);
+    for (const auto &key : addedCalls) calls.erase(key);
+  };
+  visit(0);
 }
 
 std::vector<Loop> loops(const Graph &graph) {
@@ -539,9 +649,9 @@ std::vector<Loop> loops(const Graph &graph) {
 
 void rotate(FunctionIR &f) {
   if (!f.ssa) return;
-  auto nests = loops(Graph(f));
+  auto nests = loops(controlFlow(f));
   for (const auto &original : nests) {
-    Graph graph(f);
+    const auto &graph = controlFlow(f);
     auto current = loops(graph);
     auto found = std::find_if(current.begin(), current.end(), [&](const Loop &l) { return l.header == original.header; });
     if (found == current.end()) continue;
@@ -605,7 +715,7 @@ void rotate(FunctionIR &f) {
 
 void unrollRuntime(FunctionIR &f, int h, int test, const std::vector<Instruction> &body,
     const std::vector<Instruction> &phis, size_t first, int iv, const Instruction &compare) {
-  Graph graph(f);
+  const auto &graph = controlFlow(f);
   int pre = -1;
   for (int p : graph.pred[h]) if (p != test) pre = p;
   if (pre < 0 || graph.succ[pre].size() != 1 || body.size()-first-1 > 32) return;
@@ -677,10 +787,10 @@ void unrollRuntime(FunctionIR &f, int h, int test, const std::vector<Instruction
 
 void unroll(FunctionIR &f) {
   if (!f.ssa) return;
-  auto nests = loops(Graph(f));
+  auto nests = loops(controlFlow(f));
   for (const auto &loop : nests) {
     if (loop.blocks.size() != 2) continue;
-    Graph graph(f); auto defs = definitions(f);
+    auto defs = definitions(f);
     int h = loop.header; const auto body = f.blocks[h].instructions;
     if (body.back().op != Op::Jump) continue;
     int test = body.back().target;
@@ -803,7 +913,7 @@ void arithmetic(FunctionIR &f) {
     if (i.op == Op::Constant && f.values[i.result] == ValueType::Int) ranges[i.result] = {{i.immediate, i.immediate}};
     if (i.op >= Op::Eq && i.op <= Op::Ge) ranges[i.result] = {{0, 1}};
   }
-  Graph graph(f);
+  const auto &graph = controlFlow(f);
   for (const auto &loop : loops(graph)) {
     const auto &branch = f.blocks[loop.header].instructions.back();
     if (branch.op != Op::Branch || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise)) continue;
@@ -890,9 +1000,9 @@ void arithmetic(FunctionIR &f) {
 
 void licm(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
-  auto nests = loops(Graph(f));
+  auto nests = loops(controlFlow(f));
   for (const auto &original : nests) {
-    Graph graph(f); auto current = loops(graph);
+    const auto &graph = controlFlow(f); auto current = loops(graph);
     auto found = std::find_if(current.begin(), current.end(), [&](const Loop &l) { return l.header == original.header; });
     if (found == current.end()) continue;
     const auto loop = *found; std::vector<int> outside;
@@ -964,9 +1074,9 @@ void compact(FunctionIR &f) {
 
 void strength(FunctionIR &f) {
   if (!f.ssa) return;
-  auto nests = loops(Graph(f));
+  auto nests = loops(controlFlow(f));
   for (const auto &loop : nests) {
-    Graph graph(f); auto original = definitions(f);
+    const auto &graph = controlFlow(f); auto original = definitions(f);
     // Own the facts: insertion into blocks must not invalidate analysis pointers.
     std::vector<std::optional<Instruction>> defs(f.values.size());
     std::vector<int> site(f.values.size(), -1);
@@ -1094,6 +1204,28 @@ void printEffects(const ModuleIR &module, std::ostream &out) {
   }
 }
 
+void printMemoryIR(const ModuleIR &module, std::ostream &out) {
+  auto summaries = summarize(module);
+  for (const auto &f : module.functions) {
+    auto roots = provenance(f); MemorySSA memory(f, summaries, roots);
+    out << "function " << f.source->name << " memory\n  m0 = entry\n";
+    for (size_t id = 1; id < memory.nodes.size(); ++id) {
+      const auto &n = memory.nodes[id]; out << "  m" << id << " = ";
+      if (n.kind == MemoryNode::Phi) {
+        out << "phi b" << n.block;
+        const auto &pred = controlFlow(f).pred[n.block];
+        for (size_t p = 0; p < n.inputs.size(); ++p) out << " [b" << pred[p] << ": m" << n.inputs[p] << ']';
+      } else out << "def m" << n.previous << " at b" << n.block << '.' << n.position;
+      out << '\n';
+    }
+    for (size_t b = 0; b < f.blocks.size(); ++b) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
+      const auto &i = f.blocks[b].instructions[n];
+      if (i.op == Op::Load) out << "  use b" << b << '.' << n << " m" << memory.before[b][n]
+          << " clobber=m" << memory.clobber(memory.before[b][n], roots[i.args[0]]) << '\n';
+    }
+  }
+}
+
 bool runAdvancedPass(ModuleIR &module, const std::string &name) {
   if (name == "globaldce") {
     std::map<const Function *, const FunctionIR *> functions;
@@ -1116,11 +1248,12 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       throw std::runtime_error("inline must precede SSA construction");
     inlineCalls(module); return true;
   }
-  if (name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
     if (name == "gvn" || name == "licm" || name == "memory") summaries = summarize(module);
     for (auto &f : module.functions) {
-      if (name == "ssa") ssa(f);
+      if (name == "egraph") rewriteEqualities(f);
+      else if (name == "ssa") ssa(f);
       else if (name == "simplify") simplify(f);
       else if (name == "sccp") { sccp(f); repairPhi(f); }
       else if (name == "gvn") gvn(f, summaries);
@@ -1145,12 +1278,12 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
 
 std::vector<int> loopDepth(const FunctionIR &f) {
   std::vector<int> depth(f.blocks.size(), 0);
-  for (const auto &loop : loops(Graph(f))) for (int b : loop.blocks) ++depth[b];
+  for (const auto &loop : loops(controlFlow(f))) for (int b : loop.blocks) ++depth[b];
   return depth;
 }
 
 void layoutBlocks(FunctionIR &f) {
-  Graph graph(f); std::vector<int> ids(f.blocks.size(), -1); std::vector<BasicBlock> blocks;
+  const auto &graph = controlFlow(f); std::vector<int> ids(f.blocks.size(), -1); std::vector<BasicBlock> blocks;
   for (int b : graph.order) { ids[b] = blocks.size(); blocks.push_back(std::move(f.blocks[b])); }
   for (auto &b : blocks) for (auto &i : b.instructions) {
     if (i.target >= 0) i.target = ids[i.target];
@@ -1162,7 +1295,7 @@ void layoutBlocks(FunctionIR &f) {
 
 void repairPhi(FunctionIR &f) {
   if (!f.ssa) return;
-  Graph graph(f);
+  const auto &graph = controlFlow(f);
   for (size_t b = 0; b < f.blocks.size(); ++b) for (auto &i : f.blocks[b].instructions) if (i.op == Op::Phi) {
     std::vector<int> args, edges;
     for (size_t n = 0; n < i.edges.size(); ++n)
@@ -1175,7 +1308,7 @@ void repairPhi(FunctionIR &f) {
 
 void verifySSA(const FunctionIR &f) {
   if (!f.ssa) return;
-  Graph graph(f); std::vector<int> sites(f.values.size(), -1), positions(f.values.size(), -1);
+  const auto &graph = controlFlow(f); std::vector<int> sites(f.values.size(), -1), positions(f.values.size(), -1);
   for (size_t b = 0; b < f.blocks.size(); ++b) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
     const auto &i = f.blocks[b].instructions[n];
     if (i.result >= 0) {

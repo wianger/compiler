@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--opt", type=int, choices=range(4), default=2)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--check-alloc", action="store_true")
     parser.add_argument("--exclude-tensor", action="store_true")
     opts = parser.parse_args()
     if opts.jobs < 1 or opts.timeout <= 0:
@@ -93,7 +94,7 @@ def main():
         started = time.monotonic()
         try:
             commands = [
-                [str(opts.compiler.resolve()), f"-O{opts.opt}", str(case), "-o", str(assembly)],
+                [str(opts.compiler.resolve()), f"-O{opts.opt}", str(case), "-o", str(assembly)] + (["--check-alloc"] if opts.check_alloc else []),
                 [assembler, "-march=rv64gc", "-mabi=lp64d", str(assembly), "-o", str(obj)],
                 [linker, "-o", str(executable), "-dynamic-linker", "/lib/ld-linux-riscv64-lp64d.so.1",
                  "-rpath-link", str(lib), str(lib / "crt1.o"), str(lib / "crti.o"), str(obj),

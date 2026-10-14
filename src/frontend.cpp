@@ -20,7 +20,7 @@ class Lexer {
     else ++location.column;
     return c;
   }
-  std::string number() {
+  std::string_view number() {
     size_t start = position;
     bool hexadecimal = peek() == '0' && (peek(1) == 'x' || peek(1) == 'X');
     if (hexadecimal) { take(); take(); }
@@ -44,7 +44,7 @@ class Lexer {
     if (floating) { if (peek() == 'f' || peek() == 'F' || peek() == 'l' || peek() == 'L') take(); }
     else { while (peek() == 'u' || peek() == 'U' || peek() == 'l' || peek() == 'L') take(); }
     if (alpha(peek()) || peek() == '.') throw Error(location, "invalid numeric literal");
-    return source.substr(start, position - start);
+    return std::string_view(source).substr(start, position - start);
   }
   std::string string() {
     Location start = location;
@@ -105,18 +105,20 @@ public:
       if (alpha(peek())) {
         size_t begin = position;
         while (alpha(peek()) || digit(peek())) take();
-        result.push_back({TokenKind::Identifier, source.substr(begin, position - begin), start});
+        result.push_back({TokenKind::Identifier, std::string_view(source).substr(begin, position - begin), start});
       } else if (digit(peek()) || (peek() == '.' && digit(peek(1)))) {
         result.push_back({TokenKind::Number, number(), start});
       } else if (peek() == '"') {
-        result.push_back({TokenKind::String, string(), start});
+        result.strings.push_back(string());
+        result.push_back({TokenKind::String, result.strings.back(), start});
       } else {
+        size_t begin = position;
         std::string op(1, take());
         if ((op == "&" && peek() == '&') || (op == "|" && peek() == '|') ||
             ((op == "=" || op == "!" || op == "<" || op == ">") && peek() == '=')) op += take();
         if (std::string("+-*/%@!=<>(){}[],;").find(op[0]) == std::string::npos && op != "&&" && op != "||")
           throw Error(start, "unexpected character '" + op + "'");
-        result.push_back({TokenKind::Punctuation, op, start});
+        result.push_back({TokenKind::Punctuation, std::string_view(source).substr(begin, position-begin), start});
       }
     }
     result.push_back({TokenKind::End, "", location});
@@ -126,17 +128,18 @@ public:
 
 class Parser {
   const TokenIR &tokens;
+  ProgramIR program;
   size_t position = 0;
   const Token &peek() const { return tokens.at(position); }
-  bool at(const std::string &text) const { return peek().text == text; }
+  bool at(std::string_view text) const { return peek().text == text; }
   Token take() { return tokens.at(position++); }
-  bool accept(const std::string &text) { if (!at(text)) return false; take(); return true; }
+  bool accept(std::string_view text) { if (!at(text)) return false; take(); return true; }
   Token expect(const std::string &text) {
-    if (!at(text)) throw Error(peek().location, "expected '" + text + "', found '" + peek().text + "'");
+    if (!at(text)) throw Error(peek().location, "expected '" + text + "', found '" + std::string(peek().text) + "'");
     return take();
   }
   Token identifier() {
-    static const std::unordered_set<std::string> keywords = {
+    static const std::unordered_set<std::string_view> keywords = {
         "const", "tensor", "int", "float", "void", "if", "else", "while", "break", "continue", "return"};
     if (peek().kind != TokenKind::Identifier || keywords.count(peek().text))
       throw Error(peek().location, "expected identifier");
@@ -148,7 +151,7 @@ class Parser {
     if (allowVoid && accept("void")) return Base::Void;
     throw Error(peek().location, "expected type");
   }
-  static int precedence(const std::string &op) {
+  static int precedence(std::string_view op) {
     if (op == "||") return 1;
     if (op == "&&") return 2;
     if (op == "==" || op == "!=") return 3;
@@ -157,19 +160,19 @@ class Parser {
     if (op == "*" || op == "/" || op == "%" || op == "@") return 6;
     return 0;
   }
-  std::unique_ptr<Expr> primary() {
+  ExprRef primary() {
     if (accept("(")) { auto e = expression(); expect(")"); return e; }
     if (at("+") || at("-") || at("!")) {
       auto op = take();
-      auto e = std::make_unique<Expr>(Expr::Kind::Unary, op.location, op.text);
+      auto e = program.expressions->make(Expr::Kind::Unary, op.location, op.text);
       e->operands.push_back(primary()); return e;
     }
     if (peek().kind == TokenKind::Number || peek().kind == TokenKind::String) {
       auto t = take();
-      return std::make_unique<Expr>(t.kind == TokenKind::Number ? Expr::Kind::Number : Expr::Kind::String, t.location, t.text);
+      return program.expressions->make(t.kind == TokenKind::Number ? Expr::Kind::Number : Expr::Kind::String, t.location, t.text);
     }
     auto name = identifier();
-    auto e = std::make_unique<Expr>(Expr::Kind::Variable, name.location, name.text);
+    auto e = program.expressions->make(Expr::Kind::Variable, name.location, name.text);
     if (accept("(")) {
       e->kind = Expr::Kind::Call;
       if (!at(")")) {
@@ -181,11 +184,11 @@ class Parser {
     }
     return e;
   }
-  std::unique_ptr<Expr> expression(int minimum = 1) {
+  ExprRef expression(int minimum = 1) {
     auto left = primary();
     while (precedence(peek().text) >= minimum) {
       auto op = take();
-      auto e = std::make_unique<Expr>(Expr::Kind::Binary, op.location, op.text);
+      auto e = program.expressions->make(Expr::Kind::Binary, op.location, op.text);
       e->operands.push_back(std::move(left));
       e->operands.push_back(expression(precedence(op.text) + 1));
       left = std::move(e);
@@ -222,12 +225,12 @@ class Parser {
     expect(";");
     return variables;
   }
-  std::unique_ptr<Stmt> block() {
-    auto s = std::make_unique<Stmt>(Stmt::Kind::Block, expect("{").location);
+  StmtRef block() {
+    auto s = program.statements->make(Stmt::Kind::Block, expect("{").location);
     while (!at("}")) {
       if (peek().kind == TokenKind::End) throw Error(peek().location, "unterminated block");
       if (at("const") || at("tensor") || at("int") || at("float")) {
-        auto d = std::make_unique<Stmt>(Stmt::Kind::Declaration, peek().location);
+        auto d = program.statements->make(Stmt::Kind::Declaration, peek().location);
         bool isConst = accept("const");
         bool tensor = accept("tensor");
         Base type = base();
@@ -237,10 +240,10 @@ class Parser {
     }
     expect("}"); return s;
   }
-  std::unique_ptr<Stmt> statement() {
+  StmtRef statement() {
     if (at("{")) return block();
     Location loc = peek().location;
-    auto s = std::make_unique<Stmt>(Stmt::Kind::Expression, loc);
+    auto s = program.statements->make(Stmt::Kind::Expression, loc);
     if (accept("if")) {
       s->kind = Stmt::Kind::If; expect("("); s->expression = expression(); expect(")");
       s->children.push_back(statement());
@@ -267,7 +270,6 @@ class Parser {
 public:
   explicit Parser(const TokenIR &tokens) : tokens(tokens) {}
   ProgramIR run() {
-    ProgramIR program;
     while (peek().kind != TokenKind::End) {
       bool isConst = accept("const");
       bool tensor = accept("tensor");
@@ -295,7 +297,7 @@ public:
       }
       program.items.push_back(std::move(item));
     }
-    return program;
+    return std::move(program);
   }
 };
 } // namespace
