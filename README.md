@@ -17,7 +17,8 @@ build/compiler -S -O3 test/functional/00_main.sy -o build/main.s
 ```
 Source → Token IR → Program IR → resolved Program IR
        → tensor structure analysis → expanded HIR → control-flow IR
-       → SSA IR → target IR → register allocation → RISC-V assembly
+       → SSA IR → phi lowering / branch selection
+       → register allocation → RISC-V assembly
 ```
 
 - `frontend.cpp` 产生 Token IR 和结构化 Program IR。
@@ -27,7 +28,9 @@ Source → Token IR → Program IR → resolved Program IR
 - `optimizer.cpp` 计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。通过调用图不动点与指针来源分析推导函数的读写摘要，合并相同纯函数调用，并跨基本块消除冗余加载。实现按循环位置选择的小函数内联、尾递归消除、稀疏条件常量传播、循环不变量外提、范围分析与整数算术简化、指针归纳变量和循环旋转。`-O3` 对合适的固定、动态次数循环展开；动态展开保留标量尾循环，浮点运算顺序保持一致。
 - `backend.cpp` 将 Phi 降为边上的并行复制，选择比较分支和布局，按真实冲突图与循环权重分配寄存器。使用带 ABI 约束的 Briggs 复制合并，充分使用调用者与被调用者保存的寄存器；调用参数也按并行复制处理，解决寄存器交换中的环。分配后消除无操作复制块和多余跳转。选择立即数、移位和整数倒数乘法，生成符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。
 
-标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。每层 IR 都可单独打印，各 PASS 可以重新组合。
+标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。Token、Program、SSA 和降 Phi 后的 IR 可单独打印，各 PASS 可以重新组合。
+
+当前 `--emit-mir` 仍复用通用寄存器 IR，尚无独立目标机器指令与完整操作数约束。当前 AST 是指针树，寄存器分配采用 Briggs 图着色；EGraph、红绿树、ISLE、GlobalISel 和 regalloc2 未实现。各阶段的实现审计、一手资料和后续架构建议见 [Architecture-Research.md](docs/Architecture-Research.md)。
 
 ```sh
 build/compiler --emit-tokens input.sy
