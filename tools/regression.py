@@ -652,6 +652,198 @@ def main():
           sum=sum+x/8+x%8;if(x>=0){{x=x*1664525+1013904223;sum=sum+x/8+x%8;}}
           putf("%d %d\\n",sum,x);return 0;}}''',f"{total} {x}\n0\n")
         (directory / f"{name}.in").write_text(f"{original}\n")
+    for trips in (0,1,3,7):
+        name=f"repeat_revisited_{trips}"
+        cases[name]=('''int main(){int n=getint();int r=0;int i=0;int sum=0;
+          while(r<n){while(i<5){sum=sum+7;i=i+1;}r=r+1;}
+          putf("%d %d %d\\n",sum,i,r);return 0;}''',
+          f"{35 if trips else 0} {5 if trips else 0} {trips}\n0\n")
+        (directory/f"{name}.in").write_text(f"{trips}\n")
+    for n,x in enumerate((-2147483648,-17,0,17,2147483647)):
+        name=f"affine_functions_{n}"
+        # A constant result may still have observable argument evaluation. A
+        # caller that evaluates getint cannot itself receive a pure summary.
+        cases[name]=('''int count;
+          int combine(int a,int b){return a+b;}
+          int cancel(int a,int b){return a-combine(a,b)+b;}
+          int shifted(int a,int b){return combine(a*31+7,b*(-17))+19;}
+          int tick(){count=count+1;return count;}
+          int read(int x){return cancel(getint(),x);}
+          int main(){int x=getint();int value=cancel(tick(),tick());
+            int other=read(x);int tail=getint();putf("%d %d %d %d %d\\n",value,count,other,tail,shifted(x,x));return 0;}''',
+          f"0 2 0 99 {wrap(x*14+26)}\n0\n")
+        (directory/f"{name}.in").write_text(f"{x} 123 99\n")
+    for case in range(30):
+        delta,mod=[(128,65535),(1,17),(2147483647,1),(7,2147483647),(-7,31),(0,17)][case%6]
+        trip=[-3,0,1,3,31][case//6]
+        seed=[-2147483648,-17,0,31,2147483647-1][case//6]
+        total=seed
+        for _ in range(max(trip,0)):total=remainder(wrap(total+delta),mod)
+        name=f"modular_recurrence_{case:02d}"
+        cases[name]=(f'''int compute(int x,int n,int depth){{if(depth)return compute(x,n,depth-1);int i=0;
+          while(i<n){{x=x+({delta});x=x%{mod};i=i+1;}}putint(i);putch(32);return x;}}
+          int main(){{int x=getint();int n=getint();putint(compute(x,n,2));return 0;}}''',
+          f"{max(trip,0)} {total}\n0\n")
+        (directory/f"{name}.in").write_text(f"{seed} {trip}\n")
+    cases['modular_resumed']=('''int main(){int x=getint();int i=0;int n=2;int r=0;
+      while(r<3){while(i<n){x=x+7;x=x%31;i=i+1;}n=n+3;r=r+1;}
+      putf("%d %d %d\\n",x,i,n);return 0;}''','5 8 11\n0\n')
+    (directory/'modular_resumed.in').write_text('11\n')
+    for case,seed in enumerate((65534,2147483647-128*31,2147483647-128*31+1,2147483647-127)):
+        total=seed
+        for _ in range(31):total=remainder(wrap(total+128),65535)
+        name=f'modular_guard_boundary_{case}'
+        cases[name]=('''int main(){int x=getint();int n=getint();int i=0;
+          while(i<n){x=x+128;x=x%65535;i=i+1;}putf("%d %d\\n",x,i);return 0;}''',f'{total} 31\n0\n')
+        (directory/f'{name}.in').write_text(f'{seed} 31\n')
+    cases['runtime_memory_contract']=('''int g=17;int a[2][3]={{1,2,3},{4,5,6}};
+      int main(){int before=a[1][0];int x=getint();putarray(3,a[0]);
+        int n=getarray(a[1]);putf("%d %d %d %d\\n",g,x,before,n);putarray(6,a[0]);return 0;}''',
+      '3: 1 2 3\n17 99 4 2\n6: 1 2 3 8 9 6\n0\n')
+    (directory/'runtime_memory_contract.in').write_text('99\n2 8 9\n')
+    for case,(divisor,trip,seed) in enumerate((d,n,x) for d in (2,16,1073741824)
+                                           for n in (-1,0,1,7,8,31,32,34)
+                                           for x in (-2147483648,-17,0,17,2147483647)):
+        total=seed
+        for _ in range(max(trip,0)):total=abs(total)//divisor*(-1 if total<0 else 1)
+        name=f'quotient_recurrence_{case:03d}'
+        cases[name]=(f'''int main(){{int x=getint();int n=getint();int i=0;
+          while(i<n){{x=x/{divisor};i=i+1;}}putf("%d %d\\n",x,i);return 0;}}''',f'{total} {max(trip,0)}\n0\n')
+        (directory/f'{name}.in').write_text(f'{seed} {trip}\n')
+    cases['quotient_resumed']=('''int main(){int x=getint();int i=0;int n=2;int r=0;
+      while(r<3){while(i<n){x=x/2;i=i+1;}n=n+3;r=r+1;}putf("%d %d\\n",x,i);return 0;}''','-8 8\n0\n')
+    (directory/'quotient_resumed.in').write_text('-2048\n')
+    for case,seed in enumerate((-2147483648,-17,0,17,2147483647)):
+        def choice(x,n):
+            if x<0:return wrap(x+5)
+            for _ in range(max(n,0)):x=abs(x)//2*(-1 if x<0 else 1)
+            return x
+        x=seed;total=0
+        for _ in range(4):total=wrap(total+wrap(3*choice(x,3)));x=choice(x,2)
+        name=f'ssa_inline_returns_{case}'
+        cases[name]=('''int choose(int x,int n){if(x<0)return x+5;int i=0;
+          while(i<n){x=x/2;i=i+1;}return x;}
+          int main(){int x=getint();int i=0;int total=0;
+            while(i<4){total=total+choose(x,3)+choose(x,3)+choose(x,3);x=choose(x,2);i=i+1;}
+            putf("%d %d\\n",total,x);return 0;}''',f'{total} {x}\n0\n')
+        (directory/f'{name}.in').write_text(f'{seed}\n')
+    for count in (16,31,32,33,34):
+        name=f'zero_alignment_tail_{count}'
+        cases[name]=(f'''int main(){{int prefix[1]={{7}};int a[{count}]={{}};int b[{count}]={{}};int suffix[1]={{9}};
+          putarray(1,prefix);putarray({count},a);putarray({count},b);putarray(1,suffix);return 0;}}''',
+          '1: 7\n'+(f'{count}: '+' '.join(['0']*count)+'\n')*2+'1: 9\n0\n')
+    for flag in (0,1):
+        name=f'init_sink_escape_{flag}'
+        cases[name]=('''void observe(int a[],int depth){if(depth)observe(a,depth-1);else putarray(16,a);}
+          int main(){int a[16]={};int flag=getint();if(flag)observe(a,2);return 0;}''',
+          ('16: '+' '.join(['0']*16)+'\n' if flag else '')+'0\n')
+        (directory/f'{name}.in').write_text(f'{flag}\n')
+        name=f'init_sink_loop_{flag}'
+        code='''int main(){int flag=getint();int r=0;while(r<3){int a[16]={};
+          if(flag){a[0]=r;putarray(16,a);}r=r+1;}return 0;}'''
+        output=''.join('16: '+' '.join([str(r)]+['0']*15)+'\n' for r in range(3)) if flag else ''
+        cases[name]=(code,output+'0\n');(directory/f'{name}.in').write_text(f'{flag}\n')
+    cases['init_sink_input']=('''int main(){int a[16]={};int n=getarray(a);
+      if(n)putarray(16,a);return 0;}''','16: 3 7 '+' '.join(['0']*14)+'\n0\n')
+    (directory/'init_sink_input.in').write_text('2 3 7\n')
+    replay='''int a[8]={1,2,3,4,5,6,7,8};int b[8]={1,2,3,4,5,6,7,8};
+      int main(){int n=getint();int r=getint();while(r<n){PRINT int i=0;
+        while(i<8){a[i]=VALUE;i=i+1;}r=r+1;}putint(r);putch(10);putarray(8,a);return 0;}'''
+    for mode in range(3):
+        for n in (-3,0,1,3,5):
+            values=list(range(1,9));prefix='';r=-2
+            while r<n:
+                if mode==2:prefix+=f'{r} '
+                for i in range(8):values[i]=values[i]+r+i if mode==1 else (i+1)*3+i
+                r+=1
+            code=replay.replace('PRINT','putint(r);putch(32);' if mode==2 else '')
+            code=code.replace('VALUE','a[i]+r+i' if mode==1 else 'b[i]*3+i')
+            name=f'overwrite_replay_{mode}_{n+3}'
+            cases[name]=(code,prefix+f'{r}\n8: '+' '.join(map(str,values))+'\n0\n')
+            (directory/f'{name}.in').write_text(f'{n} -2\n')
+    reset_kernel='''int hits;void kernel(int n,int a[][4],int b[][4]){EFFECT
+      int i=0;while(i<n){int k=0;while(k<n){b[i][k]=b[i][k]+a[i][i]+1;k=k+1;}
+        int j=i+1;while(j<n){k=0;while(k<n){b[j][k]=b[j][k]-a[j][i]*b[i][k];k=k+1;}j=j+1;}i=i+1;}}
+      int a[4][4]={{2,1,0,3},{1,2,1,0},{3,1,2,1},{1,0,1,2}};
+      int c[4][4]={{1,2,3,4},{5,6,7,8},{9,10,11,12},{13,14,15,16}};
+      int b[4][4]={{-1,-2,-3,-4},{-5,-6,-7,-8},{-9,-10,-11,-12},{-13,-14,-15,-16}};
+      int main(){int n=getint();int i=-9;int j=-8;int r=0;
+        while(r<4){i=0;while(i<n){j=0;while(j<n){b[i][j]=SOURCE[i][j];j=j+1;}i=i+1;}
+          kernel(n,a,DEST);r=r+1;}
+        putf("%d %d %d %d\\n",i,j,r,hits);putarray(16,b[0]);putarray(16,c[0]);return 0;}'''
+    for mode in range(4):
+        for n in (-1,0,1,3,4):
+            a=[[2,1,0,3],[1,2,1,0],[3,1,2,1],[1,0,1,2]]
+            c=[[4*i+j+1 for j in range(4)] for i in range(4)]
+            b=[[-v for v in row] for row in c]
+            for _ in range(4):
+                source=b if mode==3 else c
+                for i in range(max(n,0)):
+                    for j in range(n):b[i][j]=source[i][j]
+                dst=c if mode==2 else b
+                for i in range(max(n,0)):
+                    for k in range(n):dst[i][k]=wrap(dst[i][k]+a[i][i]+1)
+                    for j in range(i+1,n):
+                        for k in range(n):dst[j][k]=wrap(dst[j][k]-wrap(a[j][i]*dst[i][k]))
+            code=reset_kernel.replace('EFFECT','hits=hits+1;' if mode==1 else '')
+            code=code.replace('SOURCE','b' if mode==3 else 'c').replace('DEST','c' if mode==2 else 'b')
+            output=f'{max(n,0)} {n if n>0 else -8} 4 {4 if mode==1 else 0}\n'
+            output+='16: '+' '.join(str(v) for row in b for v in row)+'\n'
+            output+='16: '+' '.join(str(v) for row in c for v in row)+'\n0\n'
+            name=f'reset_region_{mode}_{n+1}'
+            cases[name]=(code,output)
+            (directory/f'{name}.in').write_text(f'{n}\n')
+    network='''int data[64];int hits;
+      void exchange(int x,int y,int d){HIT if(d==1){if(data[x]>data[y]){
+        int t=data[x];data[x]=data[y]EXTRA;data[y]=t;}}
+        else {if(data[x]<data[y]){int t=data[x];data[x]=data[y]EXTRA;data[y]=t;}}}
+      void merge_network(int low,int count,int d){if(count>1){int half=count/2;int q=low;
+        while(q<low+half){exchange(q,q+half,d);q=q+1;}
+        merge_network(low,half,d);merge_network(low+half,half,d);}}
+      void sort_network(int low,int count,int d){if(count>1){int half=count/2;
+        sort_network(low,half,1);sort_network(low+half,half,0);merge_network(low,count,d);}}'''
+    def network_model(data,low,count,d,extra=0):
+        hits=0
+        def merge(low,count,d):
+            nonlocal hits
+            if count<=1:return
+            half=count//2
+            for q in range(low,low+half):
+                hits+=1
+                if (data[q]>data[q+half]) if d==1 else (data[q]<data[q+half]):
+                    data[q],data[q+half]=wrap(data[q+half]+extra),data[q]
+            merge(low,half,d);merge(low+half,half,d)
+        def sort(low,count,d):
+            if count<=1:return
+            half=count//2;sort(low,half,1);sort(low+half,half,0);merge(low,count,d)
+        sort(low,count,d);return hits
+    sorting_rng=random.Random(20261016)
+    for case in range(24):
+        length=[-2147483648,-1,0,1,2,3,4,5,6,7,8,16][case%12]
+        direction=[0,1,7][case%3];low=3 if length>1 else 2147483647
+        data=[sorting_rng.choice(numerators) for _ in range(64)]
+        initial=data[:];mode=case//8;hits=0
+        for _ in range(4):hits+=network_model(data,low,length,direction,int(mode==2))
+        prefix=network.replace('HIT','hits=hits+1;' if mode==1 else '').replace('EXTRA','+1' if mode==2 else '')
+        name=f"sorting_contract_{case:02d}"
+        cases[name]=(prefix+'''int main(){int count=getint();int low=getint();int d=getint();
+          int i=0;while(i<64){data[i]=getint();i=i+1;}int r=0;
+          while(r<4){sort_network(low,count,d);r=r+1;}
+          putf("%d %d\\n",r,hits);putarray(64,data);return 0;}''',
+          f"4 {hits if mode==1 else 0}\n64: "+' '.join(map(str,data))+'\n0\n')
+        (directory/f"{name}.in").write_text(f"{length} {low} {direction}\n"+' '.join(map(str,initial))+'\n')
+    prefix=network.replace('HIT','').replace('EXTRA','')
+    output=[]
+    for mask in range(256):
+        data=[-7]*64
+        for j in range(8):data[j+3]=(mask>>j)&1
+        for _ in range(4):network_model(data,3,8,1)
+        output.append('64: '+' '.join(map(str,data)))
+    cases['sorting_zero_one']=(prefix+'''int main(){int mask=0;while(mask<256){
+      int i=0;while(i<64){data[i]=-7;i=i+1;}int x=mask;i=0;
+      while(i<8){data[i+3]=x%2;x=x/2;i=i+1;}int r=0;
+      while(r<4){sort_network(3,8,1);r=r+1;}putarray(64,data);mask=mask+1;}return 0;}''',
+      '\n'.join(output)+'\n0\n')
     # Memory joins: missing writes, nested joins, recursive Mod/Ref, aliases and
     # dynamic offsets must all preserve the source's reaching memory contents.
     for case in range(48):

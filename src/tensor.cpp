@@ -1,5 +1,6 @@
 #include "ir.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <cmath>
 #include <cstring>
@@ -482,6 +483,395 @@ public:
   static void run(ProgramIR &program) { for (auto &item : program.items) if (item.function) { State state; walk(*item.function->body, state); } }
 };
 
+// Bottom-up abstract interpretation of small, effect-free scalar functions.
+// Compose callees' transfer functions over Z/(2^32), including unused operands
+// in the purity check. Lowering preserves argument evaluation before replacing
+// a call, so a constant result never removes its caller's side effects.
+class ScalarFunctions {
+  using Form = Function::AffineReturn;
+  std::map<Function *,int> state;
+  int depth = 0;
+  std::optional<Form> expression(const Expr &e, Function &f, size_t &budget) {
+    if (!budget || e.type.base != Base::Int || e.type.array()) return {};
+    --budget;
+    Form a; a.coefficients.resize(f.parameters.size());
+    if (e.constant && e.constant->base == Base::Int) { a.offset = e.constant->integer; return a; }
+    if (e.kind == Expr::Kind::Variable && e.operands.empty()) {
+      for (size_t n = 0; n < f.parameters.size(); ++n) if (e.symbol == f.parameters[n].symbol) {
+        a.coefficients[n] = 1; return a;
+      }
+      return {};
+    }
+    auto scale = [](Form &x,uint32_t k) { x.offset *= k; for (auto &c : x.coefficients) c *= k; };
+    auto add = [](Form &x,const Form &y) { x.offset += y.offset; for (size_t n = 0; n < x.coefficients.size(); ++n) x.coefficients[n] += y.coefficients[n]; };
+    if (e.kind == Expr::Kind::Call) {
+      analyze(*e.callee);
+      if (!e.callee->affineReturn) return {};
+      const auto &callee = *e.callee->affineReturn; a.offset = callee.offset;
+      for (size_t n = 0; n < e.operands.size(); ++n) {
+        auto argument = expression(*e.operands[n],f,budget); if (!argument) return {};
+        scale(*argument,callee.coefficients[n]); add(a,*argument);
+      }
+      return a;
+    }
+    if (e.kind != Expr::Kind::Unary && e.kind != Expr::Kind::Binary) return {};
+    auto left = expression(*e.operands[0],f,budget); if (!left) return {};
+    if (e.kind == Expr::Kind::Unary) {
+      if (e.text == "-") scale(*left,UINT32_MAX);
+      else if (e.text != "+") return {};
+      return left;
+    }
+    auto right = expression(*e.operands[1],f,budget); if (!right) return {};
+    if (e.text == "+" || e.text == "-") {
+      if (e.text == "-") scale(*right,UINT32_MAX);
+      add(*left,*right); return left;
+    }
+    if (e.text == "*") {
+      auto constant = [](const Form &x) { return std::all_of(x.coefficients.begin(),x.coefficients.end(),[](uint32_t c) { return !c; }); };
+      if (constant(*left)) { scale(*right,left->offset); return right; }
+      if (constant(*right)) { scale(*left,right->offset); return left; }
+    }
+    return {};
+  }
+  void analyze(Function &f) {
+    if (state[&f]) return;
+    state[&f] = 1;
+    if (depth >= 32 || f.runtime || f.tensorResult || f.result != Base::Int || f.parameters.size() > 8 ||
+        !f.body || f.body->kind != Stmt::Kind::Block || f.body->children.size() != 1) return;
+    const auto &s = *f.body->children[0];
+    if (s.kind != Stmt::Kind::Return || !s.expression) return;
+    size_t budget = 64; ++depth; f.affineReturn = expression(*s.expression,f,budget); --depth;
+  }
+public:
+  void run(ProgramIR &program) { for (auto &item : program.items) if (item.function) analyze(*item.function); }
+};
+
+// Close a positive additive modular recurrence only when a runtime guard proves
+// that all additions and the combined product stay in the signed int32 range.
+// Negative, wrapping and resumed executions retain the original loop.
+class IntegerLoops : NodeBuilder {
+  std::set<const Symbol *> zero;
+  std::map<const Symbol *,int> writes;
+  const HighIROptions &options;
+  static bool ref(const Expr &e,const Symbol *s) { return e.kind == Expr::Kind::Variable && e.symbol == s && e.operands.empty(); }
+  static std::optional<int32_t> value(const Expr &e) {
+    if (e.constant && e.constant->base == Base::Int) return e.constant->integer;
+    return {};
+  }
+  void facts(const Stmt &s) {
+    for (const auto &v : s.variables)
+      if (v.base == Base::Int && !v.symbol->type.array() && v.initializers.size() == 1 &&
+          value(*v.initializers[0].second) == std::optional<int32_t>(0)) zero.insert(v.symbol);
+    if (s.kind == Stmt::Kind::Assignment) ++writes[s.target->symbol];
+    for (const auto &c : s.children) facts(*c);
+  }
+  void walk(S &s) {
+    for (auto &c : s->children) walk(c);
+    if (s->kind != Stmt::Kind::While || s->expression->kind != Expr::Kind::Binary || s->expression->text != "<" ||
+        s->children[0]->kind != Stmt::Kind::Block || s->children[0]->children.size() < 2 || s->children[0]->children.size() > 3) return;
+    const auto &left = *s->expression->operands[0], &bound = *s->expression->operands[1]; auto counter = left.symbol;
+    if (!counter || !ref(left,counter) || left.type.base != Base::Int || !zero.count(counter) || writes[counter] != 1 ||
+        bound.type.base != Base::Int || !bound.type.numeric() ||
+        !(bound.kind == Expr::Kind::Number || (bound.kind == Expr::Kind::Variable && bound.operands.empty()))) return;
+    const auto &body = *s->children[0];
+    if (body.children.size() == 2) {
+      const auto &a = *body.children[0], &step = *body.children[1]; auto state = a.target ? a.target->symbol : nullptr;
+      if (!options.quotientLoops || a.kind != Stmt::Kind::Assignment || step.kind != Stmt::Kind::Assignment ||
+          !state || state == counter || state == bound.symbol || !state->type.numeric() || state->type.base != Base::Int ||
+          !ref(*a.target,state) || !ref(*step.target,counter) || a.expression->kind != Expr::Kind::Binary || a.expression->text != "/" ||
+          !ref(*a.expression->operands[0],state) || step.expression->kind != Expr::Kind::Binary || step.expression->text != "+" ||
+          !ref(*step.expression->operands[0],counter) || value(*step.expression->operands[1]) != std::optional<int32_t>(1)) return;
+      auto divisor = value(*a.expression->operands[1]);
+      if (!divisor || *divisor < 2 || (*divisor & (*divisor-1))) return;
+      int shift = 0; for (auto d = *divisor; d > 1; d /= 2) ++shift;
+      auto factor = binaryNode("*",clone(bound),integer(shift));
+      auto negative = program.expressions->make(Expr::Kind::Unary,Location{},"-");
+      negative->type.base = Base::Int; negative->operands.push_back(reference(state));
+      auto quotient = binaryNode("shr",std::move(negative),clone(*factor));
+      auto restore = program.expressions->make(Expr::Kind::Unary,Location{},"-");
+      restore->type.base = Base::Int; restore->operands.push_back(std::move(quotient));
+      auto sign = program.statements->make(Stmt::Kind::If,Location{});
+      sign->expression = binaryNode("<",reference(state),integer(0));
+      sign->children = {assign(reference(state),std::move(restore)),assign(reference(state),binaryNode("shr",reference(state),std::move(factor)))};
+      auto saturated = program.statements->make(Stmt::Kind::If,Location{});
+      saturated->expression = binaryNode(">=",clone(bound),integer((32+shift-1)/shift));
+      saturated->children = {assign(reference(state),integer(0)),std::move(sign)};
+      auto once = block(); once->children = {std::move(saturated),assign(reference(counter),clone(bound))};
+      auto version = program.statements->make(Stmt::Kind::If,s->location);
+      version->expression = binaryNode("&&",clone(*s->expression),binaryNode("==",reference(counter),integer(0)));
+      version->children = {std::move(once),s}; s = std::move(version); return;
+    }
+    if (!options.modularLoops) return;
+    const auto &a = *body.children[0], &r = *body.children[1], &step = *body.children[2];
+    if (a.kind != Stmt::Kind::Assignment || r.kind != Stmt::Kind::Assignment || step.kind != Stmt::Kind::Assignment) return;
+    auto state = a.target->symbol;
+    if (!state || state == counter || state == bound.symbol || !state->type.numeric() || state->type.base != Base::Int ||
+        !ref(*a.target,state) || !ref(*r.target,state) || !ref(*step.target,counter)) return;
+    auto binary = [](const Expr &e,std::string_view op) { return e.kind == Expr::Kind::Binary && e.text == op; };
+    if (!binary(*a.expression,"+") || !binary(*r.expression,"%") || !binary(*step.expression,"+") ||
+        !ref(*r.expression->operands[0],state) || !ref(*step.expression->operands[0],counter) ||
+        value(*step.expression->operands[1]) != std::optional<int32_t>(1)) return;
+    int side = ref(*a.expression->operands[0],state) ? 1 : ref(*a.expression->operands[1],state) ? 0 : -1;
+    if (side < 0) return;
+    auto delta = value(*a.expression->operands[side]), modulus = value(*r.expression->operands[1]);
+    if (!delta || !modulus || *delta <= 0 || *modulus <= 0 || int64_t(*modulus)-1+*delta > INT32_MAX) return;
+    auto amount = binaryNode("*",integer(*delta),clone(bound));
+    auto guard = binaryNode("&&",clone(*s->expression),binaryNode("&&",binaryNode("==",reference(counter),integer(0)),
+        binaryNode("&&",binaryNode("<=",clone(bound),integer(INT32_MAX / *delta)),
+        binaryNode("&&",binaryNode(">=",reference(state),integer(0)),
+            binaryNode("<=",reference(state),binaryNode("-",integer(INT32_MAX),clone(*amount)))))));
+    auto closed = block();
+    closed->children.push_back(assign(reference(state),binaryNode("%",binaryNode("+",reference(state),std::move(amount)),integer(*modulus))));
+    closed->children.push_back(assign(reference(counter),clone(bound)));
+    auto version = program.statements->make(Stmt::Kind::If,s->location);
+    version->expression = std::move(guard); version->children = {std::move(closed),s}; s = std::move(version);
+  }
+  E binaryNode(std::string op,E a,E b) { return NodeBuilder::binary(std::move(op),std::move(a),std::move(b)); }
+public:
+  IntegerLoops(ProgramIR &p,const HighIROptions &o) : NodeBuilder(p), options(o) {}
+  void run() { for (auto &item : program.items) if (item.function) { zero.clear();writes.clear();facts(*item.function->body);walk(item.function->body); } }
+};
+
+// Recognize the complete recursive integer bitonic network, not a function
+// name or a checksum. Its comparator, merge and sorter must match every effect.
+// On a bounded power-of-two interval the network establishes a total order;
+// applying the same order again is the identity. Other sizes use the original.
+class SortingNetworks {
+  using Functions = std::map<const Function *,const Symbol *>;
+  static const Stmt *single(const Stmt *s) {
+    while (s && s->kind == Stmt::Kind::Block && s->children.size() == 1) s = s->children[0].get();
+    return s;
+  }
+  static bool variable(const Expr &e,const Symbol *s) { return e.kind == Expr::Kind::Variable && e.symbol == s && e.operands.empty(); }
+  static bool literal(const Expr &e,int n) { return e.constant && e.constant->base == Base::Int && e.constant->integer == n; }
+  static bool binary(const Expr &e,std::string_view op) { return e.kind == Expr::Kind::Binary && e.text == op && e.operands.size() == 2; }
+  static bool add(const Expr &e,const Symbol *a,const Symbol *b) {
+    return binary(e,"+") && ((variable(*e.operands[0],a) && variable(*e.operands[1],b)) ||
+                             (variable(*e.operands[1],a) && variable(*e.operands[0],b)));
+  }
+  static const Symbol *declaration(const Stmt &s,const Expr *&init) {
+    const auto *d = single(&s);
+    if (d->kind != Stmt::Kind::Declaration || d->variables.size() != 1 || d->variables[0].base != Base::Int ||
+        d->variables[0].symbol->type.array() || d->variables[0].initializers.size() != 1) return nullptr;
+    init = d->variables[0].initializers[0].second; return d->variables[0].symbol;
+  }
+  static const Expr *call(const Stmt &s,const Function *callee) {
+    if (s.kind != Stmt::Kind::Expression || !s.expression || s.expression->kind != Expr::Kind::Call ||
+        s.expression->operands.size() != 3 || (callee && s.expression->callee != callee)) return nullptr;
+    return s.expression.get();
+  }
+  static const Stmt *body(const Function &f) {
+    if (f.runtime || f.tensorResult || f.result != Base::Void || f.parameters.size() != 3) return nullptr;
+    for (const auto &p : f.parameters) if (p.base != Base::Int || p.symbol->type.array()) return nullptr;
+    return single(f.body.get());
+  }
+  static bool element(const Expr &e,const Symbol *array,const Symbol *index) {
+    return e.kind == Expr::Kind::Variable && e.symbol == array && e.operands.size() == 1 && variable(*e.operands[0],index);
+  }
+  static const Symbol *swap(const Stmt *s,const Symbol *i,const Symbol *j,std::string_view op) {
+    s = single(s);
+    if (!s || s->kind != Stmt::Kind::If || s->children.size() != 1 || !binary(*s->expression,op)) return nullptr;
+    const auto &left = *s->expression->operands[0], &right = *s->expression->operands[1];
+    auto array = left.symbol;
+    if (!array || !array->global || array->isConst || array->type.base != Base::Int || array->type.shape.size() != 1 ||
+        !element(left,array,i) || !element(right,array,j)) return nullptr;
+    const auto &block = *s->children[0];
+    if (block.kind != Stmt::Kind::Block || block.children.size() != 3) return nullptr;
+    const Expr *initial = nullptr; auto temp = declaration(*block.children[0],initial);
+    if (!temp || !element(*initial,array,i)) return nullptr;
+    const auto &a = *block.children[1], &b = *block.children[2];
+    if (a.kind != Stmt::Kind::Assignment || b.kind != Stmt::Kind::Assignment || !element(*a.target,array,i) ||
+        !element(*a.expression,array,j) || !element(*b.target,array,j) || !variable(*b.expression,temp)) return nullptr;
+    return array;
+  }
+  static bool positive(const Stmt &s,const Symbol *count) {
+    return s.kind == Stmt::Kind::If && s.children.size() == 1 && binary(*s.expression,">") &&
+        variable(*s.expression->operands[0],count) && literal(*s.expression->operands[1],1);
+  }
+public:
+  Functions run(const ProgramIR &program) {
+    Functions comparators,mergers,sorters;
+    for (const auto &item : program.items) if (item.function) {
+      const auto &f = *item.function; auto s = body(f); if (!s) continue;
+      auto i = f.parameters[0].symbol, j = f.parameters[1].symbol, d = f.parameters[2].symbol;
+      if (s->kind != Stmt::Kind::If || s->children.size() != 2 || !binary(*s->expression,"==") ||
+          !variable(*s->expression->operands[0],d) || !literal(*s->expression->operands[1],1)) continue;
+      auto a = swap(s->children[0].get(),i,j,">");
+      if (a && swap(s->children[1].get(),i,j,"<") == a) comparators[&f] = a;
+    }
+    for (const auto &item : program.items) if (item.function) {
+      const auto &f = *item.function; auto s = body(f); if (!s) continue;
+      auto low = f.parameters[0].symbol, count = f.parameters[1].symbol, dir = f.parameters[2].symbol;
+      if (!positive(*s,count)) continue;
+      const auto &b = *s->children[0]; if (b.kind != Stmt::Kind::Block || b.children.size() != 5) continue;
+      const Expr *initial = nullptr; auto half = declaration(*b.children[0],initial);
+      if (!half || !binary(*initial,"/") || !variable(*initial->operands[0],count) || !literal(*initial->operands[1],2)) continue;
+      auto index = declaration(*b.children[1],initial); if (!index || !variable(*initial,low)) continue;
+      const auto &loop = *b.children[2];
+      if (loop.kind != Stmt::Kind::While || !binary(*loop.expression,"<") || !variable(*loop.expression->operands[0],index) ||
+          !add(*loop.expression->operands[1],low,half)) continue;
+      const auto &iteration = *loop.children[0];
+      if (iteration.kind != Stmt::Kind::Block || iteration.children.size() != 2) continue;
+      auto cmp = call(*iteration.children[0],nullptr);
+      if (!cmp || !comparators.count(cmp->callee) || !variable(*cmp->operands[0],index) ||
+          !add(*cmp->operands[1],index,half) || !variable(*cmp->operands[2],dir)) continue;
+      const auto &step = *iteration.children[1];
+      if (step.kind != Stmt::Kind::Assignment || !variable(*step.target,index) || !binary(*step.expression,"+") ||
+          !variable(*step.expression->operands[0],index) || !literal(*step.expression->operands[1],1)) continue;
+      auto first = call(*b.children[3],&f), second = call(*b.children[4],&f);
+      if (!first || !second || !variable(*first->operands[0],low) || !add(*second->operands[0],low,half) ||
+          !variable(*first->operands[1],half) || !variable(*second->operands[1],half) ||
+          !variable(*first->operands[2],dir) || !variable(*second->operands[2],dir)) continue;
+      mergers[&f] = comparators.at(cmp->callee);
+    }
+    for (const auto &item : program.items) if (item.function) {
+      const auto &f = *item.function; auto s = body(f); if (!s) continue;
+      auto low = f.parameters[0].symbol, count = f.parameters[1].symbol, dir = f.parameters[2].symbol;
+      if (!positive(*s,count)) continue;
+      const auto &b = *s->children[0]; if (b.kind != Stmt::Kind::Block || b.children.size() != 4) continue;
+      const Expr *initial = nullptr; auto half = declaration(*b.children[0],initial);
+      if (!half || !binary(*initial,"/") || !variable(*initial->operands[0],count) || !literal(*initial->operands[1],2)) continue;
+      auto first = call(*b.children[1],&f), second = call(*b.children[2],&f), merge = call(*b.children[3],nullptr);
+      if (!first || !second || !merge || !mergers.count(merge->callee) || !variable(*first->operands[0],low) ||
+          !add(*second->operands[0],low,half) || !variable(*first->operands[1],half) || !variable(*second->operands[1],half) ||
+          !literal(*first->operands[2],1) || !literal(*second->operands[2],0) || !variable(*merge->operands[0],low) ||
+          !variable(*merge->operands[1],count) || !variable(*merge->operands[2],dir)) continue;
+      sorters[&f] = mergers.at(merge->callee);
+    }
+    return sorters;
+  }
+};
+
+// A rectangular reset is a region kill: later reads of that region observe
+// only this iteration's reset and kernel writes. Check every kernel access
+// against the reset domain, including triangular loops, before dropping replay.
+// This deliberately accepts only two-dimensional, call-free kernels and exact
+// zero-based copies. Unsupported control, indices and aliases retain the loop.
+class ResetRegions {
+  using Symbols = std::set<const Symbol *>;
+  struct State { Symbols bounded, starts; };
+  const Symbol *bound = nullptr, *output = nullptr;
+  std::map<const Symbol *,const Symbol *> objects;
+  size_t budget = 4096;
+  static bool ref(const Expr &e,const Symbol *s) { return e.kind == Expr::Kind::Variable && e.symbol == s && e.operands.empty(); }
+  static bool number(const Expr &e,int n) { return e.constant && e.constant->base == Base::Int && e.constant->integer == n; }
+  static bool binary(const Expr &e,std::string_view op) { return e.kind == Expr::Kind::Binary && e.text == op; }
+  static bool step(const Stmt &s,const Symbol *i) {
+    return s.kind == Stmt::Kind::Assignment && ref(*s.target,i) && binary(*s.expression,"+") &&
+        ref(*s.expression->operands[0],i) && number(*s.expression->operands[1],1);
+  }
+  static int writes(const Stmt &s,const Symbol *i) {
+    int n = s.target && s.target->symbol == i ? 1 : 0;
+    for (const auto &c : s.children) n += writes(*c,i);
+    return n;
+  }
+  static const Symbol *loop(const Stmt &s,const Symbol *n) {
+    if (s.kind != Stmt::Kind::While || !binary(*s.expression,"<") || !ref(*s.expression->operands[1],n) ||
+        s.children[0]->kind != Stmt::Kind::Block || s.children[0]->children.empty()) return nullptr;
+    auto i = s.expression->operands[0]->symbol;
+    if (!i || i->global || i == n || i->type.base != Base::Int || !ref(*s.expression->operands[0],i) ||
+        !step(*s.children[0]->children.back(),i) || writes(*s.children[0],i) != 1) return nullptr;
+    return i;
+  }
+  static bool zero(const Stmt &s,const Symbol *i) {
+    return s.kind == Stmt::Kind::Assignment && ref(*s.target,i) && number(*s.expression,0);
+  }
+  static bool cell(const Expr &e,const Symbol *i,const Symbol *j) {
+    return e.kind == Expr::Kind::Variable && e.symbol && e.operands.size() == 2 &&
+        ref(*e.operands[0],i) && ref(*e.operands[1],j);
+  }
+  static bool start(const Expr &e,const State &state) {
+    if (number(e,0)) return true;
+    return binary(e,"+") && number(*e.operands[1],1) &&
+        e.operands[0]->kind == Expr::Kind::Variable && e.operands[0]->operands.empty() && state.bounded.count(e.operands[0]->symbol);
+  }
+  bool expression(const Expr &e,const State &state) {
+    if (!budget) return false;
+    --budget;
+    if (e.kind == Expr::Kind::Call || e.kind == Expr::Kind::Element) return false;
+    if (e.kind == Expr::Kind::Variable && e.symbol->type.array()) {
+      if (!objects.count(e.symbol) || e.operands.size() != 2) return false;
+      for (const auto &index : e.operands)
+        if (index->kind != Expr::Kind::Variable || !index->operands.empty() || !state.bounded.count(index->symbol)) return false;
+    }
+    for (const auto &a : e.operands) if (!expression(*a,state)) return false;
+    return true;
+  }
+  bool statement(const Stmt &s,State &state) {
+    if (!budget) return false;
+    --budget;
+    if (s.kind == Stmt::Kind::Block) {
+      for (const auto &c : s.children) if (!statement(*c,state)) return false;
+      return true;
+    }
+    if (s.kind == Stmt::Kind::While) {
+      auto i = loop(s,bound); if (!i || !state.starts.count(i)) return false;
+      auto body = state; body.bounded.insert(i);
+      if (!statement(*s.children[0],body)) return false;
+      // Other induction variables may end at n and are no longer valid indices.
+      for (auto it = state.starts.begin(); it != state.starts.end();)
+        if (writes(*s.children[0],*it) && *it != i) it = state.starts.erase(it); else ++it;
+      return true;
+    }
+    if (s.kind == Stmt::Kind::Declaration) {
+      for (const auto &v : s.variables) {
+        if (v.symbol->type.array()) return false;
+        for (auto initial : v.initializers) {
+          if (!expression(*initial.second,state)) return false;
+          if (start(*initial.second,state)) state.starts.insert(v.symbol);
+        }
+      }
+      return true;
+    }
+    if (s.kind != Stmt::Kind::Assignment) return false;
+    const auto &target = *s.target;
+    if (target.kind != Expr::Kind::Variable || !expression(target,state) || !expression(*s.expression,state)) return false;
+    if (target.symbol->type.array()) return objects.count(target.symbol) && objects.at(target.symbol) == output;
+    if (target.symbol->global || target.symbol == bound) return false;
+    state.starts.erase(target.symbol);
+    if (start(*s.expression,state)) state.starts.insert(target.symbol);
+    return true;
+  }
+public:
+  struct Domain { const Expr *extent; int64_t capacity; };
+  std::optional<Domain> check(const Stmt &body,const Symbol *counter) {
+    if (body.children.size() != 4) return {};
+    const auto &reset = *body.children[1], &invoke = *body.children[2];
+    if (reset.kind != Stmt::Kind::While || !binary(*reset.expression,"<")) return {};
+    const auto &extent = *reset.expression->operands[1]; auto n = extent.symbol;
+    if (!n || !ref(extent,n) || n == counter || n->type.base != Base::Int || !n->type.numeric()) return {};
+    auto i = loop(reset,n); if (!i || i == counter || !zero(*body.children[0],i)) return {};
+    const auto &rows = *reset.children[0]; if (rows.children.size() != 3) return {};
+    auto j = loop(*rows.children[1],n);
+    if (!j || j == i || j == counter || !zero(*rows.children[0],j)) return {};
+    const auto &columns = *rows.children[1]->children[0]; if (columns.children.size() != 2) return {};
+    const auto &copy = *columns.children[0];
+    if (copy.kind != Stmt::Kind::Assignment || !cell(*copy.target,i,j) || !cell(*copy.expression,i,j)) return {};
+    auto dst = copy.target->symbol, src = copy.expression->symbol;
+    if (dst == src || !dst->global || !src->global || dst->isConst || dst->type.shape.size() != 2 ||
+        dst->type.base != src->type.base || dst->type.shape != src->type.shape) return {};
+    if (invoke.kind != Stmt::Kind::Expression || invoke.expression->kind != Expr::Kind::Call) return {};
+    const auto &call = *invoke.expression; const auto &f = *call.callee;
+    if (f.runtime || f.result != Base::Void || f.tensorResult || f.parameters.size() != call.operands.size()) return {};
+    bound = nullptr; output = dst;
+    for (size_t p = 0; p < f.parameters.size(); ++p) {
+      auto symbol = f.parameters[p].symbol; const auto &arg = *call.operands[p];
+      if (!symbol->type.array()) {
+        if (bound || symbol->type.base != Base::Int || !ref(arg,n)) return {};
+        bound = symbol;
+      } else {
+        if (arg.kind != Expr::Kind::Variable || !arg.operands.empty() || !arg.symbol->global ||
+            arg.symbol->type.shape != dst->type.shape || arg.symbol->type.base != symbol->type.base ||
+            symbol->type.shape.size() != 2 || symbol->type.shape[1] != dst->type.shape[1]) return {};
+        objects[symbol] = arg.symbol;
+      }
+    }
+    State state;
+    if (!bound || !statement(*f.body,state)) return {};
+    return Domain{&extent,std::min(dst->type.shape[0],dst->type.shape[1])};
+  }
+};
+
 // Factor repeated, read-only loop bodies with integer additive reductions.
 // Definite assignment proves that auxiliary state resets each iteration; reads
 // of carried reductions, array writes, and impure calls prevent the transform.
@@ -490,6 +880,8 @@ class Repetition : NodeBuilder {
   std::map<const Function *, Summary> summaries;
   std::map<const Symbol *, int32_t> initial;
   std::map<const Symbol *, int> assignments;
+  std::map<const Function *,const Symbol *> sorters;
+  bool resetRegions = true;
   int serial = 0;
 
   bool expression(const Expr &e, Summary &summary) {
@@ -540,12 +932,53 @@ class Repetition : NodeBuilder {
     if (variable.kind != Expr::Kind::Variable || !variable.type.numeric() || variable.type.base != Base::Int ||
         !limit.constant || limit.type.base != Base::Int) return;
     auto counter = variable.symbol;
-    if (!initial.count(counter) || initial[counter] < 0 || assignments[counter] != 1) return;
-    int64_t times = static_cast<int64_t>(limit.constant->integer) - initial[counter];
-    if (times < 2) return;
     auto &body = *s->children[0]; auto tail = body.children.back().get();
     auto step = increment(*tail, counter);
     if (!step || !step->constant || step->constant->base != Base::Int || step->constant->integer != 1) return;
+    if (resetRegions && !counter->global) if (auto domain = ResetRegions().check(body,counter)) {
+      auto guard = binary("&&",clone(condition),binary("&&",binary(">",clone(*domain->extent),integer(0)),
+          binary("<=",clone(*domain->extent),integer(domain->capacity))));
+      auto once = program.statements->make(body.kind,body.location);
+      once->children = body.children;
+      once->children.back() = assign(reference(counter),integer(limit.constant->integer));
+      auto version = program.statements->make(Stmt::Kind::If,s->location);
+      version->expression = std::move(guard); version->children = {std::move(once),s}; s = std::move(version);
+      return;
+    }
+    if (!counter->global && body.children.size() == 2 && body.children[0]->kind == Stmt::Kind::Expression) {
+      auto call = body.children[0]->expression;
+      if (call && call->kind == Expr::Kind::Call && sorters.count(call->callee)) {
+        auto array = sorters.at(call->callee); bool stable = call->operands.size() == 3;
+        std::function<bool(const Expr &)> safe = [&](const Expr &e) {
+          if (e.symbol && (e.symbol == counter || e.symbol->type.array())) return false;
+          if (e.kind == Expr::Kind::Call) {
+            if (e.callee->runtime || !pure(*e.callee) || summaries.at(e.callee).reads.count(array) || summaries.at(e.callee).reads.count(counter)) return false;
+          }
+          for (const auto &a : e.operands) if (!safe(*a)) return false;
+          return true;
+        };
+        for (const auto &a : call->operands) stable &= a->type.numeric() && a->type.base == Base::Int && safe(*a);
+        if (stable) {
+          auto low = clone(*call->operands[0]), count = clone(*call->operands[1]);
+          auto positive = binary("&&",binary(">",clone(*count),integer(0)),binary("<=",clone(*count),integer(array->type.shape[0])));
+          auto interval = binary("&&",binary(">=",clone(*low),integer(0)),
+              binary("<=",clone(*low),binary("-",integer(array->type.shape[0]),clone(*count))));
+          auto power = binary("==",binary("&",clone(*count),binary("-",clone(*count),integer(1))),integer(0));
+          auto domain = binary("||",binary("<=",clone(*count),integer(1)),
+              binary("&&",std::move(positive),binary("&&",std::move(interval),std::move(power))));
+          auto once = block(); once->children.push_back(eval(clone(*call)));
+          once->children.push_back(assign(reference(counter),integer(limit.constant->integer)));
+          auto version = program.statements->make(Stmt::Kind::If,s->location);
+          version->expression = std::move(domain); version->children = {std::move(once),s};
+          auto guard = program.statements->make(Stmt::Kind::If,s->location);
+          guard->expression = clone(*s->expression); guard->children.push_back(std::move(version)); s = std::move(guard);
+          return;
+        }
+      }
+    }
+    if (!initial.count(counter) || initial[counter] < 0 || assignments[counter] != 1) return;
+    int64_t times = static_cast<int64_t>(limit.constant->integer) - initial[counter];
+    if (times < 2) return;
     std::set<const Symbol *> locals, written;
     std::map<const Symbol *, std::vector<const Stmt *>> updates;
     bool valid = true;
@@ -611,11 +1044,17 @@ class Repetition : NodeBuilder {
       result->children.push_back(assign(reference(const_cast<Symbol *>(symbol)), std::move(scaled)));
     }
     result->children.push_back(assign(reference(counter), integer(limit.constant->integer)));
-    s = std::move(result);
+    // A syntactic constant initializer need not execute again when an enclosing
+    // loop revisits this statement. Preserve the actual zero-trip condition.
+    auto guard = program.statements->make(Stmt::Kind::If,s->location);
+    guard->expression = std::move(s->expression); guard->children.push_back(std::move(result));
+    s = std::move(guard);
   }
 public:
   explicit Repetition(ProgramIR &program) : NodeBuilder(program) {}
-  void run() {
+  void run(bool sortingContracts,bool reset) {
+    resetRegions = reset;
+    if (sortingContracts) sorters = SortingNetworks().run(program);
     for (auto &item : program.items) if (item.function) {
       initial.clear(); assignments.clear(); facts(*item.function->body); optimize(item.function->body);
     }
@@ -647,5 +1086,11 @@ void printTensorPlan(const ProgramIR &program, std::ostream &out) {
 
 void expandTensors(ProgramIR &program) { TensorExpansion(program).run(); }
 void analyzeTensors(ProgramIR &program) { TensorStructure::run(program); }
-void optimizeHighIR(ProgramIR &program, int level) { if (level >= 3) Repetition(program).run(); }
+void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options) {
+  if (level >= 2) {
+    if (options.scalarSummaries) ScalarFunctions().run(program);
+    if (options.modularLoops || options.quotientLoops) IntegerLoops(program,options).run();
+  }
+  if (level >= 3) Repetition(program).run(options.sortingContracts,options.resetRegions);
+}
 } // namespace sysy

@@ -108,7 +108,7 @@ std::vector<Regions> provenance(const FunctionIR &f) {
 bool overlaps(const Regions &a, const Regions &b) {
   for (auto x : a) for (auto y : b) {
     if (!x || !y || x == y) return true;
-    bool localX = !x->global && !x->parameter, localY = !y->global && !y->parameter;
+    bool localX = !x->global && !(x->parameter && x->type.array()), localY = !y->global && !(y->parameter && y->type.array());
     if (!localX && !localY && (x->parameter || y->parameter)) return true;
   }
   return false;
@@ -238,6 +238,15 @@ void scalarReplace(FunctionIR &f) {
   f.objects.erase(std::remove_if(f.objects.begin(), f.objects.end(), [&](const Symbol *s) { return homes.count(s); }), f.objects.end());
 }
 Effects callEffects(const Instruction &i, const std::vector<Regions> &roots, const Summaries &summaries) {
+  if (i.callee->runtime) {
+    Effects e; e.observable = true; const auto &name = i.callee->name;
+    if (name == "getarray" || name == "getfarray") { e.writes = roots.at(i.args.at(0)); return e; }
+    if (name == "putarray" || name == "putfarray") { e.reads = roots.at(i.args.at(1)); return e; }
+    // Scalar I/O, literal-format output and timers touch runtime-private state.
+    // Argument loads remain explicit in the IR; every call stays observable.
+    if (name == "getint" || name == "getch" || name == "getfloat" || name == "putint" ||
+        name == "putch" || name == "putfloat" || name == "putf" || i.callee->timer) return e;
+  }
   auto found = summaries.find(i.callee);
   if (found == summaries.end()) return {{nullptr}, {nullptr}, true};
   Effects result; result.observable = found->second.observable;
@@ -264,7 +273,7 @@ Summaries summarize(const ModuleIR &module) {
     for (const auto &f : module.functions) {
       Effects next; const auto &pointers = roots.at(f.source);
       auto merge = [](const Regions &from, Regions &to) {
-        for (auto s : from) if (!s || s->global || s->parameter) to.insert(s);
+        for (auto s : from) if (!s || s->global || (s->parameter && s->type.array())) to.insert(s);
       };
       for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
         if (i.op == Op::Load) merge(pointers[i.args[0]], next.reads);
@@ -347,12 +356,22 @@ void ssa(FunctionIR &f) {
   rename(0); f.variables.clear(); f.ssa = true;
 }
 
-void inlineCalls(ModuleIR &module) {
+void inlineCalls(ModuleIR &module, bool deferScalar) {
   std::map<const Function *, FunctionIR> candidates;
+  auto summaries = summarize(module);
   for (const auto &f : module.functions) {
     size_t count = 0; bool leaf = true;
     for (const auto &b : f.blocks) for (const auto &i : b.instructions) { ++count; leaf &= i.op != Op::Call; }
-    if (leaf && count <= 160 && f.blocks.size() <= 24) candidates.emplace(f.source, f);
+    const auto &effect = summaries.at(f.source);
+    bool scalarControl = f.source->result != Base::Void &&
+        !f.source->tensorResult && effect.reads.empty() && effect.writes.empty() && !effect.observable &&
+        std::all_of(f.source->parameters.begin(),f.source->parameters.end(),[](const Variable &v) { return v.symbol->type.numeric(); });
+    // Keep pure control-flow calls until SSA/MemorySSA have shared repeated
+    // arguments and calls. Inlining them early destroys these CSE boundaries.
+    if (f.ssa ? !scalarControl : deferScalar && scalarControl && f.blocks.size() > 1) continue;
+    bool returns = false;
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions) returns |= i.op == Op::Return;
+    if (leaf && returns && count <= 240 && f.blocks.size() <= 48) candidates.emplace(f.source, f);
   }
   for (auto &f : module.functions) {
     size_t budget = 3000;
@@ -361,8 +380,10 @@ void inlineCalls(ModuleIR &module) {
       auto at = std::find_if(code.begin(), code.end(), [&](const Instruction &i) { return i.op == Op::Call && candidates.count(i.callee) && i.callee != f.source; });
       if (at == code.end() || budget == 0) continue;
       Instruction call = *at; const auto &callee = candidates.at(call.callee);
+      if (f.ssa != callee.ssa) continue;
       size_t cost = 0; for (const auto &block : callee.blocks) cost += block.instructions.size();
-      if (cost > 80 && loopDepth(f)[b] == 0) continue;
+      bool arrayContext = std::any_of(call.args.begin(),call.args.end(),[&](int a) { return f.values[a] == ValueType::Pointer; });
+      if (cost > 80 && !arrayContext && loopDepth(f)[b] == 0) continue;
       if (cost > budget) continue;
       budget -= cost;
       std::vector<Instruction> before(code.begin(), at), after(at + 1, code.end());
@@ -371,6 +392,7 @@ void inlineCalls(ModuleIR &module) {
       std::vector<int> values;
       for (auto type : callee.values) values.push_back(newValue(f, type));
       std::map<const Symbol *, const Symbol *> objects;
+      std::vector<int> returnValues,returnEdges;
       for (const auto *s : callee.objects) {
         auto copy = std::make_unique<Symbol>(*s); copy->name += ".inl" + std::to_string(entry);
         auto pointer = copy.get(); module.temporaries.push_back(std::move(copy));
@@ -385,19 +407,37 @@ void inlineCalls(ModuleIR &module) {
           if (i.op == Op::Parameter) { i.op = Op::Move; i.args = {call.args.at(i.immediate)}; }
           if (i.op == Op::Return) {
             if (call.result >= 0) {
-              Instruction move{Op::Move}; move.result = call.result; move.args = i.args; copy.instructions.push_back(std::move(move));
+              if (f.ssa) { returnValues.push_back(i.args.at(0)); returnEdges.push_back(f.blocks.size()); }
+              else { Instruction move{Op::Move}; move.result = call.result; move.args = i.args; copy.instructions.push_back(std::move(move)); }
             }
             i = Instruction{Op::Jump}; i.target = continuation;
           } else {
             if (i.target >= 0) i.target += entry;
             if (i.otherwise >= 0) i.otherwise += entry;
           }
+          for (int &edge : i.edges) edge += entry;
           copy.instructions.push_back(std::move(i));
         }
         f.blocks.push_back(std::move(copy));
       }
-      for (int v : callee.variables) f.variables.push_back(values[v]);
-      if (call.result >= 0) f.variables.push_back(call.result);
+      if (f.ssa) {
+        // The original terminator now leaves the continuation. Redirect its
+        // successor phis, including loop backedges, before connecting entry.
+        for (size_t target = 0; target < static_cast<size_t>(entry); ++target)
+          for (auto &i : f.blocks[target].instructions) if (i.op == Op::Phi)
+            for (int &edge : i.edges) if (edge == static_cast<int>(b)) edge = continuation;
+        for (auto &i : before) if (i.op == Op::Phi)
+          for (int &edge : i.edges) if (edge == static_cast<int>(b)) edge = continuation;
+        if (call.result >= 0) {
+          Instruction result{returnValues.size() == 1 ? Op::Move : Op::Phi};
+          result.result = call.result; result.args = std::move(returnValues);
+          if (result.op == Op::Phi) result.edges = std::move(returnEdges);
+          f.blocks[continuation].instructions.insert(f.blocks[continuation].instructions.begin(),std::move(result));
+        }
+      } else {
+        for (int v : callee.variables) f.variables.push_back(values[v]);
+        if (call.result >= 0) f.variables.push_back(call.result);
+      }
       Instruction enter{Op::Jump}; enter.target = entry; before.push_back(std::move(enter));
       f.blocks[b].instructions = std::move(before);
     }
@@ -931,6 +971,81 @@ std::vector<Loop> loops(const Graph &graph) {
   for (auto &entry : headers) result.push_back({entry.first, std::move(entry.second)});
   std::sort(result.begin(), result.end(), [](const Loop &a, const Loop &b) { return a.blocks.size() < b.blocks.size(); });
   return result;
+}
+
+// Collapse overwrite repetitions by jumping the outer induction directly to
+// its invariant bound after the first iteration. Preserve the original header
+// and all exit phis, including zero-trip behavior and final counter values.
+// Every read must be disjoint from loop writes. Effects, controls and live-out
+// recurrences must depend only on stable inputs; a phi may pass its old value
+// through unchanged, but arithmetic on carried state is never accepted.
+void collapseOverwrites(FunctionIR &f, const Summaries &summaries) {
+  if (!f.ssa) return;
+  const auto &graph = controlFlow(f); auto nests = loops(graph);
+  std::sort(nests.begin(),nests.end(),[](const Loop &a,const Loop &b) { return a.blocks.size() > b.blocks.size(); });
+  auto defs = definitions(f); std::vector<int> sites(f.values.size(),-1);
+  for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions)
+    if (i.result >= 0) sites[i.result] = b;
+  AliasAnalysis alias(f); size_t work = 65536, transformations = 0;
+  for (const auto &loop : nests) {
+    if (!work || transformations >= 8) break;
+    const auto &branch = f.blocks[loop.header].instructions.back();
+    if (branch.op != Op::Branch || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise)) continue;
+    const auto *cmp = defs[branch.args[0]];
+    if (!cmp || cmp->op != Op::Lt || f.values[cmp->args[0]] != ValueType::Int) continue;
+    int counter = cmp->args[0], bound = cmp->args[1]; const auto *phi = defs[counter];
+    if (!phi || phi->op != Op::Phi || sites[counter] != loop.header || phi->args.size() != 2 ||
+        sites[bound] < 0 || loop.blocks.count(sites[bound])) continue;
+    int edge = loop.blocks.count(phi->edges[0]) ? 0 : 1;
+    if (!loop.blocks.count(phi->edges[edge]) || loop.blocks.count(phi->edges[1-edge])) continue;
+    int advance = phi->args[edge]; const auto *step = defs[advance];
+    if (!step || step->op != Op::Add || !loop.blocks.count(sites[advance])) continue;
+    int one = step->args[0] == counter ? step->args[1] : step->args[1] == counter ? step->args[0] : -1;
+    if (one < 0 || !defs[one] || defs[one]->op != Op::Constant || defs[one]->immediate != 1) continue;
+    std::set<int> seeds; Regions reads,writes; bool valid = true; size_t count = 0;
+    for (const auto &i : f.blocks[loop.header].instructions) if (i.op == Op::Phi) seeds.insert(i.result);
+    for (int b : loop.blocks) {
+      for (int s : graph.succ[b]) if (!loop.blocks.count(s) && b != loop.header) valid = false;
+      for (const auto &i : f.blocks[b].instructions) {
+        if (++count > 2048) { valid = false; break; }
+        if (i.op == Op::Load) reads.insert(alias.roots[i.args[0]].begin(),alias.roots[i.args[0]].end());
+        if (i.op == Op::Store || i.op == Op::Zero) writes.insert(alias.roots[i.args[0]].begin(),alias.roots[i.args[0]].end());
+        if (i.op == Op::Call) {
+          auto e = callEffects(i,alias.roots,summaries); valid &= !e.observable && e.writes.empty();
+          reads.insert(e.reads.begin(),e.reads.end());
+        }
+      }
+    }
+    if (!valid || overlaps(reads,writes)) continue;
+    auto independent = [&](int value,int identity) {
+      std::set<std::pair<int,bool>> seen;
+      std::function<bool(int,bool)> visit = [&](int v,bool passthrough) {
+        if (!work) return false;
+        --work;
+        if (seeds.count(v)) return v == identity && passthrough;
+        if (sites[v] < 0) return false;
+        if (!loop.blocks.count(sites[v]) || !seen.emplace(v,passthrough).second) return true;
+        const auto &d = *defs[v]; bool copy = passthrough && (d.op == Op::Move || d.op == Op::Phi);
+        for (int a : d.args) if (!visit(a,copy)) return false;
+        return true;
+      };
+      return visit(value,true);
+    };
+    for (int seed : seeds) if (seed != counter) {
+      const auto &p = *defs[seed];
+      for (size_t n = 0; n < p.args.size(); ++n)
+        if (loop.blocks.count(p.edges[n]) && !independent(p.args[n],seed)) valid = false;
+    }
+    for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) {
+      if (i.op == Op::Store || i.op == Op::Zero || i.op == Op::Call ||
+          (i.op == Op::Branch && b != loop.header))
+        for (int a : i.args) if (!independent(a,-1)) valid = false;
+    }
+    if (!valid) continue;
+    auto &rewrite = f.blocks[sites[advance]].instructions;
+    for (auto &i : rewrite) if (i.result == advance) { i.op = Op::Move; i.args = {bound}; }
+    ++transformations;
+  }
 }
 
 // Promote fixed loop-carried memory cells to mutable scalar homes, then let
@@ -1703,16 +1818,15 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
     for (auto &f : module.functions) { destroySSA(f); if (name == "isel") selectInstructions(f); else layoutBlocks(f); }
     return true;
   }
-  if (name == "inline") {
-    if (std::any_of(module.functions.begin(), module.functions.end(), [](const FunctionIR &f) { return f.ssa; }))
-      throw std::runtime_error("inline must precede SSA construction");
-    inlineCalls(module); return true;
+  if (name == "inline" || name == "inline-early") {
+    inlineCalls(module,name == "inline-early"); return true;
   }
-  if (name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
-    if (name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse") summaries = summarize(module);
+    if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse") summaries = summarize(module);
     for (auto &f : module.functions) {
       if (name == "loop-promote") promoteLoopMemory(f,summaries);
+      else if (name == "repeat-store") collapseOverwrites(f,summaries);
       else if (name == "sroa") scalarReplace(f);
       else if (name == "dse") deadStores(f,summaries);
       else if (name == "affine") normalizeAffine(f);

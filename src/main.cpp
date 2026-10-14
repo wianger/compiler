@@ -16,6 +16,7 @@ struct Options {
   std::optional<std::string> passes;
   bool stats = false, checkAllocation = false;
   bool polyhedral = true;
+  sysy::HighIROptions highIR;
 };
 void help() {
   std::cout << "Usage: compiler [options] input.sy\n"
@@ -32,13 +33,18 @@ void help() {
       "  --emit-tensor-plan print shaped iteration domains and kernel schedules\n"
       "  --emit-poly-ir     print domains, affine accesses and dependence constraints\n"
       "  --no-polyhedral    disable affine loop scheduling for comparison\n"
+      "  --no-scalar-summaries  disable interprocedural affine return summaries\n"
+      "  --no-modular-loops disable guarded modular recurrence elimination\n"
+      "  --no-quotient-loops disable guarded repeated division elimination\n"
+      "  --no-sorting-contracts  disable certified sorting repetition elimination\n"
+      "  --no-reset-regions disable repetition elimination after rectangular resets\n"
       "  --poly-tile=N      cap unroll-and-jam width (1, 2, 4, 8)\n"
       "  --tensor-tile=N    override automatic column tile (1, 2, 4, 8)\n"
       "  --emit-memory-ir   print memory definitions, phis, uses and clobbers\n"
       "  --emit-effects     print function read/write and observable-effect summaries\n"
       "  --stats            print stage timings and peak RSS as JSON to stderr\n"
       "  --passes=PIPELINE  override ordered IR passes (comma separated)\n"
-      "    prune,inline,globaldce,sroa,promote,loop-promote,ssa,simplify,sccp,gvn,memory,memory-basic,memory-phi,dse,affine,egraph,tail,arith,arith-global,licm,strength,rotate,unroll,dce,compact,lower-phi,isel,layout\n"
+      "    prune,inline,inline-early,globaldce,sroa,promote,loop-promote,ssa,simplify,sccp,gvn,memory,memory-basic,memory-phi,dse,affine,egraph,tail,arith,arith-global,licm,repeat-store,strength,rotate,unroll,dce,compact,lower-phi,isel,layout\n"
       "  --help             print this help\n";
 }
 Options options(int argc, char **argv) {
@@ -59,6 +65,11 @@ Options options(int argc, char **argv) {
     else if (arg == "--emit-tensor-plan") o.kind = Output::TensorPlan;
     else if (arg == "--emit-poly-ir") o.kind = Output::PolyhedralIR;
     else if (arg == "--no-polyhedral") o.polyhedral = false;
+    else if (arg == "--no-scalar-summaries") o.highIR.scalarSummaries = false;
+    else if (arg == "--no-modular-loops") o.highIR.modularLoops = false;
+    else if (arg == "--no-quotient-loops") o.highIR.quotientLoops = false;
+    else if (arg == "--no-sorting-contracts") o.highIR.sortingContracts = false;
+    else if (arg == "--no-reset-regions") o.highIR.resetRegions = false;
     else if (arg.rfind("--poly-tile=",0) == 0) {
       auto tile = arg.substr(12);
       if (tile != "1" && tile != "2" && tile != "4" && tile != "8") throw std::runtime_error("poly tile must be 1, 2, 4 or 8");
@@ -121,7 +132,7 @@ int main(int argc, char **argv) {
         if (o.kind == Output::TensorPlan) sysy::printTensorPlan(program,result);
         else {
           stats.measure("tensor.expand", [&] { sysy::expandTensors(program); });
-          stats.measure("hir.optimize", [&] { sysy::optimizeHighIR(program, o.optimization); });
+          stats.measure("hir.optimize", [&] { sysy::optimizeHighIR(program, o.optimization, o.highIR); });
           if (o.polyhedral) stats.measure("polyhedral", [&] { sysy::optimizePolyhedral(program,o.optimization,o.polyTile); });
           stats.count("poly.regions",program.polyRegions.size());
           for (const auto &r : program.polyRegions) {

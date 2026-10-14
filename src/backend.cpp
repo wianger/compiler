@@ -638,10 +638,23 @@ class Assembly {
     if (i.op == Op::Zero) {
       if (i.immediate == 0) return;
       move("t0", read(i.args[0], "t0"), ValueType::Pointer);
-      if (i.immediate <= 32) { for (int64_t offset = 0; offset < i.immediate; offset += 4) memory("sw", "zero", offset, "t0"); return; }
-      line("li t1, " + std::to_string(i.immediate / 4));
+      // Pair words only when the exact frame address proves eight-byte
+      // alignment. Small clears avoid a counted loop; never widen its tail.
+      auto def = allocation.original[i.args[0]];
+      bool wide = def && def->op == Op::Address && !def->symbol->global &&
+          (allocation.objects.at(def->symbol)+def->immediate)%8 == 0;
+      int64_t stride = wide ? 8 : 4, bulk = i.immediate / stride;
+      if (i.immediate <= 128) {
+        for (int64_t offset = 0; offset < i.immediate; offset += stride)
+          memory(wide && i.immediate-offset >= 8 ? "sd" : "sw", "zero", offset, "t0");
+        return;
+      }
+      line("li t1, " + std::to_string(bulk));
       std::string loop = ".Lzero" + std::to_string(functionId) + '_' + std::to_string(privateLabel++);
-      out << loop << ":\n"; line("sw zero, 0(t0)"); line("addi t0, t0, 4"); line("addi t1, t1, -1"); line("bnez t1, " + loop); return;
+      out << loop << ":\n"; line(std::string(wide ? "sd" : "sw")+" zero, 0(t0)");
+      line("addi t0, t0, " + std::to_string(stride)); line("addi t1, t1, -1"); line("bnez t1, " + loop);
+      if (i.immediate%stride) line("sw zero, 0(t0)");
+      return;
     }
     auto type = function->values[i.result]; auto dst = destination(i.result);
     auto aType = function->values[i.args[0]];

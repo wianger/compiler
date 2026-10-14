@@ -103,6 +103,24 @@ def check_smt():
             prove(f"zero remainder/{divisor}", z3.SRem(x,d)==0, (x & mask)==0)
     prove("conditional integer accumulation", z3.If(condition,accumulator+term,accumulator),
           accumulator+z3.If(condition,z3.BitVecVal(1,32),z3.BitVecVal(0,32))*term)
+    # Repeated positive power-of-two division truncates towards zero, even
+    # for INT_MIN. Logical shifts act on its unsigned magnitude; large total
+    # shifts saturate to zero instead of using the ISA's masked shift count.
+    for shift in (1,4,30):
+        for trips in (1,2,7,8,31,32,34):
+            before=x
+            for _ in range(trips):before=before/z3.BitVecVal(1<<shift,32)
+            bits=shift*trips
+            after=z3.BitVecVal(0,32) if bits>=32 else z3.If(x<0,-z3.LShR(-x,bits),z3.LShR(x,bits))
+            prove(f"quotient recurrence/{shift}/{trips}",before,after)
+    # Mathematical residue induction. Runtime guards separately ensure that
+    # all source additions and the closed expression are nonnegative int32.
+    integer=z3.Int('residue')
+    for delta,modulus in ((128,65535),(1,17),(7,2147483647)):
+        prove(f"residue induction/{delta}/{modulus}",((integer%modulus)+delta)%modulus,
+              (integer+delta)%modulus,integer>=0)
+    y=z3.BitVec('summary_arg',32)
+    prove('composed affine return summary',x-(x+y)+y,z3.BitVecVal(0,32))
     for offset in (0,1,17,1024,2**31-1):
         prove(f"guarded nonnegative addition/{offset}", x+offset >= 0, z3.BoolVal(True),
               x >= 0,x <= 2**31-1-offset)
@@ -124,7 +142,7 @@ def check_smt():
     solver=z3.Solver();solver.add(x/8 != z3.LShR(x,3))
     if solver.check() != z3.sat:
         raise AssertionError("SMT check failed to detect a missing sign guard")
-    print(f"{count} int32 rule obligations proved; missing-guard mutation rejected; Z3 {z3.get_version_string()}")
+    print(f"{count} integer rule obligations proved; missing-guard mutation rejected; Z3 {z3.get_version_string()}")
 
 
 def main():

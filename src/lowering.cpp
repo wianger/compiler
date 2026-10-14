@@ -120,6 +120,19 @@ class Lowering {
         args.push_back(id);
       }
       if (f.timer) args.push_back(constant(Number::fromInt(e.location.line)));
+      if (f.affineReturn) {
+        int result = -1;
+        for (size_t n = 0; n < f.affineReturn->coefficients.size(); ++n) {
+          uint32_t coefficient = f.affineReturn->coefficients[n]; if (!coefficient) continue;
+          int term = args[n];
+          if (coefficient == UINT32_MAX) term = value(Op::Neg,ValueType::Int,{term});
+          else if (coefficient != 1) term = value(Op::Mul,ValueType::Int,{term,constant(Number::fromInt(static_cast<int32_t>(coefficient)))});
+          result = result < 0 ? term : value(Op::Add,ValueType::Int,{result,term});
+        }
+        int32_t offset = static_cast<int32_t>(f.affineReturn->offset);
+        if (result < 0) return constant(Number::fromInt(offset));
+        return offset ? value(Op::Add,ValueType::Int,{result,constant(Number::fromInt(offset))}) : result;
+      }
       Instruction call{Op::Call}; call.args = std::move(args); call.callee = &f;
       int result = -1;
       if (f.result != Base::Void) {
@@ -146,6 +159,7 @@ class Lowering {
       }
       static const std::unordered_map<std::string, Op> ops = {
           {"+", Op::Add}, {"-", Op::Sub}, {"*", Op::Mul}, {"/", Op::Div}, {"%", Op::Rem},
+        {"&", Op::And}, {"shr", Op::Shr},
           {"==", Op::Eq}, {"!=", Op::Ne}, {"<", Op::Lt}, {"<=", Op::Le}, {">", Op::Gt}, {">=", Op::Ge}};
       // Preserve evaluation order without a recursive frame per left-associative
       // operator: large generated expressions can contain thousands of terms.
@@ -306,7 +320,7 @@ void optimize(ModuleIR &module, int level, Stats *stats) {
   if (level == 0) runPasses(module, "prune", stats);
   else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact", stats);
   else {
-    runPasses(module, "prune,inline,globaldce,sroa,promote,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,gvn,simplify,dce,affine,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,memory,dse,simplify,dce", stats);
+    runPasses(module, "prune,inline-early,globaldce,sroa,promote,dce,inline-early,globaldce,sroa,promote,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,inline,globaldce,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,repeat-store,gvn,simplify,dce,affine,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,memory,dse,simplify,dce", stats);
     if (level >= 3) runPasses(module, "unroll,memory,dse,simplify,dce", stats);
     runPasses(module, "sccp,prune,dce,compact", stats);
   }

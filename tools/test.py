@@ -51,6 +51,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="*", type=Path, default=[ROOT / "test"])
     parser.add_argument("--compiler", type=Path, default=ROOT / "build/compiler")
+    parser.add_argument("--compiler-arg", action="append", default=[], help="additional compiler argument; repeat as needed")
     parser.add_argument("--as", dest="assembler")
     parser.add_argument("--ld", dest="linker")
     parser.add_argument("--qemu")
@@ -94,7 +95,7 @@ def main():
         started = time.monotonic()
         try:
             commands = [
-                [str(opts.compiler.resolve()), f"-O{opts.opt}", str(case), "-o", str(assembly)] + (["--check-alloc"] if opts.check_alloc else []),
+                [str(opts.compiler.resolve()), f"-O{opts.opt}", *opts.compiler_arg, str(case), "-o", str(assembly)] + (["--check-alloc"] if opts.check_alloc else []),
                 [assembler, "-march=rv64gc", "-mabi=lp64d", str(assembly), "-o", str(obj)],
                 [linker, "-o", str(executable), "-dynamic-linker", "/lib/ld-linux-riscv64-lp64d.so.1",
                  "-rpath-link", str(lib), str(lib / "crt1.o"), str(lib / "crti.o"), str(obj),

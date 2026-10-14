@@ -139,6 +139,7 @@ struct Symbol {
 };
 
 struct Function {
+  struct AffineReturn { uint32_t offset = 0; std::vector<uint32_t> coefficients; };
   Location location;
   std::string name, linkageName;
   Base result = Base::Void;
@@ -147,6 +148,8 @@ struct Function {
   bool runtime = false, variadic = false, timer = false;
   bool tensorResult = false;
   std::vector<int64_t> resultShape;
+  // Pure scalar transfer function over the int32 ring, independent of names.
+  std::optional<AffineReturn> affineReturn;
 };
 
 struct Item {
@@ -213,7 +216,8 @@ void planTensors(ProgramIR &program, int tile = 0);
 void printTensorPlan(const ProgramIR &program, std::ostream &out);
 void expandTensors(ProgramIR &program);
 void analyzeTensors(ProgramIR &program);
-void optimizeHighIR(ProgramIR &program, int level);
+struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true; };
+void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options = {});
 void optimizePolyhedral(ProgramIR &program, int level, int tile = 0);
 void printPolyhedralIR(const ProgramIR &program, std::ostream &out);
 void printIR(const ProgramIR &program, std::ostream &out);
