@@ -113,6 +113,130 @@ bool overlaps(const Regions &a, const Regions &b) {
   }
   return false;
 }
+
+struct PointerLocation {
+  const Symbol *object = nullptr;
+  int base = -1;
+  uint64_t offset = 0;
+  bool sameBase(const PointerLocation &other) const {
+    return object == other.object && base == other.base;
+  }
+  bool operator<(const PointerLocation &other) const {
+    if (object != other.object) return std::less<const Symbol *>{}(object,other.object);
+    return std::tie(base,offset) < std::tie(other.base,other.offset);
+  }
+};
+uint64_t accessSize(ValueType type) {
+  return type == ValueType::Pointer || type == ValueType::Double ? 8 : 4;
+}
+// Unknown arithmetic and phis retain their own SSA identity. Constant offsets
+// may still distinguish fields relative to that identity, without assuming
+// that different parameters or different dynamic indices are independent.
+std::vector<PointerLocation> pointerLocations(const FunctionIR &f) {
+  auto defs = definitions(f); std::vector<int> count(f.values.size(), 0);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions)
+    if (i.result >= 0) ++count[i.result];
+  std::vector<PointerLocation> locations(f.values.size());
+  for (size_t v = 0; v < locations.size(); ++v) locations[v].base = v;
+  for (int b : controlFlow(f).order) for (const auto &i : f.blocks[b].instructions) {
+    if (i.result < 0 || f.values[i.result] != ValueType::Pointer || count[i.result] != 1) continue;
+    if (i.op == Op::Address) locations[i.result] = {i.symbol, -1, static_cast<uint64_t>(i.immediate)};
+    else if (i.op == Op::Move) locations[i.result] = locations[i.args[0]];
+    else if (i.op == Op::Offset) {
+      const auto *index = defs[i.args[1]];
+      if (!index || count[i.args[1]] != 1 || index->op != Op::Constant || f.values[i.args[1]] != ValueType::Int) continue;
+      auto location = locations[i.args[0]];
+      location.offset += static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(index->immediate))) *
+          static_cast<uint64_t>(i.immediate);
+      locations[i.result] = location;
+    }
+  }
+  return locations;
+}
+struct AliasAnalysis {
+  std::vector<Regions> roots;
+  std::vector<PointerLocation> locations;
+  explicit AliasAnalysis(const FunctionIR &f) : roots(provenance(f)), locations(pointerLocations(f)) {}
+  bool mayAlias(int a, uint64_t aSize, int b, uint64_t bSize) const {
+    if (!aSize || !bSize || !overlaps(roots[a], roots[b])) return false;
+    const auto &x = locations[a], &y = locations[b];
+    if (!x.sameBase(y)) return true;
+    // Unsigned differences also handle RV64 pointer arithmetic wrapping, and
+    // avoid signed overflow when a negative offset is multiplied by a stride.
+    return x.offset - y.offset < bSize || y.offset - x.offset < aSize;
+  }
+  bool covers(int writer, uint64_t size, int reader, uint64_t readSize) const {
+    const auto &x = locations[writer], &y = locations[reader];
+    uint64_t distance = y.offset - x.offset;
+    return x.sameBase(y) && distance < size && readSize <= size - distance;
+  }
+};
+
+// Sparse SROA creates homes only for cells that are actually read. Dynamic
+// accesses and escaping addresses reject the entire object; zero fills reset
+// just the observed cells, rather than expanding a large array into registers.
+void scalarReplace(FunctionIR &f) {
+  if (f.ssa) throw std::runtime_error("sroa must precede SSA construction");
+  if (std::none_of(f.objects.begin(), f.objects.end(), [](const Symbol *s) { return s->type.array(); })) return;
+  AliasAnalysis alias(f); std::set<const Symbol *> rejected;
+  std::map<const Symbol *, std::set<uint64_t>> cells;
+  for (const auto *s : f.objects) if (s->type.array()) cells[s];
+  auto reject = [&](int pointer) {
+    // Escape is a def-use property, rather than a may-alias query: an opaque
+    // external pointer (including a string literal) does not expose a local
+    // allocation. Move/Offset/Phi provenance retains every local origin.
+    for (auto s : alias.roots[pointer]) if (s) rejected.insert(s);
+  };
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) for (size_t n = 0; n < i.args.size(); ++n) {
+    int a = i.args[n]; if (f.values[a] != ValueType::Pointer) continue;
+    if ((i.op == Op::Offset || i.op == Op::Move) && n == 0 && i.result >= 0 && f.values[i.result] == ValueType::Pointer) continue;
+    if (i.op == Op::Phi && i.result >= 0 && f.values[i.result] == ValueType::Pointer) continue;
+    if (n != 0 || (i.op != Op::Load && i.op != Op::Store && i.op != Op::Zero)) { reject(a); continue; }
+    const auto &p = alias.locations[a];
+    if (!p.object || !cells.count(p.object)) { reject(a); continue; }
+    uint64_t extent = static_cast<uint64_t>(p.object->type.elements()) * 4;
+    uint64_t size = i.op == Op::Zero ? static_cast<uint64_t>(i.immediate) :
+        accessSize(f.values[i.op == Op::Load ? i.result : i.args[1]]);
+    if (p.offset % 4 || size % 4 || p.offset > extent || size > extent - p.offset || (i.op != Op::Zero && size != 4)) {
+      reject(a); continue;
+    }
+    if (i.op == Op::Load) cells[p.object].insert(p.offset);
+  }
+  std::map<const Symbol *, std::map<uint64_t, int>> homes; size_t budget = 1024;
+  for (const auto &[s, offsets] : cells) if (!rejected.count(s) && offsets.size() <= 256 && offsets.size() <= budget) {
+    budget -= offsets.size(); auto &object = homes[s];
+    for (auto offset : offsets) {
+      int v = newValue(f, s->type.base == Base::Float ? ValueType::Float : ValueType::Int);
+      object[offset] = v; f.variables.push_back(v);
+    }
+  }
+  if (homes.empty()) return;
+  for (auto &b : f.blocks) {
+    std::vector<Instruction> code;
+    for (auto i : b.instructions) {
+      if (i.op == Op::Load || i.op == Op::Store || i.op == Op::Zero) {
+        const auto &p = alias.locations[i.args[0]]; auto object = homes.find(p.object);
+        if (object != homes.end()) {
+          if (i.op == Op::Zero) {
+            for (auto [offset, home] : object->second) if (offset >= p.offset && offset - p.offset < static_cast<uint64_t>(i.immediate)) {
+              Instruction zero{Op::Constant}; zero.result = home; code.push_back(std::move(zero));
+            }
+            continue;
+          }
+          auto home = object->second.find(p.offset);
+          if (i.op == Op::Load) { i.op = Op::Move; i.args = {home->second}; }
+          else {
+            if (home == object->second.end()) continue;
+            i.op = Op::Move; i.result = home->second; i.args = {i.args[1]};
+          }
+        }
+      }
+      code.push_back(std::move(i));
+    }
+    b.instructions = std::move(code);
+  }
+  f.objects.erase(std::remove_if(f.objects.begin(), f.objects.end(), [&](const Symbol *s) { return homes.count(s); }), f.objects.end());
+}
 Effects callEffects(const Instruction &i, const std::vector<Regions> &roots, const Summaries &summaries) {
   auto found = summaries.find(i.callee);
   if (found == summaries.end()) return {{nullptr}, {nullptr}, true};
@@ -454,32 +578,38 @@ void sccp(FunctionIR &f) {
   }
 }
 
+struct ExpressionKey {
+  Op op; ValueType type; int64_t immediate;
+  const Symbol *symbol; const Function *callee;
+  std::string text; std::vector<int> args;
+  bool operator==(const ExpressionKey &other) const {
+    return op == other.op && type == other.type && immediate == other.immediate &&
+        symbol == other.symbol && callee == other.callee && text == other.text && args == other.args;
+  }
+};
+struct ExpressionHash {
+  size_t operator()(const ExpressionKey &k) const {
+    size_t h = static_cast<size_t>(k.op);
+    auto mix = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ull+(h<<6)+(h>>2); };
+    mix(static_cast<size_t>(k.type)); mix(k.immediate); mix(reinterpret_cast<uintptr_t>(k.symbol));
+    mix(reinterpret_cast<uintptr_t>(k.callee)); mix(std::hash<std::string>{}(k.text));
+    for (int a : k.args) mix(a);
+    return h;
+  }
+};
+ExpressionKey expressionKey(const Instruction &i, const FunctionIR &f) {
+  ExpressionKey key{i.op,f.values[i.result],i.immediate,i.symbol,i.callee,i.text,i.args};
+  if (key.args.size() == 2 && (i.op == Op::Eq || i.op == Op::Ne ||
+      ((i.op == Op::Add || i.op == Op::Mul) && f.values[i.result] == ValueType::Int)) && key.args[0] > key.args[1]) std::swap(key.args[0],key.args[1]);
+  return key;
+}
 void gvn(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
   const auto &graph = controlFlow(f); std::vector<int> aliases(f.values.size());
   for (size_t v = 0; v < aliases.size(); ++v) aliases[v] = v;
-  struct Key {
-    Op op; ValueType type; int64_t immediate;
-    const Symbol *symbol; const Function *callee;
-    std::string text; std::vector<int> args;
-    bool operator==(const Key &other) const {
-      return op == other.op && type == other.type && immediate == other.immediate &&
-          symbol == other.symbol && callee == other.callee && text == other.text && args == other.args;
-    }
-  };
-  struct Hash {
-    size_t operator()(const Key &k) const {
-      size_t h = static_cast<size_t>(k.op);
-      auto mix = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ull+(h<<6)+(h>>2); };
-      mix(static_cast<size_t>(k.type)); mix(k.immediate); mix(reinterpret_cast<uintptr_t>(k.symbol));
-      mix(reinterpret_cast<uintptr_t>(k.callee)); mix(std::hash<std::string>{}(k.text));
-      for (int a : k.args) mix(a);
-      return h;
-    }
-  };
-  std::unordered_map<Key,int,Hash> expressions;
+  std::unordered_map<ExpressionKey,int,ExpressionHash> expressions;
   std::function<void(int)> visit = [&](int b) {
-    std::map<int, int> memory; std::vector<Key> insertedKeys;
+    std::map<int, int> memory; std::vector<ExpressionKey> insertedKeys;
     for (auto &i : f.blocks[b].instructions) {
       for (int &a : i.args) a = root(aliases, a);
       if (i.op == Op::Store) { memory.clear(); memory[i.args[0]] = i.args[1]; }
@@ -493,9 +623,7 @@ void gvn(FunctionIR &f, const Summaries &summaries) {
         continue;
       }
       if (i.op == Op::Phi || i.op == Op::Parameter || (i.op == Op::Call && !constantCall(i, summaries))) continue;
-      Key key{i.op,f.values[i.result],i.immediate,i.symbol,i.callee,i.text,i.args};
-      if (key.args.size() == 2 && (i.op == Op::Eq || i.op == Op::Ne ||
-          ((i.op == Op::Add || i.op == Op::Mul) && f.values[i.result] == ValueType::Int)) && key.args[0] > key.args[1]) std::swap(key.args[0],key.args[1]);
+      auto key = expressionKey(i,f);
       auto inserted = expressions.emplace(key, i.result);
       if (!inserted.second) aliases[i.result] = inserted.first->second;
       else insertedKeys.push_back(std::move(key));
@@ -513,19 +641,23 @@ void gvn(FunctionIR &f, const Summaries &summaries) {
 struct Loop { int header; std::set<int> blocks; };
 
 // Whole-memory SSA keeps potentially aliasing parameters in one chain. The
-// walker skips only writes proven disjoint by provenance and call summaries.
+// walker skips writes proven disjoint by byte ranges, provenance and summaries.
 struct MemoryNode {
   enum Kind { Entry, Def, Phi } kind = Entry;
   int block = 0, position = -1, previous = 0;
   Regions writes;
+  int pointer = -1;
+  uint64_t size = 0;
   std::vector<int> inputs;
 };
 struct MemorySSA {
   std::vector<MemoryNode> nodes{MemoryNode{}};
   std::vector<std::vector<int>> before;
   std::vector<int> incoming, outgoing, phis;
-  mutable std::map<std::pair<int,Regions>,int> answers;
-  MemorySSA(const FunctionIR &f, const Summaries &summaries, const std::vector<Regions> &roots) {
+  const AliasAnalysis &alias;
+  mutable std::map<std::tuple<int,Regions,int,uint64_t>,int> answers;
+  MemorySSA(const FunctionIR &f, const Summaries &summaries, const AliasAnalysis &analysis) : alias(analysis) {
+    const auto &roots = alias.roots;
     const auto &g = controlFlow(f);
     size_t count = f.blocks.size();
     before.resize(count); incoming.assign(count, 0); outgoing.assign(count, 0); phis.assign(count, 0);
@@ -542,7 +674,11 @@ struct MemorySSA {
         else if (i.op == Op::Call) writes = callEffects(i, roots, summaries).writes;
         if (!writes.empty()) {
           defs[b][n] = nodes.size(); MemoryNode d; d.kind = MemoryNode::Def; d.block = b;
-          d.position = n; d.writes = std::move(writes); nodes.push_back(std::move(d));
+          d.position = n; d.writes = std::move(writes);
+          if (i.op == Op::Store || i.op == Op::Zero) {
+            d.pointer = i.args[0]; d.size = i.op == Op::Zero ? static_cast<uint64_t>(i.immediate) : accessSize(f.values[i.args[1]]);
+          }
+          nodes.push_back(std::move(d));
         }
       }
     }
@@ -567,9 +703,9 @@ struct MemorySSA {
         throw std::logic_error("self-referencing memory definition");
     }
   }
-  int clobber(int version, const Regions &reads) const {
+  int clobber(int version, const Regions &reads, int pointer = -1, uint64_t size = 0) const {
     if (reads.empty()) return 0;
-    auto key = std::make_pair(version,reads); auto cached = answers.find(key);
+    auto key = std::make_tuple(version,reads,pointer,size); auto cached = answers.find(key);
     if (cached != answers.end()) return cached->second;
     std::set<int> terminal; std::vector<int> work{version};
     std::vector<bool> visited(nodes.size(), false); int firstPhi = -1;
@@ -577,7 +713,8 @@ struct MemorySSA {
       int v = work.back(); work.pop_back();
       if (visited[v]) continue;
       visited[v] = true; const auto &node = nodes[v];
-      if (node.kind == MemoryNode::Entry || (node.kind == MemoryNode::Def && overlaps(node.writes, reads))) terminal.insert(v);
+      bool conflict = pointer >= 0 && node.pointer >= 0 ? alias.mayAlias(pointer,size,node.pointer,node.size) : overlaps(node.writes,reads);
+      if (node.kind == MemoryNode::Entry || (node.kind == MemoryNode::Def && conflict)) terminal.insert(v);
       else if (node.kind == MemoryNode::Def) work.push_back(node.previous);
       else {
         if (firstPhi < 0) firstPhi = v;
@@ -591,27 +728,34 @@ struct MemorySSA {
 
 void memoryForward(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
-  const auto &graph = controlFlow(f); auto roots = provenance(f);
-  MemorySSA memory(f, summaries, roots);
-  using Key = std::tuple<int, ValueType, int>;
+  const auto &graph = controlFlow(f); AliasAnalysis alias(f); const auto &roots = alias.roots;
+  MemorySSA memory(f, summaries, alias);
+  using Key = std::tuple<PointerLocation, ValueType, int>;
   std::map<Key, int> loads;
   std::map<std::string, int> calls;
+  std::unordered_map<ExpressionKey,int,ExpressionHash> expressions;
+  std::vector<int> aliases(f.values.size());
+  for (size_t v = 0; v < aliases.size(); ++v) aliases[v] = v;
   std::function<void(int)> visit = [&](int b) {
     std::vector<Key> addedLoads; std::vector<std::string> addedCalls;
+    std::vector<ExpressionKey> addedExpressions;
     for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
       auto &i = f.blocks[b].instructions[n];
+      for (int &a : i.args) a = root(aliases,a);
       if (i.op == Op::Load) {
-        int version = memory.clobber(memory.before[b][n], roots[i.args[0]]);
-        Key key{i.args[0], f.values[i.result], version}; int available = -1;
+        uint64_t size = accessSize(f.values[i.result]);
+        int version = memory.clobber(memory.before[b][n], roots[i.args[0]], i.args[0], size);
+        Key key{alias.locations[i.args[0]], f.values[i.result], version}; int available = -1;
         auto previous = loads.find(key);
         if (previous != loads.end()) available = previous->second;
         const auto &node = memory.nodes[version];
         if (available < 0 && node.kind == MemoryNode::Def && graph.dominates(node.block, b) &&
             (node.block != b || node.position < static_cast<int>(n))) {
           const auto &store = f.blocks[node.block].instructions[node.position];
-          if (store.op == Op::Store && store.args[0] == i.args[0] && f.values[store.args[1]] == f.values[i.result]) available = store.args[1];
+          if (store.op == Op::Store && alias.covers(store.args[0],accessSize(f.values[store.args[1]]),i.args[0],size) &&
+              f.values[store.args[1]] == f.values[i.result]) available = store.args[1];
         }
-        if (available >= 0) { i.op = Op::Move; i.args = {available}; }
+        if (available >= 0) aliases[i.result] = root(aliases,available);
         else { loads.emplace(key, i.result); addedLoads.push_back(key); }
       } else if (i.op == Op::Call && i.result >= 0) {
         auto e = callEffects(i, roots, summaries);
@@ -619,15 +763,69 @@ void memoryForward(FunctionIR &f, const Summaries &summaries) {
         std::ostringstream text; text << i.callee << ':' << memory.clobber(memory.before[b][n], e.reads);
         for (int a : i.args) text << ':' << a;
         auto key = text.str(); auto previous = calls.find(key);
-        if (previous != calls.end()) { i.op = Op::Move; i.args = {previous->second}; i.callee = nullptr; }
+        if (previous != calls.end()) aliases[i.result] = root(aliases,previous->second);
         else { calls.emplace(key, i.result); addedCalls.push_back(key); }
+      } else if (i.result >= 0) {
+        if (i.op == Op::Move) aliases[i.result] = i.args[0];
+        else if (i.op != Op::Phi && i.op != Op::Parameter) {
+          auto key = expressionKey(i,f); auto inserted = expressions.emplace(key,i.result);
+          if (!inserted.second) aliases[i.result] = root(aliases,inserted.first->second);
+          else addedExpressions.push_back(std::move(key));
+        }
       }
     }
     for (int child : graph.children[b]) visit(child);
     for (const auto &key : addedLoads) loads.erase(key);
     for (const auto &key : addedCalls) calls.erase(key);
+    for (const auto &key : addedExpressions) expressions.erase(key);
   };
   visit(0);
+  for (auto &b : f.blocks) for (auto &i : b.instructions) {
+    for (int &a : i.args) a = root(aliases,a);
+    if (i.result >= 0 && aliases[i.result] != i.result) {
+      i.op = Op::Move; i.args = {root(aliases,i.result)}; i.edges.clear(); i.callee = nullptr;
+    }
+  }
+}
+
+// Bound local DSE work independently of source size. Each retained later write
+// can kill an earlier fully covered store, until a possibly aliasing read or
+// call makes that write unavailable. Partial zero fills never kill live bytes.
+void deadStores(FunctionIR &f, const Summaries &summaries) {
+  if (!f.ssa) return;
+  bool candidate = false;
+  for (const auto &b : f.blocks) {
+    int writes = 0;
+    for (const auto &i : b.instructions) if (i.op == Op::Store || i.op == Op::Zero) ++writes;
+    candidate |= writes > 1;
+  }
+  if (!candidate) return;
+  AliasAnalysis alias(f);
+  for (auto &b : f.blocks) {
+    if (std::count_if(b.instructions.begin(),b.instructions.end(),[](const Instruction &i) { return i.op == Op::Store || i.op == Op::Zero; }) < 2) continue;
+    struct Write { int pointer; uint64_t size; };
+    std::vector<Write> later; std::vector<bool> dead(b.instructions.size(),false);
+    for (size_t n = b.instructions.size(); n-- > 0;) {
+      const auto &i = b.instructions[n];
+      if (i.op == Op::Load) {
+        later.erase(std::remove_if(later.begin(),later.end(),[&](Write w) {
+          return alias.mayAlias(w.pointer,w.size,i.args[0],accessSize(f.values[i.result]));
+        }),later.end());
+      } else if (i.op == Op::Call) {
+        auto e = callEffects(i,alias.roots,summaries); e.reads.insert(e.writes.begin(),e.writes.end());
+        later.erase(std::remove_if(later.begin(),later.end(),[&](Write w) { return overlaps(alias.roots[w.pointer],e.reads); }),later.end());
+      } else if (i.op == Op::Store || i.op == Op::Zero) {
+        uint64_t size = i.op == Op::Zero ? static_cast<uint64_t>(i.immediate) : accessSize(f.values[i.args[1]]);
+        dead[n] = !size || std::any_of(later.begin(),later.end(),[&](Write w) { return alias.covers(w.pointer,w.size,i.args[0],size); });
+        if (!dead[n]) {
+          if (later.size() == 64) later.erase(later.begin());
+          later.push_back({i.args[0],size});
+        }
+      }
+    }
+    size_t n = 0;
+    b.instructions.erase(std::remove_if(b.instructions.begin(),b.instructions.end(),[&](const Instruction &) { return dead[n++]; }),b.instructions.end());
+  }
 }
 
 std::vector<Loop> loops(const Graph &graph) {
@@ -1001,6 +1199,8 @@ void arithmetic(FunctionIR &f) {
 void licm(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
   auto nests = loops(controlFlow(f));
+  if (nests.empty()) return;
+  AliasAnalysis alias(f); const auto &roots = alias.roots;
   for (const auto &original : nests) {
     const auto &graph = controlFlow(f); auto current = loops(graph);
     auto found = std::find_if(current.begin(), current.end(), [&](const Loop &l) { return l.header == original.header; });
@@ -1019,17 +1219,15 @@ void licm(FunctionIR &f, const Summaries &summaries) {
     }
     std::vector<int> site(f.values.size(), -1);
     for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions) if (i.result >= 0) site[i.result] = b;
-    auto roots = provenance(f); Regions writes;
+    Regions callWrites;
+    std::vector<std::pair<int,uint64_t>> writes;
     for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) {
-      if (i.op == Op::Store || i.op == Op::Zero) writes.insert(roots[i.args[0]].begin(), roots[i.args[0]].end());
-      if (i.op == Op::Call) { auto e = callEffects(i, roots, summaries); writes.insert(e.writes.begin(), e.writes.end()); }
+      if (i.op == Op::Store || i.op == Op::Zero) writes.push_back({i.args[0],i.op == Op::Zero ? static_cast<uint64_t>(i.immediate) : accessSize(f.values[i.args[1]])});
+      if (i.op == Op::Call) { auto e = callEffects(i, roots, summaries); callWrites.insert(e.writes.begin(), e.writes.end()); }
     }
     bool changed;
     do {
       changed = false;
-      std::vector<std::pair<const Symbol *, int64_t>> addresses(f.values.size(), {nullptr, 0});
-      for (const auto &block : f.blocks) for (const auto &i : block.instructions)
-        if (i.op == Op::Address) addresses[i.result] = {i.symbol, i.immediate};
       for (int b : loop.blocks) {
         auto &code = f.blocks[b].instructions;
         bool priorEffect = false;
@@ -1038,12 +1236,14 @@ void licm(FunctionIR &f, const Summaries &summaries) {
           if (constantCall(i, summaries)) movable = b == loop.header && !priorEffect;
           for (int a : i.args) movable &= !loop.blocks.count(site[a]);
           if (i.op == Op::Load) {
-            auto pointer = addresses[i.args[0]];
-            // Speculate only fixed, valid object accesses, and only in a loop
-            // with no writes or calls. Unknown addresses remain guarded.
-            bool fixed = pointer.first && pointer.second >= 0 &&
-                !pointer.first->parameter && pointer.second / 4 < pointer.first->type.elements();
-            movable &= !overlaps(roots[i.args[0]], writes) && (fixed || (b == loop.header && !priorEffect));
+            auto pointer = alias.locations[i.args[0]]; uint64_t size = accessSize(f.values[i.result]);
+            // Speculate only fixed, valid object accesses. Unknown addresses
+            // retain the existing must-execute guard, including zero trips.
+            uint64_t extent = pointer.object && !pointer.object->parameter ? static_cast<uint64_t>(pointer.object->type.elements()) * 4 : 0;
+            bool fixed = extent >= size && pointer.offset <= extent - size;
+            bool clobbered = overlaps(roots[i.args[0]],callWrites) ||
+                std::any_of(writes.begin(),writes.end(),[&](auto w) { return alias.mayAlias(i.args[0],size,w.first,w.second); });
+            movable &= !clobbered && (fixed || (b == loop.header && !priorEffect));
           }
           if (movable) {
             site[i.result] = preheader; auto moved = std::move(i);
@@ -1207,7 +1407,7 @@ void printEffects(const ModuleIR &module, std::ostream &out) {
 void printMemoryIR(const ModuleIR &module, std::ostream &out) {
   auto summaries = summarize(module);
   for (const auto &f : module.functions) {
-    auto roots = provenance(f); MemorySSA memory(f, summaries, roots);
+    AliasAnalysis alias(f); MemorySSA memory(f, summaries, alias);
     out << "function " << f.source->name << " memory\n  m0 = entry\n";
     for (size_t id = 1; id < memory.nodes.size(); ++id) {
       const auto &n = memory.nodes[id]; out << "  m" << id << " = ";
@@ -1221,7 +1421,7 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out) {
     for (size_t b = 0; b < f.blocks.size(); ++b) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
       const auto &i = f.blocks[b].instructions[n];
       if (i.op == Op::Load) out << "  use b" << b << '.' << n << " m" << memory.before[b][n]
-          << " clobber=m" << memory.clobber(memory.before[b][n], roots[i.args[0]]) << '\n';
+          << " clobber=m" << memory.clobber(memory.before[b][n], alias.roots[i.args[0]],i.args[0],accessSize(f.values[i.result])) << '\n';
     }
   }
 }
@@ -1248,11 +1448,13 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       throw std::runtime_error("inline must precede SSA construction");
     inlineCalls(module); return true;
   }
-  if (name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
-    if (name == "gvn" || name == "licm" || name == "memory") summaries = summarize(module);
+    if (name == "gvn" || name == "licm" || name == "memory" || name == "dse") summaries = summarize(module);
     for (auto &f : module.functions) {
-      if (name == "affine") normalizeAffine(f);
+      if (name == "sroa") scalarReplace(f);
+      else if (name == "dse") deadStores(f,summaries);
+      else if (name == "affine") normalizeAffine(f);
       else if (name == "egraph") rewriteEqualities(f);
       else if (name == "ssa") ssa(f);
       else if (name == "simplify") simplify(f);

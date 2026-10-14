@@ -114,6 +114,24 @@ CASES = {
         return sink(h,g,f,e,d,c,b,a,z,y,x);}
       int main(){putint(relay(1,2,3,4,5,6,7,8,1.25,2.5,3.75));return 0;}''',
       "8 7 6 5 4 3 2 1 3.75 2.50 1.25\n8\n0\n"),
+    "sparse_array_effects": ('''int count;int tick(){count=count+1;return count;}
+      int main(){int a[2000000]={tick()};a[1999999]=tick();a[731]=tick();a[731]=tick();
+        int i=0;while(i<7){a[0]=a[0]+a[1999999];if(i%2)a[1999999]=a[1999999]+1;i=i+1;}
+        putf("%d %d %d %d\\n",a[0],a[1999999],a[1],count);return 0;}''', "24 5 0 4\n0\n"),
+    "sroa_reinitialization": ('''int main(){int n=getint();int sum=0;int i=0;
+      while(i<n){int a[3][2]={{i}, {i+1}};a[2][1]=sum;
+        if(i%2==0){i=i+1;continue;}sum=sum+a[0][0]+a[1][0]+a[0][1]+a[2][0]+a[2][1];
+        if(i>6)break;i=i+1;}putf("%d %d\\n",sum,i);return 0;}''', "89 7\n0\n"),
+    "memory_read_barriers": ('''int a[2];int seen(int p[],int n){if(n)return seen(p,n-1);return p[0];}
+      int main(){a[0]=7;int x=seen(a,3);a[1]=9;a[0]=11;int y=seen(a,2);
+        a[0]=13;putf("%d %d %d %d\\n",x,y,a[0],a[1]);return 0;}''', "7 11 13 9\n0\n"),
+    "memory_float_bits": ('''int main(){float a[4]={};float x=getfloat();a[0]=-x;a[1]=x/x;
+      float y=a[0];a[2]=17.0;float z=a[0];a[3]=3.0;
+      putf("%f %f %f %f\\n",y,z,a[1],a[2]+a[3]);return 0;}''', "-0.000000 -0.000000 nan 20.000000\n0\n"),
+    "memory_negative_subarray": ('''int calc(int a[],int b[],int n){if(n)return calc(a,b,n-1);
+      int x=a[-1];b[3]=17;int y=a[-1];a[-2]=9;int z=a[-1];return x*100+y*10+z;}
+      int main(){int a[2][4]={{1,2,3,4},{5,6,7,8}};putint(calc(a[1],a[0],2));
+        putch(32);putarray(8,a[0]);return 0;}''', "587 8: 1 2 9 17 5 6 7 8\n0\n"),
 }
 
 INVALID = {
@@ -142,12 +160,37 @@ INVALID = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--benchmark", action="store_true", help="write a timed pressure fixture and exit")
+    parser.add_argument("--benchmark", action="store_true", help="write timed pressure, division and memory fixtures")
     parser.add_argument("--compiler", type=Path, default=ROOT / "build/compiler")
     opts = parser.parse_args()
     directory = ROOT / "build/regressions"
     directory.mkdir(parents=True, exist_ok=True)
     cases = dict(CASES)
+    stores = "".join(f"data[{i}]=x+{i};" for i in range(1,71))
+    cases["memory_search_budget"] = (f'''int data[80];int main(){{int x=getint();data[0]=x;
+      {stores}data[0]=x+3;putarray(80,data);return 0;}}''',
+      "80: "+" ".join(map(str,[-14]+[-17+i for i in range(1,71)]+[0]*9))+"\n0\n")
+    (directory / "memory_search_budget.in").write_text("-17\n")
+    chain = "data["*8 + "0" + "]"*8
+    chain_source = f'''int data[32];int other[1];int main(){{int n=getint();int i=0;int sum=0;
+      while(i<32){{data[i]=(i+1)%32;i=i+1;}}i=0;START
+      while(i<n){{data[i%32]=(i*7+5)%32;int x={chain};other[0]=i;
+        int y={chain};sum=sum+x+y;i=i+1;}}STOP
+      putf("%d %d\\n",sum,other[0]);return 0;}}'''
+    def chain_model(n):
+        data,total = [(i+1)%32 for i in range(32)],0
+        def read():
+            x = 0
+            for _ in range(8): x = data[x]
+            return x
+        for i in range(min(n,32)):
+            data[i%32] = (i*7+5)%32
+            total += 2*read()
+        if n > 32: total += (n-32)*2*read()
+        return (total+2**31)%2**32-2**31,max(0,n-1)
+    total,last = chain_model(47)
+    cases["memory_numbering_chain"] = (chain_source.replace("START","").replace("STOP",""),f"{total} {last}\n0\n")
+    (directory / "memory_numbering_chain.in").write_text("47\n")
     cases["deep_expression"] = ("int main(){int x=getint();putint(x"+"+1"*20000+");return 0;}", "20007\n0\n")
     (directory / "deep_expression.in").write_text("7\n")
     # All parameters survive another call: exercise both argument banks,
@@ -272,6 +315,46 @@ def main():
             (fixture / "division.in").write_text(f"-2147483648 {division_count}\n")
             (fixture / "division.out").write_text(f"{total} {x}\n0\n")
             print(f"Wrote {division_count} quotient/remainder iterations to {fixture}")
+            fixture = ROOT / "build/memory-fixture/performance"
+            fixture.mkdir(parents=True,exist_ok=True)
+            # Exponentiate an independent recurrence over Z/(2^32).
+            def recurrence(matrix, vector, count):
+                while count:
+                    if count & 1: vector = [sum(a*b for a,b in zip(row,vector)) & 0xffffffff for row in matrix]
+                    count >>= 1
+                    if count: matrix = [[sum(matrix[i][k]*matrix[k][j] for k in range(3)) & 0xffffffff for j in range(3)] for i in range(3)]
+                return [wrap(x) for x in vector]
+            a,b,count = 1664525,1013904223,10000000
+            x,y,_ = recurrence([[a,0,b],[a,1,b],[0,0,1]],[3,7,1],count)
+            source = '''int main(){int a[2000000]={3};a[1999999]=7;int n=getint();int i=0;
+              starttime();while(i<n){a[0]=a[0]*1664525+1013904223;
+                a[1999999]=a[1999999]+a[0];i=i+1;}stoptime();
+              putf("%d %d\\n",a[0],a[1999999]);return 0;}'''
+            (fixture / "sparse.sy").write_text(source)
+            (fixture / "sparse.in").write_text(f"{count}\n")
+            (fixture / "sparse.out").write_text(f"{x} {y}\n0\n")
+            x,total,_ = recurrence([[a,0,b],[3,1,3],[0,0,1]],[-31,0,1],count)
+            source = '''int data[2]={3,7};int main(){int x=getint();int n=getint();int i=0;int sum=0;
+              starttime();while(i<n){sum=sum+data[0];data[1]=x;sum=sum+data[0]*data[1];
+                x=x*1664525+1013904223;i=i+1;}stoptime();
+              putf("%d %d\\n",sum,x);return 0;}'''
+            (fixture / "fields.sy").write_text(source)
+            (fixture / "fields.in").write_text(f"-31 {count}\n")
+            (fixture / "fields.out").write_text(f"{total} {x}\n0\n")
+            x,previous,_ = recurrence([[a,0,b],[1,0,0],[0,0,1]],[-31,0,1],count)
+            source = '''int data[2];int main(){int x=getint();int n=getint();int i=0;
+              starttime();while(i<n){data[0]=x+3;data[1]=x+7;
+                data[0]=x*31+11;data[1]=x*37+13;data[0]=x*5+17;data[1]=x*7+19;
+                x=x*1664525+1013904223;i=i+1;}stoptime();
+              putf("%d %d\\n",data[0]+data[1],x);return 0;}'''
+            (fixture / "stores.sy").write_text(source)
+            (fixture / "stores.in").write_text(f"-31 {count}\n")
+            (fixture / "stores.out").write_text(f"{wrap(12*previous+36)} {x}\n0\n")
+            print(f"Wrote sparse-cell, disjoint-field and overwritten-store fixtures to {fixture}")
+            total,last = chain_model(count)
+            (fixture / "chain.sy").write_text(chain_source.replace("START","starttime();").replace("STOP","stoptime();"))
+            (fixture / "chain.in").write_text(f"{count}\n")
+            (fixture / "chain.out").write_text(f"{total} {last}\n0\n")
             return
         name = f"pressure_generated_{k:02d}"
         cases[name] = (source,f"{wrap(sum(model))}\n0\n")
@@ -303,6 +386,31 @@ def main():
         name = f"affine_generated_{k:02d}"
         cases[name] = (source,f"{p} {q} {shared} {x}\n0\n")
         (directory / f"{name}.in").write_text(f"{x} {y} {mode} {n}\n")
+    # Fixed fields relative to dynamic row pointers, distinct and identical
+    # actual parameters, and unknown-index writes. No noalias assumptions.
+    memory_rng = random.Random(20261015)
+    for k in range(24):
+        n,row,same = [0,1,2,3,4,7,8,13][k%8],k%4,k%2
+        values = [memory_rng.randrange(-100000,100000) for _ in range(16)]
+        model = values[:]; total = 0
+        for i in range(n):
+            a,b = row*4, row*4 if same else ((row+1)%4)*4
+            total = wrap(total+model[a])
+            model[b+1] = wrap(model[b+1]+i)
+            total = wrap(total+model[a]+model[b+1])
+            model[b+i%4] = wrap(total+i)
+            total = wrap(total+model[a])
+        source = '''int calc(int a[],int b[],int n){int i=0;int sum=0;
+          while(i<n){sum=sum+a[0];b[1]=b[1]+i;sum=sum+a[0]+b[1];
+            b[i%4]=sum+i;sum=sum+a[0];i=i+1;}return sum;}
+          int data[4][4];int main(){int i=0;while(i<4){int j=0;
+            while(j<4){data[i][j]=getint();j=j+1;}i=i+1;}
+          int n=getint();int row=getint();int same=getint();int sum=0;
+          if(same)sum=calc(data[row],data[row],n);else sum=calc(data[row],data[(row+1)%4],n);
+          putint(sum);putch(32);putarray(16,data[0]);return 0;}'''
+        name = f"memory_generated_{k:02d}"
+        cases[name] = (source,f"{total} 16: {' '.join(map(str,model))}\n0\n")
+        (directory / f"{name}.in").write_text(" ".join(map(str,values+[n,row,same]))+"\n")
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)
@@ -317,6 +425,8 @@ def main():
     (directory / "guarded_divergence.in").write_text("0\n")
     (directory / "runtime_unroll_tails.in").write_text("\n".join(map(str,lengths))+"\n")
     (directory / "signed_mask_tests.in").write_text("137 -99\n")
+    (directory / "sroa_reinitialization.in").write_text("12\n")
+    (directory / "memory_float_bits.in").write_text("0\n")
     for opt in (0, 2, 3):
         subprocess.run(["python3", str(ROOT / "tools/test.py"), str(directory), "--compiler", str(opts.compiler),
                         "--opt", str(opt), "--check-alloc", "--output", str(ROOT / f"build/regression-o{opt}")], check=True)
