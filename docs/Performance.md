@@ -1,5 +1,46 @@
 # 性能优化与测量
 
+## 现有实现补强与全阶段筛选（2026-10-14）
+
+基线是预先保存的当前分支 `8366f03`。新增 `loop-promote` 完善固定可写内存的循环状态及出口回写，覆盖有状态累加、只写覆盖、条件写和多个出口；`arith` 加入支配作用域的条件事实、惰性范围查询及比较消除。MIR 补操作数／位宽／边／clobber／slot 检查，GP 池纳入未被展开使用的 `t2`。全阶段调研、深入取舍与下一批验收实验见 [Compiler-Research.md](Compiler-Research.md)。
+
+| 指标 | 基线 | 本轮 | 结果 |
+|---|---:|---:|---|
+| 原有 210 个输入的编译 wall 中位数总计 | 0.82161 s | 0.83231 s | 增加 **1.3%** |
+| 同组编译 CPU 时间总计 | 0.79106 s | 0.80196 s | 增加 **1.4%** |
+| 平均峰值 RSS | 5768 KiB | 5772 KiB | 基本持平，增加约 **0.1%**；每版各采样一次 |
+| 原有 60 个 performance 的 QEMU wall 几何平均 | — | — | **1.002×**，基本持平 |
+| 基线区间至少 10ms 的 44 个程序 | — | — | 区间几何平均 **1.010×**，不视为明显整体加速 |
+| 同组链接后 `.text` 总计 | 202748 B | 202126 B | 减少 **0.31%** |
+| 循环状态实验，计时区间 | 16.957 ms | 13.217 ms | **1.283×** |
+| 条件范围实验，计时区间 | 63.500 ms | 58.850 ms | **1.079×** |
+| 只写覆盖实验，计时区间 | 34.279 ms | 28.596 ms | **1.199×** |
+| 高压力实验，仅比较 GP21 / GP22 | 59.368 ms | 57.815 ms | **1.027×** |
+
+循环状态与条件范围各一千万次迭代；只写覆盖为一亿次，结果包含 int32 环绕。状态实验由独立递推矩阵求幂生成预期值；条件实验由 Python 对每次正负分支、截断除法／余数和 LCG 更新建模。所有输入均在运行时读取。原有负载中 51 个程序改变汇编，不能将每个时间波动都归因于代码改进。conv2d-2/3 此轮区间约快 10–11%，其他多数差异较小。
+
+单项对照使用同一最终编译器：只关闭 `loop-promote`，状态实验从 **17.074 ms** 降至 **13.369 ms**，**1.277×**；只写覆盖从 **34.433 ms** 降至 **28.682 ms**，**1.201×**。将 `arith` 换成 `arith-global`，条件实验从 **62.417 ms** 降至 **58.654 ms**，**1.064×**；两个状态实验基本不变。基线的 O3 展开＋DSE 已删除主循环中的部分重复写，所以只写实验的增量不是删除全部循环 store 的理论倍数。
+
+寄存器池单项对照保留其他优化，只把 GP21 改为 GP22：原有程序区间几何平均 **1.002×**、高压力实验 **1.027×**、原有程序 `.text` 从 **202508 B** 降至 **202126 B**。首轮 crypto-3 测得约 6% 退化，针对三个 crypto 程序交替重测 17 次未复现，区间几何平均 **1.008×**；不把接近持平的数据宣传为稳定加速。22 个 GP 的调用 mask、参数 ABI 限制和检查器位置空间均同步，保留实际需要的 scratch。
+
+构建和验证与计时分开，固定同一 CPU 串行运行。原有负载、编译成本预热一次并交替七次；状态、条件和压力实验十一次；只写与 crypto 重测十七次，均取中位数。最终只写补强和额外验证检查没有改变原有 60 个程序的已测汇编，逐字节核对通过。原始样本、候选和单项对照保留在忽略目录 `build/research-round6`；全部结果见 [performance-analysis.csv](performance-analysis.csv)。
+
+最终验证：`-O2`、`-O3` 各 **210/210**；257 个额外程序在 O0/O2/O3 下 **771 次执行**、**20 个诊断**通过；原生默认 8MiB 栈下 ASan/UBSan 编译 **479/479**。MIR 检查器接受七组有效示例、拒绝 **54 个破坏性变异**；可选 Z3 证明 **195 个局部 int32 条件**，删除符号守卫的反例必须被识别。这不是完整 CFG／内存／机器代码翻译验证。
+
+```sh
+python3 tools/regression.py
+python3 tools/regression.py --benchmark
+python3 tools/verify.py
+# 可选离线证明依赖，编译器本身不需要 Z3
+uv pip install --target build/verification-deps z3-solver==5.1.0.0
+PYTHONPATH=build/verification-deps python3 tools/verify.py --smt
+python3 tools/test.py build/scalar-fixture/performance --compiler /path/to/baseline-compiler --opt 3 --check-alloc --output build/scalar-before
+python3 tools/test.py build/scalar-fixture/performance --opt 3 --check-alloc --output build/scalar-after
+python3 tools/bench.py build/scalar-before build/scalar-after --tests build/scalar-fixture/performance --repeats 11
+```
+
+单项对照可通过 `--passes` 复制默认 O3 的 CFG 管线，再删除 `loop-promote` 或将 `arith` 替换为 `arith-global`；保留其他 PASS、顺序及 HIR 选项。该对照不会读取其他分支，也不更换 SysY 后端。
+
 ## 多面体循环调度与安全整数掩码（2026-10-14）
 
 基线为预先保存的当前分支 `03c6afb`，未读取其他分支。新增自有 `PolyRegion`、仿射访存关系、有限整数集合求解、循环交换与 unroll-and-jam；合法性证明、资源预算与调度选择分别处理。条件整数累加仅在贡献可安全求值时转换为掩码，浮点归约顺序保留。实现与近期论文的准确对应见 [Architecture-Research.md](Architecture-Research.md)。

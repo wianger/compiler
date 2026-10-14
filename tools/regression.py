@@ -577,6 +577,81 @@ def main():
             a[{wi}*i+{wj}*j+{wo}]=a[{ri}*i+{rj}*j+{ro}]*3+seed+i*7+j;i=i+1;}}j=j+1;}}
           putarray(192,a);return 0;}}''',"192: "+" ".join(map(str,data))+"\n0\n")
         (directory / f"{name}.in").write_text(f"{seed}\n")
+    # Loop memory promotion must commit the reaching state on every exit and
+    # leave observers and unknown-index aliases in the original memory order.
+    state_rng = random.Random(20261018)
+    for n in range(24):
+        mode,trip = n%6,[-2,0,4,9][n//6]
+        seed = state_rng.randrange(-1000000000,1000000000)
+        data = [wrap(seed+k*7) for k in range(8)]
+        i,total,result = 0,0,None
+        while i < trip:
+            data[2] = wrap(data[2]*31+i)
+            if mode == 1 and i%3 == 0: i += 1; continue
+            if mode == 2 and i == 5: break
+            if mode == 3 and i == 5: result = -i; break
+            data[5] = wrap(data[5]+data[2])
+            if mode == 4: total = wrap(total+wrap(data[2]+data[5]))
+            if mode == 5: data[i%8] = i+17
+            i += 1
+        if result is None: result = wrap(i+total)
+        control = {0:"",1:"if(i%3==0){i=i+1;continue;}",2:"if(i==5)break;",3:"if(i==5)return -i;",4:"",5:""}[mode]
+        observe = "total=total+observe(2);" if mode == 4 else "a[i%8]=i+17;" if mode == 5 else ""
+        name = f"loop_memory_{n:02d}"
+        cases[name] = (f'''int a[8];int observe(int n){{if(n==0)return a[2]+a[5];return observe(n-1);}}
+          int calc(int n){{int i=0;int total=0;while(i<n){{a[2]=a[2]*31+i;{control}
+            a[5]=a[5]+a[2];{observe}i=i+1;}}return i+total;}}
+          int main(){{int seed=getint();int n=getint();int k=0;while(k<8){{a[k]=seed+k*7;k=k+1;}}
+            putint(calc(n));putch(32);putarray(8,a);return 0;}}''',f"{result} 8: "+" ".join(map(str,data))+"\n0\n")
+        (directory / f"{name}.in").write_text(f"{seed} {trip}\n")
+    cases["loop_memory_one_past"] = ('''int calc(int a[],int n){int i=0;
+      while(i<n){a[0]=a[0]+i;i=i+1;}return i;}
+      int main(){int a[1][4]={1,2,3,4};putint(calc(a[1],getint()));return 0;}''',"0\n0\n")
+    (directory / "loop_memory_one_past.in").write_text("0\n")
+    cases["loop_memory_const_zero_trip"] = ('''const int a[4]={1,2,3,4};
+      int calc(int p[],int n){int i=0;while(i<n){p[0]=p[0]+i;i=i+1;}return i;}
+      int main(){putint(calc(a,getint()));return 0;}''',"0\n0\n")
+    (directory / "loop_memory_const_zero_trip.in").write_text("0\n")
+    for n in (-2,0,1,2,6,9,31):
+        last = max((i for i in range(max(n,0)) if i%3 == 0),default=None)
+        expected = 17 if last is None else last*31
+        name = f"loop_memory_write_only_{max(n,0)}" + ("_negative" if n < 0 else "")
+        cases[name] = ('''int state=17;void calc(int n){int i=0;
+          while(i<n){if(i%3==0)state=i*31;i=i+1;}}
+          int main(){calc(getint());putint(state);return 0;}''',f"{expected}\n0\n")
+        (directory / f"{name}.in").write_text(f"{n}\n")
+    for trip in (0,1,7):
+        total = f32(-.0)
+        for _ in range(trip): total = f32(total+f32(.1))
+        cases[f"loop_memory_float_{trip}"] = ('''float state;int main(){int n=getint();state=-0.0;
+          int i=0;while(i<n){state=state+0.1;i=i+1;}
+          putf("state=%f\\n",state);return 0;}''',f"state={total:.6f}\n0\n")
+        (directory / f"loop_memory_float_{trip}.in").write_text(f"{trip}\n")
+    def quotient(x,d): return wrap(abs(x)//abs(d)*(-1 if (x<0)!=(d<0) else 1))
+    def remainder(x,d): return wrap(x-quotient(x,d)*d)
+    guard_rng = random.Random(20261019)
+    for n in range(24):
+        x = ([-2**31,-2**31+1,-65537,-1,0,1,65537,2**31-18,2**31-1]+[guard_rng.randrange(-2**31,2**31) for _ in range(15)])[n]
+        original = x
+        op = ["<","<=",">",">=","==","!="][n%6]; c = [-1,0,17,2**31-1][n//6]
+        condition = {"<":x<c,"<=":x<=c,">":x>c,">=":x>=c,"==":x==c,"!=":x!=c}[op]
+        predicate = f"x{op}({c})" if n%2 else f"({c})"+{"<":">","<=":">=",">":"<",">=":"<=","==":"==","!=":"!="}[op]+"x"
+        if condition:
+            total = wrap(quotient(x,8)+remainder(x,8))
+            if 0 <= x < 1024:
+                total = wrap(total+quotient(x+17,16)+remainder(x+17,16))
+        else: total = wrap(quotient(x,-16)+remainder(x,-16))
+        total = wrap(total+quotient(x,8)+remainder(x,8))
+        if x >= 0:
+            x = wrap(x*1664525+1013904223)
+            total = wrap(total+quotient(x,8)+remainder(x,8))
+        name = f"predicate_range_{n:02d}"
+        cases[name] = (f'''int main(){{int x=getint();int sum=0;if({predicate}){{sum=x/8+x%8;
+          if(x>=0&&x<1024){{sum=sum+(x+17)/16+(x+17)%16;if(x<0)sum=9999;}}}}
+          else sum=x/(-16)+x%(-16);
+          sum=sum+x/8+x%8;if(x>=0){{x=x*1664525+1013904223;sum=sum+x/8+x%8;}}
+          putf("%d %d\\n",sum,x);return 0;}}''',f"{total} {x}\n0\n")
+        (directory / f"{name}.in").write_text(f"{original}\n")
     if opts.benchmark:
         fixture = ROOT / "build/polyhedral-fixture/performance"
         fixture.mkdir(parents=True,exist_ok=True)
@@ -622,6 +697,36 @@ def main():
             (fixture / f"{name}.in").write_text(f"{seed}\n")
             (fixture / f"{name}.out").write_text(f"{rows*columns}: "+" ".join(expected)+"\n0\n")
         print(f"Wrote column recurrence and ordered integer/float dot fixtures to {fixture}")
+        fixture = ROOT / "build/scalar-fixture/performance"
+        fixture.mkdir(parents=True,exist_ok=True)
+        count,seed = 10000000,-31
+        x,y,_ = recurrence([[1664525,0,1013904223],[1664525,1,1013904223],[0,0,1]],[seed,7,1],count)
+        source = '''int data[8];int main(){int x=getint();int n=getint();data[2]=x;data[5]=7;
+          int i=0;starttime();while(i<n){data[2]=data[2]*1664525+1013904223;
+            data[5]=data[5]+data[2];i=i+1;}stoptime();putf("%d %d\\n",data[2],data[5]);return 0;}'''
+        (fixture / "loop_state.sy").write_text(source)
+        (fixture / "loop_state.in").write_text(f"{seed} {count}\n")
+        (fixture / "loop_state.out").write_text(f"{x} {y}\n0\n")
+        source = '''int state=17;int main(){int n=getint();int i=0;starttime();
+          while(i<n){state=i*31;i=i+1;}stoptime();putint(state);return 0;}'''
+        (fixture / "write_only.sy").write_text(source)
+        (fixture / "write_only.in").write_text(f"{count*10}\n")
+        (fixture / "write_only.out").write_text(f"{wrap((count*10-1)*31)}\n0\n")
+        source = '''int main(){int x=getint();int n=getint();int i=0;int sum=0;starttime();
+          while(i<n){if(x>=0)sum=sum+x/8+x%8+x/16+x%16+x/64+x%64;
+            else sum=sum-x/8-x%8-x/16-x%16-x/64-x%64;
+            x=x*1664525+1013904223;i=i+1;}
+          stoptime();putf("%d %d\\n",sum,x);return 0;}'''
+        x,total = seed,0
+        for _ in range(count):
+            magnitude,sign = abs(x),1 if x >= 0 else -1
+            contribution = sum(sign*(magnitude>>shift)+x-sign*((magnitude>>shift)<<shift) for shift in (3,4,6))
+            total = wrap(total+sign*contribution)
+            x = wrap(x*1664525+1013904223)
+        (fixture / "guarded_division.sy").write_text(source)
+        (fixture / "guarded_division.in").write_text(f"{seed} {count}\n")
+        (fixture / "guarded_division.out").write_text(f"{total} {x}\n0\n")
+        print(f"Wrote loop-state, write-only and predicate-range fixtures to {fixture}")
         return
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)

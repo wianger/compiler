@@ -26,13 +26,13 @@ Source → source-slice Token IR → arena Program IR → resolved HIR
 - `tensor.cpp` 保留并分析数组形状和生产者，推导行、列一致性，再选择矩阵算法。调度 IR 明确记录迭代域、列分块和尾块；一般矩阵使用四列或八列微内核，保持每个元素的浮点累加顺序；符合证明条件的矩阵使用二重循环。逐元素表达式融合，标量广播只求值一次；临时结果保证别名安全，返回值使用调用方提供的缓冲区。`-O3` 还分析无副作用的重复循环与整数加法归约。
 - `polyhedral.cpp` 为普通数组的二重矩形循环建立整数迭代域、仿射访问映射与候选依赖关系。用有预算的整数集合求解证明循环交换或 unroll-and-jam 合法，再按访问步长、公共加载及寄存器预算选择调度；整数条件累加只在贡献可安全求值时转换为掩码。浮点累加顺序保留，未知别名和未证实的关系阻止变换。已选择的 tensor 内核带调度标记，避免重复分块。这是受限多面体优化，尚无一般符号域、skewing、波前或自动搜索框架。
 - `lowering.cpp` 将结构化控制流变成基本块，短路表达式变成分支，访存和调用显式化；提升不逃逸的局部标量，检查 PASS 前后约束。很长的算术表达式以迭代方式降级，减少编译器栈消耗。降低完成后释放语法 arena，保留符号、类型及全局初值。
-- `optimizer.cpp` 缓存支配分析，使用 def-use 工作队列 SCCP、结构化哈希 GVN、按字节区间查询的 MemorySSA；值编号与加载替换在一次支配遍历中即时协作。稀疏 SROA 只为不逃逸数组的观测元素建立 SSA，局部 DSE 删除完整覆盖的死写。`rewrite.cpp` 先用单基仿射摘要归一化单次使用的整数链，再进入有预算的 EGraph 做等价改写和成本提取。计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。通过调用图不动点与指针来源分析推导函数的读写摘要，合并相同纯函数调用，并跨基本块消除冗余加载。实现按循环位置选择的小函数内联、尾递归消除、稀疏条件常量传播、循环不变量外提、范围分析与整数算术简化、指针归纳变量和循环旋转。`-O3` 对合适的固定、动态次数循环展开；动态展开保留标量尾循环，浮点运算顺序保持一致。
+- `optimizer.cpp` 缓存支配分析，使用 def-use 工作队列 SCCP、结构化哈希 GVN、按字节区间查询的 MemorySSA；值编号与加载替换在一次支配遍历中即时协作。稀疏 SROA 只为不逃逸数组的观测元素建立 SSA；循环内的固定可写单元可提升为状态，并在每个出口回写，未知访问和观察调用阻止变换。局部 DSE 删除完整覆盖的死写。`rewrite.cpp` 先用单基仿射摘要归一化单次使用的整数链，再进入有预算的 EGraph 做等价改写和成本提取。计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。通过调用图不动点与指针来源分析推导函数的读写摘要，合并相同纯函数调用，并跨基本块消除冗余加载。实现小函数内联、尾递归消除、循环不变量外提、受支配作用域约束的范围推理、整数算术简化、指针归纳变量和循环旋转。`-O3` 对合适的固定、动态次数循环展开，保留标量尾循环和浮点顺序。
 - `selection.cpp` 将 Phi 降为边上复制，选择布局和 RV64 目标指令；常量除法、地址计算及比较序列在寄存器分配前展开。目标 MIR 暴露临时值、bank、early/late 使用时刻及调用 clobber。展开后进行局部值编号和复制传播，以定义版本保护可多次写入的值，保留常量重物化配方，再用 def-use 工作队列删除无用临时值并压缩 ID。
 - `backend.cpp` 用稀疏 64 位块计算活跃度，以有序占用区间查询冲突，按优先队列分配复制 bundle 并驱逐重试；避免冷路径的受限复制压缩热 bundle 的寄存器选择。热溢出区间拆分后重新分配，较高压力下相邻使用共享重载。独立冲突与 ABI 检查，以及可选的符号数据流检查，验证分配结果。ABI 参数按并行复制处理交换环；分配后消除无操作复制块和多余跳转，输出符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。
 
 标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。Token、Program、SSA 和降 Phi 后的 IR 可单独打印，各 PASS 可以重新组合。
 
-采用的现代设计及准确实现边界见 [Architecture-Research.md](docs/Architecture-Research.md)。红绿 CST、完整 SoA、跨 CFG AEGraph、ISLE DSL 和完整 regalloc2 尚未实现；当前批量编译使用源码切片、块状 arena、自有目标 MIR 和区间分配器。
+采用的现代设计及准确实现边界见 [Architecture-Research.md](docs/Architecture-Research.md)，全阶段调研、取舍与下一批实验见 [Compiler-Research.md](docs/Compiler-Research.md)。红绿 CST、完整 SoA、跨 CFG AEGraph、ISLE DSL 和完整 regalloc3 尚未实现；当前批量编译使用源码切片、块状 arena、自有目标 MIR 和区间分配器。
 
 ```sh
 build/compiler --emit-tokens input.sy
@@ -52,6 +52,8 @@ build/compiler --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce in
 ```
 
 默认 `-O0`。`-O1` 使用标量 SSA 优化，`-O2` 增加调用、内存、循环和 tensor 结构优化，`-O3` 增加循环展开与经过数据流检查的重复循环归约。追求执行性能时使用 `-O3`。`-o -` 输出到标准输出，`-` 输入从标准输入读取。错误带文件、行、列；失败不会覆盖已有输出文件。
+
+`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数规则，编译器本身无需此依赖。
 
 优化保留浮点运算顺序，不启用 fast-math 或 FMA 重结合。浮点矩阵算法变换要求证明每一步乘积和部分和都能精确表示；未知浮点值走普通内核。常量求值采用目标的 [NaN 规则](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)。
 

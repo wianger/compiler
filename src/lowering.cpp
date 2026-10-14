@@ -306,7 +306,7 @@ void optimize(ModuleIR &module, int level, Stats *stats) {
   if (level == 0) runPasses(module, "prune", stats);
   else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact", stats);
   else {
-    runPasses(module, "prune,inline,globaldce,sroa,promote,dce,ssa,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,gvn,simplify,dce,affine,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,memory,dse,simplify,dce", stats);
+    runPasses(module, "prune,inline,globaldce,sroa,promote,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,gvn,simplify,dce,affine,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,memory,dse,simplify,dce", stats);
     if (level >= 3) runPasses(module, "unroll,memory,dse,simplify,dce", stats);
     runPasses(module, "sccp,prune,dce,compact", stats);
   }

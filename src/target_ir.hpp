@@ -4,6 +4,10 @@
 #include <initializer_list>
 
 namespace sysy {
+// Pool indices are shared by selection, allocation and symbolic checking.
+// t0/t1/t3/t4/t6 and ft0/ft1/ft2 remain reserved for pseudo expansion.
+inline constexpr int integerRegisterCount = 22, floatRegisterCount = 29;
+inline constexpr int integerArgumentStart = 13, floatArgumentStart = 21;
 // Target instructions have explicit virtual def/use operands. ABI, stack-frame
 // and rematerializable operations remain typed pseudos until frame layout.
 enum class RV {

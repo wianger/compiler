@@ -2,6 +2,8 @@
 
 2026-10-14，基于当前分支实现及本地测量。未读取本仓库其他分支。所有算法均由本仓库的 C++ 实现，外部项目提供设计资料，没有引入编译器框架或后端依赖。
 
+全阶段技术清单、深入分析、实施优先级及验收实验见 [Compiler-Research.md](Compiler-Research.md)。本文记录当前实现，研究清单中的 P1/P2 不代表已实现。
+
 ## 实际采用的设计
 
 | 阶段 | 实现与依据 | 实际用途与边界 |
@@ -9,13 +11,13 @@
 | Token / 解析 | 源码切片 Token、连续 Token 数组、稳定索引的块状 AoS arena | 普通 Token 不复制字符；节点每 128 个成块分配，避免逐节点分配与递归销毁。孩子引用仍包含 arena 指针和索引，变长字段仍用 vector；尚非完整 SoA |
 | 语义 / HIR | 显式栈的有序后序遍历；保留类型、符号及 tensor 形状；按阶段释放语法 arena | 消除长表达式的递归语义栈；降低后清除语法引用并释放节点，符号身份和全局数据继续有效。没有不可变 CST 或增量查询系统 |
 | CFG / SSA 分析 | 密集 Value ID、按准确拓扑快照缓存支配分析 | 指令改写保留缓存，改边、重排或增删块自动失效；比较完整边数组，避免哈希碰撞导致错误复用。不是所有分析都已缓存 |
-| 常量 / 值编号 | def-use 工作队列 SCCP、结构化 hash-cons 键、支配树作用域撤销表 | 只重新处理受变化影响的用户；GVN 避免字符串序列化和逐子树复制整个表达式表 |
-| 内存 | 字节区间别名分析、MemorySSA、协作 GVN、稀疏 SROA、局部 DSE | 区分同一对象的不同元素；值编号与加载替换即时传播。仅标量化不逃逸且访问位置固定的数组；DSE 保留所有可能观察旧值的读与调用。参数间仍可能别名 |
+| 常量 / 值编号 | def-use 工作队列 SCCP、结构化 hash-cons 键、支配树作用域撤销表、条件范围与惰性查询 | 条件事实只在对应支配子树成立，退出撤销；整数计算可能环绕时不推导精确范围。尚无完整 KnownBits／同余产品域 |
+| 内存 | 字节区间别名分析、MemorySSA、协作 GVN、稀疏 SROA、循环状态提升、局部 DSE | 固定可写单元在循环中转为 SSA 状态，每个出口回写；未知重叠和观察调用阻止提升。SROA 仍限不逃逸固定数组，DSE 仍限块内 |
 | 等价改写 | 单基 SSA 仿射摘要、共享感知归一化、有预算的整数 EGraph | 仿射 PASS 跨区域保留模 2³² 的系数与偏移，只吸收单次使用的整数算术；EGraph 做 hash-cons、congruence rebuild 和成本提取。尚非跨 CFG 的完整 AEGraph |
 | tensor / 循环 | 独立 TensorSchedule IR；普通数组的 PolyRegion、仿射映射、整数依赖集合及调度 | tensor 保留专用算法；二重矩形循环以空集证明保护交换与 unroll-and-jam，按访存及寄存器预算选择。尚无一般符号域、skewing、波前或通用调度搜索 |
 | 指令选择 | 独立目标 MIR、RV opcode、bank、early / late、clobber；展开后局部值编号、复制传播和工作队列 DCE | 消除除法与取余等展开的重复子式；定义版本保护降 Phi 后的可变值，常量仍为独立重物化配方。压缩有效 Value ID；尚无跨块目标 GVN |
-| 寄存器分配 | 稀疏 64 位活跃块、有序占用区间、复制 bundle、优先队列、驱逐、热溢出拆分 | Briggs 合并保留热 bundle 的寄存器选择；较高压力下使用短重载簇，调用及块边界终止共享。尚无 min-cut 全局区域拆分或 regalloc2 全部约束模型 |
-| 验证 / 输出 | 独立冲突图与 ABI 检查、分配后符号 must-dataflow、活跃压力生成测试 | 符号检查跟踪物理位置包含哪些当前虚拟值，汇合取交集，检查复制、调用破坏及溢出。不是完整机器语义的形式证明 |
+| 寄存器分配 | 稀疏 64 位活跃块、有序占用区间、复制 bundle、优先队列、驱逐、热溢出拆分；共享 bank／ABI 计数 | GP 池含不被展开使用的 t2，共 22 个 GP、29 个 FP；调用破坏、输入参数保护和符号位置空间同步。尚无 min-cut 全局区域拆分或完整 regalloc3 |
+| 验证 / 输出 | MIR 操作数／位宽／边／slot 验证、独立冲突与 ABI 检查、符号 must-dataflow、离线规则 SMT | MIR 变异必须被拒绝；Z3 仅证明有限 int32 改写条件，不进入编译器，也不构成完整机器或内存翻译证明 |
 
 代码分别位于 [arena.hpp](../src/arena.hpp)、[ir.hpp](../src/ir.hpp)、[optimizer.cpp](../src/optimizer.cpp)、[rewrite.cpp](../src/rewrite.cpp)、[tensor.cpp](../src/tensor.cpp)、[polyhedral.cpp](../src/polyhedral.cpp)、[target_ir.hpp](../src/target_ir.hpp)、[selection.cpp](../src/selection.cpp)、[backend.cpp](../src/backend.cpp)。`--stats` 记录每个 PASS、验证、选择、分配的耗时及计数；指标与复现见 [Performance.md](Performance.md)。
 

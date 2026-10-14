@@ -845,6 +845,97 @@ std::vector<Loop> loops(const Graph &graph) {
   return result;
 }
 
+// Promote fixed loop-carried memory cells to mutable scalar homes, then let
+// pruned SSA place/rename their phis. Every outgoing edge writes back its own
+// reaching value. Unknown observers, overlapping accesses and type punning
+// reject a cell; only valid object addresses may be loaded on a zero-trip path.
+void promoteLoopMemory(FunctionIR &f, const Summaries &summaries) {
+  if (f.ssa) throw std::runtime_error("loop-promote must precede SSA construction");
+  if (std::none_of(f.blocks.begin(),f.blocks.end(),[](const BasicBlock &b) {
+      return std::any_of(b.instructions.begin(),b.instructions.end(),[](const Instruction &i) { return i.op == Op::Store; });
+    })) return;
+  auto nests = loops(controlFlow(f));
+  if (nests.empty()) return;
+  std::reverse(nests.begin(),nests.end());
+  std::unique_ptr<AliasAnalysis> alias;
+  size_t budget = 8;
+  for (const auto &original : nests) {
+    if (!budget) break;
+    const auto &graph = controlFlow(f); auto current = loops(graph);
+    auto found = std::find_if(current.begin(),current.end(),[&](const Loop &l) { return l.header == original.header; });
+    if (found == current.end()) continue;
+    const auto loop = *found;
+    std::vector<int> incoming;
+    for (int p : graph.pred[loop.header]) if (!loop.blocks.count(p)) incoming.push_back(p);
+    if (incoming.size() != 1) continue;
+    std::vector<std::pair<int,int>> exits;
+    size_t instructions = 0;
+    for (int b : loop.blocks) {
+      instructions += f.blocks[b].instructions.size();
+      for (int s : graph.succ[b]) if (!loop.blocks.count(s)) exits.push_back({b,s});
+    }
+    if (exits.empty() || exits.size() > 16 || instructions > 2048) continue;
+    if (!alias) alias = std::make_unique<AliasAnalysis>(f);
+    struct Cell { PointerLocation location; int pointer; ValueType type; int home = -1, address = -1; };
+    std::vector<Cell> cells;
+    for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) if (i.op == Op::Store) {
+      const auto &p = alias->locations[i.args[0]]; auto type = f.values[i.args[1]];
+      uint64_t extent = p.object && !p.object->parameter ? static_cast<uint64_t>(p.object->type.elements())*4 : 0;
+      if ((type != ValueType::Int && type != ValueType::Float) || !p.object || p.object->isConst || extent < 4 || p.offset > extent-4 || p.offset%4) continue;
+      bool same = std::any_of(cells.begin(),cells.end(),[&](const Cell &c) { return c.location.sameBase(p) && c.location.offset == p.offset; });
+      if (!same && cells.size() < 16) cells.push_back({p,i.args[0],type});
+    }
+    cells.erase(std::remove_if(cells.begin(),cells.end(),[&](const Cell &cell) {
+      for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) {
+        if (i.op == Op::Call) {
+          auto e = callEffects(i,alias->roots,summaries); e.reads.insert(e.writes.begin(),e.writes.end());
+          if (overlaps(alias->roots[cell.pointer],e.reads)) return true;
+        }
+        if (i.op != Op::Load && i.op != Op::Store && i.op != Op::Zero) continue;
+        uint64_t size = i.op == Op::Zero ? static_cast<uint64_t>(i.immediate) :
+            accessSize(f.values[i.op == Op::Load ? i.result : i.args[1]]);
+        if (!alias->mayAlias(cell.pointer,4,i.args[0],size)) continue;
+        if (i.op == Op::Zero) return true;
+        const auto &p = alias->locations[i.args[0]];
+        if (!p.sameBase(cell.location) || p.offset != cell.location.offset || size != 4 ||
+            f.values[i.op == Op::Load ? i.result : i.args[1]] != cell.type) return true;
+      }
+      return false;
+    }),cells.end());
+    if (cells.size() > budget) cells.resize(budget);
+    if (cells.empty()) continue;
+    std::vector<Instruction> seed;
+    for (auto &cell : cells) {
+      cell.home = newValue(f,cell.type); f.variables.push_back(cell.home);
+      cell.address = newValue(f,ValueType::Pointer);
+      Instruction address{Op::Address}; address.result = cell.address; address.symbol = cell.location.object;
+      address.immediate = static_cast<int64_t>(cell.location.offset); seed.push_back(std::move(address));
+      int initial = newValue(f,cell.type); Instruction load{Op::Load}; load.result = initial; load.args = {cell.address}; seed.push_back(std::move(load));
+      Instruction initialize{Op::Move}; initialize.result = cell.home; initialize.args = {initial}; seed.push_back(std::move(initialize));
+    }
+    auto &preheader = f.blocks[incoming[0]].instructions;
+    preheader.insert(preheader.end()-1,seed.begin(),seed.end());
+    for (int b : loop.blocks) for (auto &i : f.blocks[b].instructions) if (i.op == Op::Load || i.op == Op::Store) {
+      const auto &p = alias->locations[i.args[0]];
+      for (const auto &cell : cells) if (p.sameBase(cell.location) && p.offset == cell.location.offset) {
+        int result = i.op == Op::Load ? i.result : cell.home;
+        int value = i.op == Op::Load ? cell.home : i.args[1];
+        i = Instruction{Op::Move}; i.result = result; i.args = {value}; break;
+      }
+    }
+    for (auto [from,to] : exits) {
+      int edge = f.blocks.size(); std::vector<Instruction> code;
+      for (const auto &cell : cells) { Instruction store{Op::Store}; store.args = {cell.address,cell.home}; code.push_back(std::move(store)); }
+      Instruction jump{Op::Jump}; jump.target = to; code.push_back(std::move(jump));
+      auto &last = f.blocks[from].instructions.back();
+      if (last.target == to) last.target = edge;
+      if (last.otherwise == to) last.otherwise = edge;
+      f.blocks.push_back({"loop.writeback",std::move(code)});
+    }
+    budget -= cells.size(); alias.reset();
+  }
+}
+
 void rotate(FunctionIR &f) {
   if (!f.ssa) return;
   auto nests = loops(controlFlow(f));
@@ -1099,7 +1190,7 @@ void tailRecursion(FunctionIR &f) {
   Instruction jump{Op::Jump}; jump.target = header; parameters.push_back(jump); f.blocks[0].instructions = std::move(parameters);
 }
 
-void arithmetic(FunctionIR &f) {
+void arithmetic(FunctionIR &f, bool predicates = true) {
   if (!f.ssa) return;
   auto borrowed = definitions(f); std::vector<std::optional<Instruction>> defs(f.values.size());
   for (size_t v = 0; v < defs.size(); ++v) if (borrowed[v]) defs[v] = *borrowed[v];
@@ -1171,13 +1262,91 @@ void arithmetic(FunctionIR &f) {
     int other = test ? i.args[i.args[0] == a ? 1 : 0] : -1;
     zeroTest[a] = zeroTest[a] && test && defs[other] && defs[other]->op == Op::Constant && defs[other]->immediate == 0;
   }
-  for (auto &b : f.blocks) {
+  // Edge predicates are valid only in their dominated subtree. Derived ranges
+  // are queried lazily; wrapping arithmetic and cyclic phis stay conservative.
+  std::map<int,std::pair<int64_t,int64_t>> facts;
+  std::function<Range(int,int&)> query = [&](int v, int &budget) -> Range {
+    auto fact = facts.find(v); if (fact != facts.end()) return fact->second;
+    if (ranges[v]) return ranges[v];
+    if (--budget < 0 || !defs[v] || f.values[v] != ValueType::Int) return {};
+    const auto &i = *defs[v];
+    if (i.op == Op::Move) return query(i.args[0],budget);
+    if (i.op == Op::Neg) {
+      auto a = query(i.args[0],budget);
+      if (a && a->first != INT32_MIN) return {{-a->second,-a->first}};
+    }
+    if (i.op == Op::And) for (int a : i.args) if (defs[a] && defs[a]->op == Op::Constant && defs[a]->immediate >= 0)
+      return {{0,defs[a]->immediate}};
+    if (i.op != Op::Add && i.op != Op::Sub && i.op != Op::Mul) return {};
+    auto a = query(i.args[0],budget), b = query(i.args[1],budget);
+    if (!a || !b) return {};
+    int64_t lo,hi;
+    if (i.op == Op::Add) { lo = a->first+b->first; hi = a->second+b->second; }
+    else if (i.op == Op::Sub) { lo = a->first-b->second; hi = a->second-b->first; }
+    else {
+      int64_t products[] = {a->first*b->first,a->first*b->second,a->second*b->first,a->second*b->second};
+      lo = *std::min_element(products,products+4); hi = *std::max_element(products,products+4);
+    }
+    return lo >= INT32_MIN && hi <= INT32_MAX ? Range{{lo,hi}} : Range{};
+  };
+  std::function<void(int)> rewrite = [&](int block) {
+    int refined = -1; Range previous;
+    if (predicates && graph.pred[block].size() == 1) {
+      const auto &branch = f.blocks[graph.pred[block][0]].instructions.back();
+      if (branch.op == Op::Branch && branch.target != branch.otherwise) {
+        const auto &compare = defs[branch.args[0]];
+        if (compare && compare->op >= Op::Eq && compare->op <= Op::Ge &&
+            f.values[compare->args[0]] == ValueType::Int && f.values[compare->args[1]] == ValueType::Int) {
+          Op op = compare->op; int value = compare->args[0], literal = compare->args[1];
+          if (defs[value] && defs[value]->op == Op::Constant) {
+            std::swap(value,literal);
+            if (op == Op::Lt) op = Op::Gt; else if (op == Op::Le) op = Op::Ge;
+            else if (op == Op::Gt) op = Op::Lt; else if (op == Op::Ge) op = Op::Le;
+          }
+          if (defs[literal] && defs[literal]->op == Op::Constant) {
+            if (branch.otherwise == block) {
+              if (op == Op::Eq) op = Op::Ne; else if (op == Op::Ne) op = Op::Eq;
+              else if (op == Op::Lt) op = Op::Ge; else if (op == Op::Le) op = Op::Gt;
+              else if (op == Op::Gt) op = Op::Le; else op = Op::Lt;
+            }
+            int budget = 64; auto bound = query(value,budget).value_or(std::make_pair(int64_t(INT32_MIN),int64_t(INT32_MAX)));
+            int64_t c = defs[literal]->immediate;
+            if (op == Op::Eq) { bound.first = std::max(bound.first,c); bound.second = std::min(bound.second,c); }
+            if (op == Op::Lt || op == Op::Le) bound.second = std::min(bound.second,c-(op == Op::Lt));
+            if (op == Op::Gt || op == Op::Ge) bound.first = std::max(bound.first,c+(op == Op::Gt));
+            if (bound.first <= bound.second && op != Op::Ne) {
+              auto old = facts.find(value); if (old != facts.end()) previous = old->second;
+              refined = value; facts[value] = bound;
+            }
+          }
+        }
+      }
+    }
+    auto &b = f.blocks[block];
     std::vector<Instruction> code;
     for (auto i : b.instructions) {
+      if (predicates && i.op >= Op::Eq && i.op <= Op::Ge && f.values[i.args[0]] == ValueType::Int &&
+          f.values[i.args[1]] == ValueType::Int && (!facts.empty() || (ranges[i.args[0]] && ranges[i.args[1]]))) {
+        int budget = 64; auto a = query(i.args[0],budget), c = query(i.args[1],budget);
+        if (a && c) {
+          std::optional<bool> value;
+          if (i.op == Op::Eq || i.op == Op::Ne) {
+            if (a->second < c->first || c->second < a->first) value = i.op == Op::Ne;
+            else if (a->first == a->second && *a == *c) value = i.op == Op::Eq;
+          } else {
+            if (i.op == Op::Gt || i.op == Op::Ge) std::swap(a,c);
+            bool inclusive = i.op == Op::Le || i.op == Op::Ge;
+            if (inclusive ? a->second <= c->first : a->second < c->first) value = true;
+            else if (inclusive ? a->first > c->second : a->first >= c->second) value = false;
+          }
+          if (value) { i.op = Op::Constant; i.immediate = *value; i.args.clear(); }
+        }
+      }
       if ((i.op == Op::Div || i.op == Op::Rem) && f.values[i.result] == ValueType::Int && defs[i.args[1]] && defs[i.args[1]]->op == Op::Constant) {
         int64_t divisor = defs[i.args[1]]->immediate, magnitude = std::abs(divisor);
-        bool nonnegative = ranges[i.args[0]] && ranges[i.args[0]]->first >= 0;
         bool power = magnitude && !(magnitude & (magnitude-1));
+        int budget = 64; auto range = power ? (predicates ? query(i.args[0],budget) : ranges[i.args[0]]) : Range{};
+        bool nonnegative = range && range->first >= 0;
         if (power && (nonnegative || (i.op == Op::Rem && zeroTest[i.result]))) {
           Instruction c{Op::Constant}; c.result = newValue(f, ValueType::Int);
           if (i.op == Op::Rem) c.immediate = magnitude-1;
@@ -1193,7 +1362,10 @@ void arithmetic(FunctionIR &f) {
       code.push_back(std::move(i));
     }
     b.instructions = std::move(code);
-  }
+    for (int child : graph.children[block]) rewrite(child);
+    if (refined >= 0) { if (previous) facts[refined] = *previous; else facts.erase(refined); }
+  };
+  rewrite(0);
 }
 
 void licm(FunctionIR &f, const Summaries &summaries) {
@@ -1448,11 +1620,12 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       throw std::runtime_error("inline must precede SSA construction");
     inlineCalls(module); return true;
   }
-  if (name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
-    if (name == "gvn" || name == "licm" || name == "memory" || name == "dse") summaries = summarize(module);
+    if (name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "dse") summaries = summarize(module);
     for (auto &f : module.functions) {
-      if (name == "sroa") scalarReplace(f);
+      if (name == "loop-promote") promoteLoopMemory(f,summaries);
+      else if (name == "sroa") scalarReplace(f);
       else if (name == "dse") deadStores(f,summaries);
       else if (name == "affine") normalizeAffine(f);
       else if (name == "egraph") rewriteEqualities(f);
@@ -1466,6 +1639,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       else if (name == "unroll") unroll(f);
       else if (name == "tail") tailRecursion(f);
       else if (name == "arith") arithmetic(f);
+      else if (name == "arith-global") arithmetic(f,false);
       else if (name == "compact") compact(f);
       else if (name == "strength") strength(f);
       else destroySSA(f);

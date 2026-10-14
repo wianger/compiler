@@ -106,7 +106,7 @@ class Selector {
       MachineInstruction selected{i.op}; selected.result = i.result; selected.args = i.args; selected.immediate = i.immediate;
       selected.symbol = i.symbol; selected.callee = i.callee; selected.text = i.text;
       selected.target = i.target; selected.otherwise = i.otherwise;
-      if (i.op == Op::Call) { selected.integerClobbers = ((1u<<21)-1) & ~((1u<<12)-1); selected.floatClobbers = ((1u<<29)-1) & ~((1u<<12)-1); }
+      if (i.op == Op::Call) { selected.integerClobbers = ((1u<<integerRegisterCount)-1) & ~((1u<<12)-1); selected.floatClobbers = ((1u<<floatRegisterCount)-1) & ~((1u<<12)-1); }
       output->push_back(std::move(selected)); return;
     }
     int dst = i.result; auto type = input.values[dst]; bool fp = floating(type);
@@ -264,13 +264,22 @@ MachineFunction selectTarget(FunctionIR f, Stats *stats) {
   verifyTarget(result); return result;
 }
 void verifyTarget(const MachineFunction &f) {
+  for (auto type : f.values) if (type < ValueType::Int || type > ValueType::Double) throw std::logic_error("invalid machine value type");
   for (const auto &b : f.blocks) {
     if (b.instructions.empty()) throw std::logic_error("empty machine block");
     auto terminal = b.instructions.back().op;
     if (terminal != Op::Jump && terminal != Op::Branch && terminal != Op::BranchCompare && terminal != Op::Return) throw std::logic_error("unterminated machine block");
-    for (const auto &i : b.instructions) {
+    for (size_t position = 0; position < b.instructions.size(); ++position) {
+      const auto &i = b.instructions[position];
+      if ((i.integerClobbers >> integerRegisterCount) || (i.floatClobbers >> floatRegisterCount))
+        throw std::logic_error("invalid machine clobber mask");
+      if ((i.op == Op::Jump || i.op == Op::Branch || i.op == Op::BranchCompare || i.op == Op::Return) && position+1 != b.instructions.size())
+        throw std::logic_error("machine terminator before end of block");
+      for (int target : {i.target,i.otherwise}) if (target < -1 || target >= static_cast<int>(f.blocks.size()))
+        throw std::logic_error("invalid machine edge");
       for (int a : i.args) if (a < 0 || a >= static_cast<int>(f.values.size())) throw std::logic_error("invalid machine use");
-      if (i.result >= static_cast<int>(f.values.size())) throw std::logic_error("invalid machine definition");
+      if (i.result < -1 || i.result >= static_cast<int>(f.values.size())) throw std::logic_error("invalid machine definition");
+      if (i.opcode < RV::Pseudo || i.opcode > RV::FmvDX) throw std::logic_error("invalid target opcode");
       if (i.op == Op::Target && (i.result < 0 || i.opcode == RV::Pseudo)) throw std::logic_error("unselected instruction");
       if (i.op == Op::Target) {
         bool unary = i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi ||
@@ -280,10 +289,47 @@ void verifyTarget(const MachineFunction &f) {
         if ((i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi || i.opcode == RV::Xori) && !small(i.immediate)) throw std::logic_error("target immediate out of range");
         if ((i.opcode == RV::Slli || i.opcode == RV::Srai) && (i.immediate < 0 || i.immediate > 63)) throw std::logic_error("invalid 64-bit shift");
         if ((i.opcode == RV::Slliw || i.opcode == RV::Srliw || i.opcode == RV::Sraiw) && (i.immediate < 0 || i.immediate > 31)) throw std::logic_error("invalid 32-bit shift");
-        bool fpResult = (i.opcode >= RV::FaddS && i.opcode <= RV::FnegS) || i.opcode >= RV::FcvtSW;
-        if (floating(f.values[i.result]) != fpResult) throw std::logic_error("invalid target register bank");
+        ValueType result = f.values[i.result];
+        auto require = [&](ValueType output, ValueType input) {
+          if (result != output || std::any_of(i.args.begin(),i.args.end(),[&](int a) { return f.values[a] != input; }))
+            throw std::logic_error("invalid target operand type");
+        };
+        if (i.opcode >= RV::FaddS && i.opcode <= RV::FnegS) require(ValueType::Float,ValueType::Float);
+        else if (i.opcode >= RV::FeqS && i.opcode <= RV::FcvtWS) require(ValueType::Int,ValueType::Float);
+        else if (i.opcode == RV::FcvtSW) require(ValueType::Float,ValueType::Int);
+        else if (i.opcode == RV::FcvtDS) require(ValueType::Double,ValueType::Float);
+        else {
+          bool bits = i.opcode == RV::FmvWX || i.opcode == RV::FmvDX;
+          if (bits ? result != (i.opcode == RV::FmvWX ? ValueType::Float : ValueType::Double) : floating(result))
+            throw std::logic_error("invalid target register bank");
+          for (int a : i.args) if (floating(f.values[a])) throw std::logic_error("invalid target operand bank");
+          bool word = (i.opcode >= RV::Addw && i.opcode <= RV::Remw && i.opcode != RV::Mul) ||
+              (i.opcode >= RV::Slliw && i.opcode <= RV::Negw && i.opcode != RV::Srai) ||
+              i.opcode == RV::Slt || i.opcode == RV::Seqz || i.opcode == RV::Snez;
+          if (word && result != ValueType::Int) throw std::logic_error("invalid word result type");
+        }
       }
-      if ((i.op == Op::SpillLoad || i.op == Op::SpillStore) && (i.immediate < 0 || i.immediate >= static_cast<int64_t>(f.slots.size()))) throw std::logic_error("invalid split spill slot");
+      auto arity = [&](size_t n, bool definition) {
+        if (i.args.size() != n || (i.result >= 0) != definition) throw std::logic_error("invalid machine pseudo arity");
+      };
+      if (i.op == Op::Move) { arity(1,true); if (f.values[i.result] != f.values[i.args[0]]) throw std::logic_error("invalid machine copy type"); }
+      if (i.op == Op::Load || i.op == Op::Store || i.op == Op::Zero) {
+        arity(i.op == Op::Store ? 2 : 1,i.op == Op::Load);
+        if (f.values[i.args[0]] != ValueType::Pointer) throw std::logic_error("invalid machine memory address");
+        if (i.op == Op::Zero && (i.immediate < 0 || i.immediate%4)) throw std::logic_error("invalid machine zero size");
+      }
+      if (i.op == Op::Jump) { arity(0,false); if (i.target < 0 || i.otherwise != -1) throw std::logic_error("invalid machine jump"); }
+      if (i.op == Op::Branch || i.op == Op::BranchCompare) {
+        arity(i.op == Op::Branch ? 1 : 2,false);
+        if (i.target < 0 || i.otherwise < 0) throw std::logic_error("invalid machine branch");
+        if (i.op == Op::Branch && f.values[i.args[0]] != ValueType::Int) throw std::logic_error("invalid machine predicate");
+        if (i.op == Op::BranchCompare && f.values[i.args[0]] != f.values[i.args[1]]) throw std::logic_error("invalid machine comparison type");
+      }
+      if (i.op == Op::SpillLoad || i.op == Op::SpillStore) {
+        if (i.immediate < 0 || i.immediate >= static_cast<int64_t>(f.slots.size())) throw std::logic_error("invalid split spill slot");
+        arity(i.op == Op::SpillLoad ? 0 : 1,i.op == Op::SpillLoad);
+        if (f.values[i.op == Op::SpillLoad ? i.result : i.args[0]] != f.slots[i.immediate]) throw std::logic_error("invalid split spill type");
+      }
 
       if (i.op == Op::Phi || (i.op > Op::Zero && i.op < Op::Call)) throw std::logic_error("generic operation in target IR");
     }

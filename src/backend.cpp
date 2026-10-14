@@ -193,16 +193,17 @@ Allocation allocate(const MachineFunction &f) {
     if (!i || i->op != Op::Parameter) return -1;
     auto a = incoming.at(i->immediate);
     if (a.reg < 0 || (fp(f.values[v]) && !a.floating)) return -1;
-    return a.reg + (fp(f.values[v]) ? 21 : 13);
+    return a.reg + (fp(f.values[v]) ? floatArgumentStart : integerArgumentStart);
   };
   auto allowed = [&](int v, int r) {
     if (forbidden[v] & (uint32_t{1} << r)) return false;
     const auto *i = result.original[v];
-    if (i && i->op == Op::Parameter && r >= (fp(f.values[v]) ? 21 : 13) && r != preferred(v)) return false;
+    int first = fp(f.values[v]) ? floatArgumentStart : integerArgumentStart;
+    if (i && i->op == Op::Parameter && r >= first && r < first+8 && r != preferred(v)) return false;
     return true;
   };
   for (bool floating : {false, true}) {
-    int colors = floating ? 29 : 21;
+    int colors = floating ? floatRegisterCount : integerRegisterCount;
     std::vector<int> parent(count); std::iota(parent.begin(), parent.end(), 0);
     auto leader = [&](int v) { while (v != parent[v]) v = parent[v]; return v; };
     std::vector<uint32_t> masks(count, 0);
@@ -379,10 +380,10 @@ void checkAllocation(const MachineFunction &f, const Allocation &a) {
   using State = std::map<int,std::set<int>>;
   auto location = [&](int v) {
     if (a.definitions[v]) return -1;
-    if (a.registers[v] >= 0) return a.registers[v]+(fp(f.values[v]) ? 21 : 0);
-    return a.spills[v] >= 0 ? 50+v : -1;
+    if (a.registers[v] >= 0) return a.registers[v]+(fp(f.values[v]) ? integerRegisterCount : 0);
+    return a.spills[v] >= 0 ? integerRegisterCount+floatRegisterCount+v : -1;
   };
-  auto slot = [&](int n) { return 50+static_cast<int>(f.values.size())+n; };
+  auto slot = [&](int n) { return integerRegisterCount+floatRegisterCount+static_cast<int>(f.values.size())+n; };
   std::vector<std::vector<int>> pred(f.blocks.size());
   for (size_t b = 0; b < f.blocks.size(); ++b) {
     const auto &i = f.blocks[b].instructions.back();
@@ -397,9 +398,9 @@ void checkAllocation(const MachineFunction &f, const Allocation &a) {
         if (check && !aliases.count(v)) throw std::logic_error("allocation lost %"+std::to_string(v)+" in "+f.source->name+" b"+std::to_string(b)+"."+std::to_string(n));
         if (!p) source = std::move(aliases);
       }
-      for (int r = 0; r < 29; ++r) {
-        if (r < 21 && (i.integerClobbers & (uint32_t{1} << r))) state.erase(r);
-        if (i.floatClobbers & (uint32_t{1} << r)) state.erase(21+r);
+      for (int r = 0; r < std::max(integerRegisterCount,floatRegisterCount); ++r) {
+        if (r < integerRegisterCount && (i.integerClobbers & (uint32_t{1} << r))) state.erase(r);
+        if (i.floatClobbers & (uint32_t{1} << r)) state.erase(integerRegisterCount+r);
       }
       if (i.op == Op::SpillStore) state[slot(i.immediate)] = source;
       if (i.result >= 0 && location(i.result) >= 0) {
@@ -455,7 +456,7 @@ class Assembly {
   std::string reg(int id) const {
     int r = allocation.registers[id];
     if (fp(function->values[id])) return r < 12 ? "fs" + std::to_string(r) : r < 21 ? "ft" + std::to_string(r - 9) : "fa" + std::to_string(r - 21);
-    return r < 12 ? "s" + std::to_string(r) : r == 12 ? "t5" : "a" + std::to_string(r - 13);
+    return r < 12 ? "s" + std::to_string(r) : r == 12 ? "t5" : r == 21 ? "t2" : "a" + std::to_string(r - integerArgumentStart);
   }
   std::string stringLabel(int id) const { return ".Lstr" + std::to_string(functionId) + '_' + std::to_string(id); }
   void memory(const std::string &op, const std::string &r, int64_t offset, const std::string &base = "sp") {
