@@ -54,6 +54,12 @@ int main() {
   bad=examples[0];bad.blocks[0].instructions[0]=MachineInstruction{Op::SpillLoad};bad.blocks[0].instructions[0].result=0;bad.slots={ValueType::Float};reject(bad);
   bad=examples[0];bad.values[0]=static_cast<ValueType>(99);reject(bad);
   bad=examples[0];bad.blocks[0].instructions[0].integerClobbers=uint32_t{1}<<31;reject(bad);
+  for(int displacement:{-2048,2047}) {
+    auto memory=examples[0];memory.values[1]=ValueType::Pointer;
+    auto &load=memory.blocks[0].instructions[0];load=MachineInstruction{Op::Load};
+    load.result=0;load.args={1};load.immediate=displacement;verifyTarget(memory);++valid;
+    load.immediate=displacement<0 ? -2049 : 2048;reject(memory);
+  }
   std::cout<<valid<<" valid MIR examples; "<<rejected<<" malformed mutations rejected\n";
 }
 '''
@@ -121,6 +127,17 @@ def check_smt():
               (integer+delta)%modulus,integer>=0)
     y=z3.BitVec('summary_arg',32)
     prove('composed affine return summary',x-(x+y)+y,z3.BitVecVal(0,32))
+    pointer,displacement,stride=z3.BitVecs('pointer displacement stride',64)
+    alpha,beta=z3.BitVecs('seed_alpha seed_beta',64)
+    prove('congruent pointer recurrence seeds',pointer+alpha,(pointer+beta)+(alpha-beta))
+    prove('congruent pointer recurrence step',(pointer+displacement)+stride,(pointer+stride)+displacement)
+    for trips in (1,2,7,35,2147483647):
+        before=accumulator
+        if trips<36:
+            for _ in range(trips):before=before+term
+            prove(f'replay integer reduction/{trips}',before,accumulator+term*trips)
+        else:
+            prove('replay reduction induction',(accumulator+term*(trips-1))+term,accumulator+term*trips)
     for offset in (0,1,17,1024,2**31-1):
         prove(f"guarded nonnegative addition/{offset}", x+offset >= 0, z3.BoolVal(True),
               x >= 0,x <= 2**31-1-offset)

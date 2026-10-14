@@ -872,6 +872,243 @@ public:
   }
 };
 
+// A bounded symbolic-domain proof, separate from its replay consumer. The
+// reset is a must-write Cartesian region; every subsequent output access must
+// lie in it. Loop dimensions retain their parameter and affine displacement,
+// rather than reducing everything to unrelated numeric intervals.
+class RegionKills {
+  using Certificate = Function::ReplayRegion;
+  struct Range { int64_t lower; const Symbol *upper; int64_t offset; };
+  struct State {
+    std::map<const Symbol *,Range> ranges;
+    std::set<const Symbol *> defined;
+  };
+  struct Loop { const Symbol *index, *bound; int offset; };
+  Certificate certificate;
+  std::map<const Symbol *,size_t> parameters;
+  std::vector<Loop> domain;
+  std::set<const Symbol *> reads;
+  std::function<bool(const Function &)> scalarPure;
+  size_t budget = 4096;
+  static bool ref(const Expr &e,const Symbol *s) { return e.kind == Expr::Kind::Variable && e.symbol == s && e.operands.empty(); }
+  static std::optional<int32_t> number(const Expr &e) {
+    if (e.constant && e.constant->base == Base::Int) return e.constant->integer;
+    return {};
+  }
+  static bool binary(const Expr &e,std::string_view op) { return e.kind == Expr::Kind::Binary && e.text == op; }
+  static const Stmt &unwrap(const Stmt &s) {
+    auto node = &s;
+    while (node->kind == Stmt::Kind::Block && node->children.size() == 1) node = node->children[0].get();
+    return *node;
+  }
+  static std::set<const Symbol *> writes(const Stmt &s) {
+    std::set<const Symbol *> result;
+    std::vector<const Stmt *> pending{&s};
+    while (!pending.empty()) {
+      auto node = pending.back(); pending.pop_back();
+      if (node->target) result.insert(node->target->symbol);
+      for (const auto &v : node->variables) result.insert(v.symbol);
+      for (const auto &c : node->children) pending.push_back(c.get());
+    }
+    return result;
+  }
+  static int assignments(const Stmt &s,const Symbol *i) {
+    int n = s.target && s.target->symbol == i ? 1 : 0;
+    for (const auto &c : s.children) n += assignments(*c,i);
+    return n;
+  }
+  std::optional<Loop> loop(const Stmt &s,const State &state) {
+    if (s.kind != Stmt::Kind::While || (!binary(*s.expression,"<") && !binary(*s.expression,"<=")) ||
+        s.children[0]->kind != Stmt::Kind::Block || s.children[0]->children.empty()) return {};
+    auto i = s.expression->operands[0]->symbol, n = s.expression->operands[1]->symbol;
+    if (!i || i->global || parameters.count(i) || !n || !parameters.count(n) ||
+        !ref(*s.expression->operands[0],i) || !ref(*s.expression->operands[1],n) || !state.ranges.count(i)) return {};
+    auto start = state.ranges.at(i);
+    if (start.upper || start.lower != start.offset || start.lower < 0 || start.lower > INT32_MAX-1) return {};
+    const auto &tail = *s.children[0]->children.back();
+    if (tail.kind != Stmt::Kind::Assignment || !ref(*tail.target,i) || !binary(*tail.expression,"+") ||
+        !ref(*tail.expression->operands[0],i) || number(*tail.expression->operands[1]) != 1 || assignments(*s.children[0],i) != 1) return {};
+    return Loop{i,n,s.expression->text == "<" ? -1 : 0};
+  }
+  std::optional<Range> range(const Expr &e,const State &state) {
+    if (auto n = number(e)) return Range{*n,nullptr,*n};
+    if (e.kind == Expr::Kind::Variable && e.operands.empty()) {
+      if (parameters.count(e.symbol)) return Range{certificate.parameters[parameters.at(e.symbol)].lower,e.symbol,0};
+      if (state.ranges.count(e.symbol)) return state.ranges.at(e.symbol);
+    }
+    if ((binary(e,"+") || binary(e,"-")) && number(*e.operands[1])) {
+      auto r = range(*e.operands[0],state); if (!r) return {};
+      int64_t delta = *number(*e.operands[1]); if (e.text == "-") delta = -delta;
+      r->lower += delta; r->offset += delta;
+      int64_t upper = r->offset;
+      if (r->upper) upper += certificate.parameters[parameters.at(r->upper)].upper;
+      if (r->lower < INT32_MIN || upper > INT32_MAX) return {};
+      return r;
+    }
+    return {};
+  }
+  bool restrict(const Symbol *p,int64_t lower,int64_t upper) {
+    auto &b = certificate.parameters[parameters.at(p)];
+    lower = std::max<int64_t>(b.lower,lower); upper = std::min<int64_t>(b.upper,upper);
+    if (lower > upper) return false;
+    b.lower = lower; b.upper = upper; return true;
+  }
+  bool access(const Expr &e,const State &state) {
+    if (!e.symbol->global || e.operands.size() != e.symbol->type.shape.size()) return false;
+    bool output = e.symbol == certificate.output;
+    if (!output) reads.insert(e.symbol);
+    for (size_t d = 0; d < e.operands.size(); ++d) {
+      auto r = range(*e.operands[d],state); if (!r || r->lower < 0) return false;
+      if (r->upper) {
+        if (!restrict(r->upper,0,e.symbol->type.shape[d]-1-r->offset)) return false;
+      } else if (r->offset >= e.symbol->type.shape[d]) return false;
+      if (output) {
+        if (r->upper) {
+          if (r->upper != domain[d].bound || r->offset > domain[d].offset) return false;
+        } else if (!restrict(domain[d].bound,r->offset-domain[d].offset,INT32_MAX-1)) return false;
+      }
+    }
+    return true;
+  }
+  bool expression(const Expr &e,const State &state) {
+    if (!budget) return false;
+    --budget;
+    if (e.kind == Expr::Kind::Element || e.kind == Expr::Kind::String) return false;
+    if (e.kind == Expr::Kind::Variable) {
+      if (e.symbol->type.array()) { if (!access(e,state)) return false; }
+      else if (e.symbol->global) reads.insert(e.symbol);
+      else if (!parameters.count(e.symbol) && !state.defined.count(e.symbol)) return false;
+    }
+    if (e.kind == Expr::Kind::Call && (!e.callee || !scalarPure(*e.callee))) return false;
+    for (const auto &a : e.operands) if (!expression(*a,state)) return false;
+    return true;
+  }
+  bool scalar(const Stmt &node,State &state,bool prefix = false) {
+    const auto &s = unwrap(node);
+    if (s.kind == Stmt::Kind::Declaration) {
+      for (const auto &v : s.variables) {
+        if (!v.symbol->type.numeric() || v.base != Base::Int || v.initializers.size() > 1) return false;
+        state.ranges.erase(v.symbol); state.defined.erase(v.symbol);
+        if (!v.initializers.empty()) {
+          auto e = v.initializers[0].second;
+          if (!expression(*e,state) || (prefix && !number(*e))) return false;
+          state.defined.insert(v.symbol); if (auto r = range(*e,state)) state.ranges[v.symbol] = *r;
+        }
+      }
+      return true;
+    }
+    if (s.kind != Stmt::Kind::Assignment || s.target->kind != Expr::Kind::Variable ||
+        s.target->symbol->global || parameters.count(s.target->symbol) || !s.target->type.numeric() ||
+        s.target->type.base != Base::Int || !expression(*s.expression,state) || (prefix && !number(*s.expression))) return false;
+    auto r = range(*s.expression,state); state.ranges.erase(s.target->symbol); state.defined.insert(s.target->symbol);
+    if (r) state.ranges[s.target->symbol] = *r;
+    return true;
+  }
+  bool reset(const Stmt &s,State &state,size_t depth) {
+    if (depth >= 3 || !budget) return false;
+    --budget;
+    auto l = loop(s,state); if (!l || state.ranges.at(l->index).lower != 0) return false;
+    for (auto previous : domain) if (l->index == previous.index) return false;
+    domain.push_back(*l);
+    const auto &body = *s.children[0]; State inner = state;
+    inner.ranges[l->index] = {0,l->bound,l->offset};
+    bool found = false;
+    for (size_t n = 0; n+1 < body.children.size(); ++n) {
+      const auto &node = unwrap(*body.children[n]);
+      if (found) return false;
+      if (node.kind == Stmt::Kind::While) { if (!reset(node,inner,depth+1)) return false; found = true; }
+      else if (node.kind == Stmt::Kind::Assignment && node.target->symbol && node.target->symbol->type.array()) {
+        auto object = node.target->symbol;
+        if (!object->global || object->isConst || object->type.shape.size() != domain.size() ||
+            node.target->operands.size() != domain.size() || !node.expression->constant || node.expression->constant->truth()) return false;
+        for (size_t d = 0; d < domain.size(); ++d) {
+          if (!ref(*node.target->operands[d],domain[d].index) ||
+              !restrict(domain[d].bound,-domain[d].offset,object->type.shape[d]-1-domain[d].offset)) return false;
+        }
+        certificate.output = object; found = true;
+      } else if (!scalar(node,inner,true)) return false;
+    }
+    for (auto object : writes(body)) state.ranges.erase(object);
+    return found;
+  }
+  bool statement(const Stmt &s,State &state) {
+    if (!budget) return false;
+    --budget;
+    if (s.kind == Stmt::Kind::Block) {
+      for (const auto &c : s.children) if (!statement(*c,state)) return false;
+      return true;
+    }
+    if (s.kind == Stmt::Kind::While) {
+      auto l = loop(s,state); if (!l) return false;
+      auto inner = state;
+      inner.ranges[l->index] = {state.ranges.at(l->index).lower,l->bound,l->offset};
+      const auto &body = *s.children[0];
+      for (size_t n = 0; n+1 < body.children.size(); ++n) if (!statement(*body.children[n],inner)) return false;
+      for (auto object : writes(body)) state.ranges.erase(object);
+      return true;
+    }
+    if (s.kind == Stmt::Kind::If) {
+      if (!expression(*s.expression,state)) return false;
+      auto yes = state, no = state;
+      if (!statement(*s.children[0],yes) || (s.children.size() == 2 && !statement(*s.children[1],no))) return false;
+      state.ranges.clear();
+      for (auto entry : yes.ranges) if (no.ranges.count(entry.first)) {
+        auto other = no.ranges.at(entry.first), r = entry.second;
+        if (r.lower == other.lower && r.upper == other.upper && r.offset == other.offset) state.ranges.insert(entry);
+      }
+      state.defined.clear();
+      for (auto symbol : yes.defined) if (no.defined.count(symbol)) state.defined.insert(symbol);
+      return true;
+    }
+    if (s.kind == Stmt::Kind::Assignment && s.target->symbol && s.target->symbol->type.array())
+      return s.target->symbol == certificate.output && expression(*s.target,state) && expression(*s.expression,state);
+    return scalar(s,state);
+  }
+public:
+  std::optional<Certificate> check(const Function &f,std::function<bool(const Function &)> pure) {
+    if (f.runtime || f.result != Base::Int || f.tensorResult || f.parameters.empty() || f.parameters.size() > 8 ||
+        f.body->kind != Stmt::Kind::Block || f.body->children.empty()) return {};
+    size_t nodes = 0;
+    std::vector<std::pair<const Stmt *,int>> pending{{f.body.get(),0}};
+    while (!pending.empty()) {
+      auto [s,depth] = pending.back(); pending.pop_back();
+      if (++nodes > 4096 || depth > 64) return {};
+      for (const auto &c : s->children) pending.push_back({c.get(),depth+1});
+      std::vector<std::pair<const Expr *,int>> expressions;
+      if (s->expression) expressions.push_back({s->expression.get(),0});
+      if (s->target) expressions.push_back({s->target.get(),0});
+      for (const auto &v : s->variables) for (auto init : v.initializers) expressions.push_back({init.second,0});
+      while (!expressions.empty()) {
+        auto [e,d] = expressions.back(); expressions.pop_back();
+        if (++nodes > 4096 || d > 64) return {};
+        for (const auto &a : e->operands) expressions.push_back({a.get(),d+1});
+      }
+    }
+    scalarPure = std::move(pure); certificate.parameters.resize(f.parameters.size());
+    auto written = writes(*f.body);
+    for (size_t p = 0; p < f.parameters.size(); ++p) {
+      auto symbol = f.parameters[p].symbol;
+      if (!symbol->type.numeric() || symbol->type.base != Base::Int || written.count(symbol)) return {};
+      parameters[symbol] = p;
+    }
+    State state; bool killed = false;
+    const auto &body = *f.body;
+    for (size_t n = 0; n+1 < body.children.size(); ++n) {
+      const auto &node = unwrap(*body.children[n]);
+      if (!killed && node.kind == Stmt::Kind::While) {
+        if (!reset(node,state,0) || !certificate.output) return {};
+        // Reset induction variables are defined even when used after the nest.
+        for (auto l : domain) state.defined.insert(l.index);
+        killed = true;
+      } else if (!(killed ? statement(node,state) : scalar(node,state,true))) return {};
+    }
+    const auto &last = unwrap(*body.children.back());
+    if (!killed || last.kind != Stmt::Kind::Return || !last.expression || !expression(*last.expression,state)) return {};
+    certificate.reads.assign(reads.begin(),reads.end());
+    return certificate;
+  }
+};
+
 // Factor repeated, read-only loop bodies with integer additive reductions.
 // Definite assignment proves that auxiliary state resets each iteration; reads
 // of carried reductions, array writes, and impure calls prevent the transform.
@@ -883,6 +1120,70 @@ class Repetition : NodeBuilder {
   std::map<const Function *,const Symbol *> sorters;
   bool resetRegions = true;
   int serial = 0;
+
+  std::optional<std::pair<std::string,int64_t>> comparison(const Expr &e,const Symbol *i) {
+    if (e.kind != Expr::Kind::Binary || (e.text != "<" && e.text != "<=" && e.text != ">" && e.text != ">=")) return {};
+    auto a = e.operands[0], b = e.operands[1];
+    if (a->kind != Expr::Kind::Variable || a->symbol != i || !a->operands.empty() ||
+        !b->constant || b->constant->base != Base::Int) return {};
+    return std::make_pair(e.text,int64_t(b->constant->integer));
+  }
+  S partitionBody(const Stmt &source,const Symbol *i,int64_t low,int64_t high) {
+    if (source.kind == Stmt::Kind::If) if (auto c = comparison(*source.expression,i)) {
+      auto [op,k] = *c;
+      bool yes = op == "<" ? high < k : op == "<=" ? high <= k : op == ">" ? low > k : low >= k;
+      bool no = op == "<" ? low >= k : op == "<=" ? low > k : op == ">" ? high <= k : high < k;
+      if (yes) return partitionBody(*source.children[0],i,low,high);
+      if (no) return source.children.size() == 2 ? partitionBody(*source.children[1],i,low,high) : block();
+    }
+    auto s = program.statements->make(source.kind,source.location); *s = source; s->children.clear();
+    if (source.expression) s->expression = clone(*source.expression);
+    if (source.target) s->target = clone(*source.target);
+    for (const auto &c : source.children) s->children.push_back(partitionBody(*c,i,low,high));
+    return s;
+  }
+  void partition(S &s,size_t &growth) {
+    for (auto &child : s->children) partition(child,growth);
+    if (s->kind != Stmt::Kind::While || s->expression->kind != Expr::Kind::Binary || s->expression->text != "<" ||
+        s->children[0]->kind != Stmt::Kind::Block || s->children[0]->children.empty()) return;
+    auto &a = *s->expression->operands[0], &b = *s->expression->operands[1];
+    if (a.kind != Expr::Kind::Variable || !a.operands.empty() || a.symbol->global || a.type.base != Base::Int ||
+        !b.constant || b.constant->base != Base::Int || b.constant->integer <= 0 || b.constant->integer > 1024) return;
+    auto i = a.symbol; const auto &body = *s->children[0];
+    auto step = increment(*body.children.back(),i);
+    if (!step || !step->constant || step->constant->base != Base::Int || step->constant->integer != 1) return;
+    size_t nodes = 0; int writes = 0; bool valid = true; std::set<int64_t> cuts;
+    std::vector<std::pair<const Stmt *,int>> pending{{&body,0}};
+    while (!pending.empty() && valid) {
+      auto [node,depth] = pending.back(); pending.pop_back();
+      if (++nodes > 512 || depth > 32 || node->kind == Stmt::Kind::Break || node->kind == Stmt::Kind::Continue || node->kind == Stmt::Kind::Return) { valid = false; break; }
+      if (node->target && node->target->symbol == i) ++writes;
+      if (node->kind == Stmt::Kind::If) if (auto c = comparison(*node->expression,i)) {
+        auto [op,k] = *c; int64_t boundary = k+(op == "<=" || op == ">");
+        if (boundary > 0 && boundary < b.constant->integer) cuts.insert(boundary);
+      }
+      auto safe = [&](Expr *e) {
+        if (!e) return;
+        visitExpressions(*e,[&](Expr &expression) {
+          if (++nodes > 512 || (expression.kind == Expr::Kind::Call && !pure(*expression.callee))) valid = false;
+        });
+      };
+      safe(node->expression.get()); safe(node->target.get());
+      for (const auto &v : node->variables) for (auto entry : v.initializers) safe(entry.second);
+      for (const auto &c : node->children) pending.push_back({c.get(),depth+1});
+    }
+    size_t cost = nodes*cuts.size();
+    if (!valid || writes != 1 || cuts.empty() || cuts.size() > 7 || cost > 2048 || cost > growth) return;
+    growth -= cost; cuts.insert(b.constant->integer);
+    auto result = block(); int64_t low = INT32_MIN;
+    for (int64_t end : cuts) {
+      auto loop = program.statements->make(Stmt::Kind::While,s->location);
+      loop->expression = binary("<",reference(i),integer(end));
+      loop->children.push_back(partitionBody(body,i,low,end-1));
+      result->children.push_back(std::move(loop)); low = end;
+    }
+    s = std::move(result);
+  }
 
   bool expression(const Expr &e, Summary &summary) {
     if (e.symbol && e.symbol->global) summary.reads.insert(e.symbol);
@@ -935,6 +1236,41 @@ class Repetition : NodeBuilder {
     auto &body = *s->children[0]; auto tail = body.children.back().get();
     auto step = increment(*tail, counter);
     if (!step || !step->constant || step->constant->base != Base::Int || step->constant->integer != 1) return;
+    if (!counter->global && limit.constant->integer > 0 && body.children.size() == 2 &&
+        body.children[0]->kind == Stmt::Kind::Assignment) {
+      auto &update = *body.children[0]; auto sum = update.target->symbol;
+      auto call = sum ? increment(update,sum) : nullptr;
+      if (sum != counter && sum && sum->type.numeric() && sum->type.base == Base::Int &&
+          call && call->kind == Expr::Kind::Call && call->callee->replayRegion) {
+        const auto &proof = *call->callee->replayRegion;
+        bool stable = call->operands.size() == proof.parameters.size();
+        for (auto object : proof.reads) if (object == sum || object == counter) stable = false;
+        std::function<bool(const Expr &)> safe = [&](const Expr &e) {
+          if (e.kind == Expr::Kind::Call || e.kind == Expr::Kind::Element || e.kind == Expr::Kind::String ||
+              (e.symbol && (e.symbol == sum || e.symbol == counter || e.symbol->type.array()))) return false;
+          for (const auto &a : e.operands) if (!safe(*a)) return false;
+          return e.type.numeric() && e.type.base == Base::Int;
+        };
+        for (const auto &a : call->operands) stable &= safe(*a);
+        if (stable) {
+          auto guard = binary("&&",clone(condition),binary(">=",reference(counter),integer(0)));
+          for (size_t p = 0; p < call->operands.size(); ++p) {
+            const auto &b = proof.parameters[p];
+            auto domain = binary("&&",binary(">=",clone(*call->operands[p]),integer(b.lower)),
+                binary("<=",clone(*call->operands[p]),integer(b.upper)));
+            guard = binary("&&",std::move(guard),std::move(domain));
+          }
+          auto once = block();
+          auto count = binary("-",integer(limit.constant->integer),reference(counter));
+          auto scaled = binary("+",reference(sum),binary("*",clone(*call),std::move(count)));
+          once->children.push_back(assign(reference(sum),std::move(scaled)));
+          once->children.push_back(assign(reference(counter),integer(limit.constant->integer)));
+          auto version = program.statements->make(Stmt::Kind::If,s->location);
+          version->expression = std::move(guard); version->children = {std::move(once),s}; s = std::move(version);
+          return;
+        }
+      }
+    }
     if (resetRegions && !counter->global) if (auto domain = ResetRegions().check(body,counter)) {
       auto guard = binary("&&",clone(condition),binary("&&",binary(">",clone(*domain->extent),integer(0)),
           binary("<=",clone(*domain->extent),integer(domain->capacity))));
@@ -1052,11 +1388,23 @@ class Repetition : NodeBuilder {
   }
 public:
   explicit Repetition(ProgramIR &program) : NodeBuilder(program) {}
-  void run(bool sortingContracts,bool reset) {
+  void run(int level,const HighIROptions &options) {
+    bool sortingContracts = level >= 3 && options.sortingContracts;
+    bool regions = level >= 3 && options.regionSummaries;
+    bool reset = options.resetRegions;
     resetRegions = reset;
     if (sortingContracts) sorters = SortingNetworks().run(program);
+    for (auto &item : program.items) if (item.function) item.function->replayRegion.reset();
+    if (regions) for (auto &item : program.items) if (item.function) {
+      item.function->replayRegion = RegionKills().check(*item.function,[&](const Function &f) {
+        if (!pure(f) || !summaries.at(&f).reads.empty() || f.tensorResult) return false;
+        for (const auto &p : f.parameters) if (!p.symbol->type.numeric()) return false;
+        return true;
+      });
+    }
     for (auto &item : program.items) if (item.function) {
-      initial.clear(); assignments.clear(); facts(*item.function->body); optimize(item.function->body);
+      if (options.loopPartition) { size_t growth = 4096; partition(item.function->body,growth); }
+      if (level >= 3) { initial.clear(); assignments.clear(); facts(*item.function->body); optimize(item.function->body); }
     }
   }
 };
@@ -1091,6 +1439,6 @@ void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options)
     if (options.scalarSummaries) ScalarFunctions().run(program);
     if (options.modularLoops || options.quotientLoops) IntegerLoops(program,options).run();
   }
-  if (level >= 3) Repetition(program).run(options.sortingContracts,options.resetRegions);
+  if (level >= 2) Repetition(program).run(level,options);
 }
 } // namespace sysy

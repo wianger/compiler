@@ -413,6 +413,17 @@ void printIR(const ProgramIR &program, std::ostream &out) {
     if (!item.function) continue;
     const auto &f = *item.function;
     out << "func " << f.name << " -> " << Type{f.result, {}}.str() << '\n';
+    if (f.replayRegion) {
+      const auto &r = *f.replayRegion;
+      out << "  replay-region kill=" << r.output->name << " guard=";
+      for (size_t p = 0; p < r.parameters.size(); ++p) {
+        if (p) out << ',';
+        out << f.parameters[p].name << " in [" << r.parameters[p].lower << ',' << r.parameters[p].upper << ']';
+      }
+      out << " reads=";
+      for (auto symbol : r.reads) out << symbol->name << ' ';
+      out << '\n';
+    }
     for (const auto &p : f.parameters) printVariable(p, 2, out);
     printStmt(*f.body, 2, out);
   }

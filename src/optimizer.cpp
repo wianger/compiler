@@ -1762,6 +1762,90 @@ void strength(FunctionIR &f) {
     }
   }
 }
+
+// Congruent pointer recurrences need one induction value, with the remaining
+// differences carried by the target's signed 12-bit memory displacement. This
+// is an exact uint64 recurrence identity, independent of int32 range guesses.
+void coalesceInduction(FunctionIR &f) {
+  if (!f.ssa) return;
+  auto nests = loops(controlFlow(f)); std::reverse(nests.begin(),nests.end());
+  size_t budget = 65536;
+  for (const auto &loop : nests) {
+    const auto &code = f.blocks[loop.header].instructions;
+    if (std::count_if(code.begin(),code.end(),[&](const Instruction &i) {
+      return i.op == Op::Phi && f.values[i.result] == ValueType::Pointer;
+    }) < 2) continue;
+    if (f.values.size() > budget) break;
+    budget -= f.values.size();
+    auto originals = definitions(f);
+    std::vector<std::optional<Instruction>> defs(f.values.size());
+    for (size_t v = 0; v < originals.size(); ++v) if (originals[v]) defs[v] = *originals[v];
+    std::function<std::optional<int32_t>(int,int)> literal = [&](int v,int depth) -> std::optional<int32_t> {
+      if (!budget || depth > 16 || !defs[v] || f.values[v] != ValueType::Int) return {};
+      --budget; const auto &i = *defs[v];
+      if (i.op == Op::Constant) return static_cast<int32_t>(i.immediate);
+      if (i.op == Op::Move) return literal(i.args[0],depth+1);
+      if (i.op != Op::Add && i.op != Op::Sub && i.op != Op::Mul) return {};
+      auto a = literal(i.args[0],depth+1), b = literal(i.args[1],depth+1);
+      if (!a || !b) return {};
+      uint32_t x = *a, y = *b;
+      return static_cast<int32_t>(i.op == Op::Add ? x+y : i.op == Op::Sub ? x-y : x*y);
+    };
+    struct Seed { const Symbol *object; int value; uint64_t offset; };
+    std::function<Seed(int,int)> seed = [&](int v,int depth) -> Seed {
+      if (!budget || depth > 32) return {nullptr,v,0};
+      --budget;
+      if (!defs[v]) return {nullptr,v,0};
+      const auto &i = *defs[v];
+      if (i.op == Op::Address) return {i.symbol,-1,uint64_t(i.immediate)};
+      if (i.op == Op::Move) return seed(i.args[0],depth+1);
+      if (i.op == Op::Offset) if (auto n = literal(i.args[1],0)) {
+        auto s = seed(i.args[0],depth+1);
+        s.offset += uint64_t(*n)*uint64_t(i.immediate); return s;
+      }
+      return {nullptr,v,0};
+    };
+    struct Recurrence { int phi, preheader, latch; uint64_t stride; Seed initial; };
+    std::vector<Recurrence> representatives;
+    std::vector<Instruction> derived;
+    auto &header = f.blocks[loop.header].instructions;
+    for (auto &phi : header) {
+      if (!budget) break;
+      --budget;
+      if (phi.op != Op::Phi || f.values[phi.result] != ValueType::Pointer || phi.edges.size() != 2) continue;
+      int outside = loop.blocks.count(phi.edges[0]) ? 1 : 0, inside = 1-outside;
+      if (loop.blocks.count(phi.edges[outside]) || !loop.blocks.count(phi.edges[inside])) continue;
+      auto update = defs[phi.args[inside]];
+      if (!update || update->op != Op::Offset || update->args[0] != phi.result ||
+          !defs[update->args[1]] || defs[update->args[1]]->op != Op::Constant) continue;
+      uint64_t stride = uint64_t(update->immediate)*uint64_t(defs[update->args[1]]->immediate);
+      auto first = seed(phi.args[outside],0);
+      auto same = std::find_if(representatives.begin(),representatives.end(),[&](const Recurrence &r) {
+        int64_t delta = static_cast<int64_t>(first.offset-r.initial.offset);
+        return r.preheader == phi.edges[outside] && r.latch == phi.edges[inside] && r.stride == stride &&
+            r.initial.object == first.object && r.initial.value == first.value && delta >= -2048 && delta <= 2047;
+      });
+      if (same == representatives.end()) {
+        if (representatives.size() < 64) representatives.push_back({phi.result,phi.edges[outside],phi.edges[inside],stride,first});
+        continue;
+      }
+      Instruction displacement{Op::Constant}; displacement.result = newValue(f,ValueType::Int);
+      displacement.immediate = static_cast<int64_t>(first.offset-same->initial.offset);
+      Instruction address{Op::Offset}; address.result = phi.result; address.args = {same->phi,displacement.result}; address.immediate = 1;
+      derived.push_back(displacement); derived.push_back(address);
+      defs.push_back(displacement); defs[phi.result] = address;
+      // Mark the old phi for erasure; no instruction definition is exposed
+      // outside the original dominance region.
+      phi.op = Op::Move; phi.args = {same->phi}; phi.edges.clear();
+    }
+    if (!derived.empty()) {
+      std::set<int> removed; for (const auto &i : derived) if (i.op == Op::Offset) removed.insert(i.result);
+      header.erase(std::remove_if(header.begin(),header.end(),[&](const Instruction &i) { return removed.count(i.result); }),header.end());
+      auto position = std::find_if(header.begin(),header.end(),[](const Instruction &i) { return i.op != Op::Phi; });
+      header.insert(position,derived.begin(),derived.end());
+    }
+  }
+}
 } // namespace
 
 void printEffects(const ModuleIR &module, std::ostream &out) {
@@ -1802,6 +1886,27 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out) {
 }
 
 bool runAdvancedPass(ModuleIR &module, const std::string &name) {
+  if (name == "global-memory") {
+    // Closed-world observation starts at main. ModRef substitutes actual
+    // pointer roots through the call graph, including recursive fixed points.
+    // Unknown reads keep every object live; unknown/union destinations never
+    // justify deleting a store. Operand evaluation remains explicit in SSA.
+    auto summaries = summarize(module);
+    const Effects *entry = nullptr;
+    for (const auto &f : module.functions) if (f.source->name == "main" && f.source->parameters.empty()) entry = &summaries.at(f.source);
+    if (!entry || std::any_of(entry->reads.begin(),entry->reads.end(),[](const Symbol *s) { return !s || !s->global; })) return true;
+    for (auto &f : module.functions) {
+      auto roots = provenance(f);
+      for (auto &b : f.blocks) b.instructions.erase(std::remove_if(b.instructions.begin(),b.instructions.end(),[&](const Instruction &i) {
+        if (i.op != Op::Store && i.op != Op::Zero) return false;
+        const auto &objects = roots[i.args[0]];
+        return !objects.empty() && std::all_of(objects.begin(),objects.end(),[&](const Symbol *s) {
+          return s && s->global && !entry->reads.count(s);
+        });
+      }),b.instructions.end());
+    }
+    return true;
+  }
   if (name == "globaldce") {
     std::map<const Function *, const FunctionIR *> functions;
     for (const auto &f : module.functions) functions[f.source] = &f;
@@ -1821,7 +1926,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
   if (name == "inline" || name == "inline-early") {
     inlineCalls(module,name == "inline-early"); return true;
   }
-  if (name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
     if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse") summaries = summarize(module);
     for (auto &f : module.functions) {
@@ -1847,6 +1952,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       else if (name == "arith-global") arithmetic(f,false);
       else if (name == "compact") compact(f);
       else if (name == "strength") strength(f);
+      else if (name == "iv-coalesce") coalesceInduction(f);
       else destroySSA(f);
     }
     return true;

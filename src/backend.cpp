@@ -518,8 +518,8 @@ class Assembly {
     std::string op = load ? (type == ValueType::Float ? "flw" : "lw") : (type == ValueType::Float ? "fsw" : "sw");
     auto def = allocation.definitions[ptr];
     if (def && def->op == Op::Address && !def->symbol->global)
-      memory(op, r, allocation.objects.at(def->symbol) + def->immediate);
-    else memory(op, r, 0, read(ptr, "t0"));
+      memory(op, r, allocation.objects.at(def->symbol) + def->immediate + i.immediate);
+    else memory(op, r, i.immediate, read(ptr, "t0"));
     if (load) finish(data, r);
   }
   void parameter(const MachineInstruction &i) {

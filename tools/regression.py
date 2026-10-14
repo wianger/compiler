@@ -793,6 +793,132 @@ def main():
             name=f'reset_region_{mode}_{n+1}'
             cases[name]=(code,output)
             (directory/f'{name}.in').write_text(f'{n}\n')
+    # Independent full-memory model for symbolic region kills. Rejected variants
+    # expose incoming output, partial coverage, I/O, changing arguments and a
+    # scalar reduction read by the callee. Observe untouched cells as well.
+    region_kernel='''int data[8][8];int input[8];int hits;int total;
+      int choose(int x,int y){if(x>y)return x;return y;}
+      int work(int n,int m){PREFIX int i=0;
+        while(i<=n){int j=RESET_START;while(j<=m){data[i][j]=0;j=j+1;}i=i+1;}
+        EFFECT i=1;while(i<=n){int j=1;while(j<=m){
+          data[i][j]=choose(data[i-1][j],data[i][j-1])+input[i-1]+input[j-1];j=j+1;}i=i+1;}
+        OUTSIDE return data[0][0]+data[1][1]RETURN_EXTRA;}
+      int argument(int n){hits=hits+1;return n;}
+      int main(){int n=getint();int m=getint();int r=getint();total=getint();
+        int i=0;while(i<8){input[i]=getint();int j=0;while(j<8){data[i][j]=getint();j=j+1;}i=i+1;}
+        while(r<7){total=total+work(ARG,m);r=r+1;}
+        putf("%d %d %d\\n",total,r,hits);putarray(64,data[0]);return 0;}'''
+    for mode in range(9):
+        for case,(n,m,r) in enumerate(((0,0,0),(1,2,3),(5,6,0),(6,5,6),(0,3,7),(-1,2,1),(2,3,-1))):
+            data=[[17+8*i+j for j in range(8)] for i in range(8)]
+            original=[row[:] for row in data]
+            values=[2147483647,-2147483648,7,-19,31,0,-1,5]
+            total,hits,start=-2147483617,0,r
+            while r<7:
+                size=n+(r%2) if mode==5 else n
+                old=data[0][0] if mode==4 else 0
+                if mode==6:hits+=1
+                for i in range(max(size+1,0)):
+                    for j in range(1 if mode==1 else 0,max(m+1,0)):data[i][j]=0
+                if mode==2:hits+=1
+                for i in range(1,size+1):
+                    for j in range(1,m+1):data[i][j]=wrap(max(data[i-1][j],data[i][j-1])+values[i-1]+values[j-1])
+                if mode==3:data[7][7]=wrap(data[7][7]+3)
+                result=wrap(data[0][0]+data[1][1]+(old if mode==4 else total if mode==7 else 0))
+                total=wrap(total+result);r+=1
+            code=region_kernel.replace('PREFIX','int old=data[0][0];' if mode==4 else '')
+            code=code.replace('RESET_START','1' if mode==1 else '0')
+            code=code.replace('EFFECT','hits=hits+1;' if mode==2 else 'putch(65);' if mode==8 else '')
+            code=code.replace('OUTSIDE','data[7][7]=data[7][7]+3;' if mode==3 else '')
+            code=code.replace('RETURN_EXTRA','+old' if mode==4 else '+total' if mode==7 else '')
+            code=code.replace('ARG','n+r%2' if mode==5 else 'argument(n)' if mode==6 else 'n')
+            output=('A'*max(7-start,0) if mode==8 else '')+f'{total} {r} {hits}\n64: '
+            output+=' '.join(str(v) for row in data for v in row)+'\n0\n'
+            name=f'region_summary_{mode}_{case}'
+            cases[name]=(code,output)
+            (directory/f'{name}.in').write_text(f'{n} {m} {start} -2147483617\n'+
+                '\n'.join(str(v)+' '+' '.join(map(str,row)) for v,row in zip(values,original))+'\n')
+    for n in (0,1,2,4,6):
+        for divisor in (-1,3,7):
+            data=[[[0]*8 for _ in range(7)] for _ in range(6)];data[0][0][0]=9
+            for i in range(n):
+                for j in range(n):
+                    for k in range(n):data[i][j][k]=1
+            for i in range(1,n-1):
+                for j in range(1,n-1):
+                    for k in range(1,n-1):
+                        value=wrap(data[i-1][j][k]+data[i+1][j][k]+data[i][j-1][k]+data[i][j+1][k]+
+                                   data[i][j][k-1]+data[i][j][k+1]+data[i-1][j-1][k-1])
+                        data[i][j][k]=abs(value)//abs(divisor)*(-1 if (value<0)!=(divisor<0) else 1)
+            name=f'congruent_stencil_{n}_{divisor+1}'
+            cases[name]=('''int x[6][7][8]={9};int unused[6][7][8];
+              int main(){int n=getint();int f=getint();int i=0;while(i<n){int j=0;
+                while(j<n){int k=0;while(k<n){x[i][j][k]=1;unused[i][j][k]=0;k=k+1;}j=j+1;}i=i+1;}
+                i=1;while(i<n-1){int j=1;while(j<n-1){int k=1;while(k<n-1){
+                  x[i][j][k]=(x[i-1][j][k]+x[i+1][j][k]+x[i][j-1][k]+x[i][j+1][k]+
+                    x[i][j][k-1]+x[i][j][k+1]+x[i-1][j-1][k-1])/f;k=k+1;}j=j+1;}i=i+1;}
+                putarray(336,x[0][0]);return 0;}''',
+                '336: '+' '.join(str(v) for plane in data for row in plane for v in row)+'\n0\n')
+            (directory/f'{name}.in').write_text(f'{n} {divisor}\n')
+    cases['dead_global_evaluation']=('''int ignored[4];int calls;
+      int tick(){calls=calls+1;return getint();}
+      int main(){ignored[tick()%4]=tick();int count=getarray(ignored);
+        putf("%d %d %d\\n",calls,count,getint());return 0;}''','2 2 99\n0\n')
+    (directory/'dead_global_evaluation.in').write_text('1 17 2 31 32 99\n')
+    for select in (0,1):
+        name=f'global_parameter_observation_{select}'
+        cases[name]=('''int a[2]={3,4};int b[2]={5,6};
+          void observe(int p[],int depth){if(depth)observe(p,depth-1);else putarray(2,p);}
+          int main(){int c=getint();a[0]=getint();b[0]=getint();
+            if(c)observe(a,3);else observe(b,3);return 0;}''',f'2: {17 if select else 19} {4 if select else 6}\n0\n')
+        (directory/f'{name}.in').write_text(f'{select} 17 19\n')
+    for mode in range(4):
+        for start in (-2,0,15,16,31,63,64,2147483647):
+            data=[0]*80;counter=start;result=-2147483641;hits=0
+            while counter<64:
+                if mode==1 and counter==17:break
+                if mode==2 and counter==13:counter+=1;continue
+                if mode==3:hits+=1
+                factor=3 if counter<16 else 7 if counter<32 else -5 if counter<48 else 11
+                result=wrap(result*factor+counter);data[counter+2]=result;counter+=1
+            name=f'loop_partition_{mode}_{start+2}'
+            cases[name]=('''int data[80];int hits;
+              int effect(){hits=hits+1;return 0;}
+              int main(){int i=getint();int result=-2147483641;while(i<64){CONTROL EFFECT
+                int factor;if(i<16)factor=3;else if(i<32)factor=7;else if(i<48)factor=-5;else factor=11;
+                result=result*factor+i;data[i+2]=result;i=i+1;}
+                putf("%d %d %d\\n",result,i,hits);putarray(80,data);return 0;}'''
+                .replace('CONTROL','if(i==17)break;' if mode==1 else 'if(i==13){i=i+1;continue;}' if mode==2 else '')
+                .replace('EFFECT','effect();' if mode==3 else ''),
+                f'{result} {counter} {hits}\n80: '+' '.join(map(str,data))+'\n0\n')
+            (directory/f'{name}.in').write_text(f'{start}\n')
+    for rank in (1,3):
+        target='out'+''.join(f'[i{d}]' for d in range(rank))
+        reset=f'{target}=0;';kernel=f'{target}={target}+input[i0]'+''.join(f'+i{d}' for d in range(1,rank))+';'
+        for d in reversed(range(rank)):
+            reset=f'int i{d}=0;while(i{d}<n){{{reset}i{d}=i{d}+1;}}'
+            kernel=f'int i{d}=0;while(i{d}<n){{{kernel}i{d}=i{d}+1;}}'
+        kernel=kernel.replace('int i0=0;','i0=0;',1)
+        for n in (-1,0,1,3,4):
+            for start in (-1,0,6,7):
+                data=[9]+[0]*(4**rank-1);total=2147483627;r=start
+                while r<7:
+                    import itertools
+                    for index in itertools.product(range(max(n,0)),repeat=rank):
+                        offset=0
+                        for i in index:offset=offset*4+i
+                        data[offset]=[-17,3,2147483647,-2147483648][index[0]]+sum(index[1:])
+                        data[offset]=wrap(data[offset])
+                    total=wrap(total+data[0]);r+=1
+                name=f'region_rank_{rank}_{n+1}_{start+1}'
+                access='out'+('[0]'*rank)
+                source=f'''int out{('[4]'*rank)}={{9}};int input[4]={{-17,3,2147483647,-2147483648}};
+                  int work(int n){{{reset}{kernel}return {access};}}
+                  int main(){{int n=getint();int r=getint();int sum=2147483627;
+                    while(r<7){{sum=sum+work(n);r=r+1;}}
+                    putf("%d %d\\n",sum,r);putarray({4**rank},{'out'+('[0]'*(rank-1))});return 0;}}'''
+                cases[name]=(source,f'{total} {r}\n{4**rank}: '+' '.join(map(str,data))+'\n0\n')
+                (directory/f'{name}.in').write_text(f'{n} {start}\n')
     network='''int data[64];int hits;
       void exchange(int x,int y,int d){HIT if(d==1){if(data[x]>data[y]){
         int t=data[x];data[x]=data[y]EXTRA;data[y]=t;}}

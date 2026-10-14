@@ -35,6 +35,18 @@ class Selector {
     if (d && d->op == Op::Constant && !floating(input.values[id])) return d->immediate;
     return {};
   }
+  std::pair<int,int64_t> address(int pointer,int64_t displacement = 0) const {
+    for (int depth = 0; depth < 16 && defs[pointer]; ++depth) {
+      const auto &d = *defs[pointer];
+      if (d.op == Op::Move) { pointer = d.args[0]; continue; }
+      if (d.op != Op::Offset || !literal(d.args[1])) break;
+      uint64_t bits = uint64_t(displacement)+uint64_t(*literal(d.args[1]))*uint64_t(d.immediate);
+      int64_t next = static_cast<int64_t>(bits);
+      if (!small(next)) break;
+      displacement = next; pointer = d.args[0];
+    }
+    return {pointer,displacement};
+  }
   bool immediate(const Instruction &i) {
     if (i.args.size() != 2 || input.values[i.result] != ValueType::Int) return false;
     auto c = literal(i.args[1]); if (!c) return false;
@@ -106,6 +118,10 @@ class Selector {
       MachineInstruction selected{i.op}; selected.result = i.result; selected.args = i.args; selected.immediate = i.immediate;
       selected.symbol = i.symbol; selected.callee = i.callee; selected.text = i.text;
       selected.target = i.target; selected.otherwise = i.otherwise;
+      if (i.op == Op::Load || i.op == Op::Store) {
+        auto [pointer,displacement] = address(i.args[0]);
+        selected.args[0] = pointer; selected.immediate = displacement;
+      }
       if (i.op == Op::Call) { selected.integerClobbers = ((1u<<integerRegisterCount)-1) & ~((1u<<12)-1); selected.floatClobbers = ((1u<<floatRegisterCount)-1) & ~((1u<<12)-1); }
       output->push_back(std::move(selected)); return;
     }
@@ -118,8 +134,10 @@ class Selector {
     if (i.op == Op::Offset) {
       auto c = literal(b);
       if (c) {
-        int64_t delta = *c*i.immediate;
-        if (small(delta)) emit(RV::Addi,{a},delta,dst,type);
+        int64_t delta = static_cast<int64_t>(uint64_t(*c)*uint64_t(i.immediate));
+        if (small(delta)) {
+          auto [base,offset] = address(a,delta); emit(RV::Addi,{base},offset,dst,type);
+        }
         else emit(RV::Add,{a,constant(delta,ValueType::Pointer)},0,dst,type);
       } else if (!i.immediate) copy(dst,a);
       else {
@@ -317,6 +335,7 @@ void verifyTarget(const MachineFunction &f) {
         arity(i.op == Op::Store ? 2 : 1,i.op == Op::Load);
         if (f.values[i.args[0]] != ValueType::Pointer) throw std::logic_error("invalid machine memory address");
         if (i.op == Op::Zero && (i.immediate < 0 || i.immediate%4)) throw std::logic_error("invalid machine zero size");
+        if (i.op != Op::Zero && !small(i.immediate)) throw std::logic_error("machine memory displacement out of range");
       }
       if (i.op == Op::Jump) { arity(0,false); if (i.target < 0 || i.otherwise != -1) throw std::logic_error("invalid machine jump"); }
       if (i.op == Op::Branch || i.op == Op::BranchCompare) {

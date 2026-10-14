@@ -140,6 +140,12 @@ struct Symbol {
 
 struct Function {
   struct AffineReturn { uint32_t offset = 0; std::vector<uint32_t> coefficients; };
+  struct ReplayRegion {
+    struct Bound { int32_t lower = 0, upper = INT32_MAX - 1; };
+    const Symbol *output = nullptr;
+    std::vector<Bound> parameters;
+    std::vector<const Symbol *> reads;
+  };
   Location location;
   std::string name, linkageName;
   Base result = Base::Void;
@@ -150,6 +156,9 @@ struct Function {
   std::vector<int64_t> resultShape;
   // Pure scalar transfer function over the int32 ring, independent of names.
   std::optional<AffineReturn> affineReturn;
+  // Under parameter guards, a complete region kill makes the return and final
+  // output independent of the incoming output. Other objects are read-only.
+  std::optional<ReplayRegion> replayRegion;
 };
 
 struct Item {
@@ -216,7 +225,7 @@ void planTensors(ProgramIR &program, int tile = 0);
 void printTensorPlan(const ProgramIR &program, std::ostream &out);
 void expandTensors(ProgramIR &program);
 void analyzeTensors(ProgramIR &program);
-struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true; };
+struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true, regionSummaries = true, loopPartition = true; };
 void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options = {});
 void optimizePolyhedral(ProgramIR &program, int level, int tile = 0);
 void printPolyhedralIR(const ProgramIR &program, std::ostream &out);
