@@ -304,4 +304,22 @@ public:
 
 TokenIR tokenize(const Source &source) { return Lexer(source).run(); }
 ProgramIR parse(const TokenIR &tokens) { return Parser(tokens).run(); }
+void ProgramIR::releaseSyntax() {
+  auto variable = [](Variable &v) {
+    std::vector<ExprRef>().swap(v.dimensions);
+    v.initializer.reset();
+    std::vector<std::pair<int64_t,Expr *>>().swap(v.initializers);
+  };
+  auto function = [&](Function &f) {
+    f.body.reset();
+    for (auto &p : f.parameters) variable(p);
+  };
+  for (auto &item : items) {
+    for (auto &v : item.variables) variable(v);
+    if (item.function) function(*item.function);
+  }
+  for (auto &f : runtime) function(*f);
+  std::vector<TensorSchedule>().swap(schedules);
+  statements.reset(); expressions.reset();
+}
 } // namespace sysy

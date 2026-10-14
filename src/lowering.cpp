@@ -306,7 +306,7 @@ void optimize(ModuleIR &module, int level, Stats *stats) {
   if (level == 0) runPasses(module, "prune", stats);
   else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact", stats);
   else {
-    runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,memory,simplify,dce,tail,prune,licm,gvn,simplify,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,gvn,memory,simplify,dce", stats);
+    runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,memory,simplify,dce,tail,prune,licm,gvn,simplify,dce,affine,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,gvn,memory,simplify,dce", stats);
     if (level >= 3) runPasses(module, "unroll,gvn,memory,simplify,dce", stats);
     runPasses(module, "sccp,prune,dce,compact", stats);
   }
@@ -354,7 +354,7 @@ void verify(const ModuleIR &module) {
           require(arity >= i.callee->parameters.size(), "IR call has too few arguments");
           if (!i.callee->variadic) require(arity == i.callee->parameters.size() + (i.callee->timer ? 1 : 0), "IR call arity mismatch");
           for (size_t a = 0; a < i.callee->parameters.size(); ++a) {
-            auto type = i.callee->parameters[a].symbol->type;
+            const auto &type = i.callee->parameters[a].symbol->type;
             require(f.values[i.args[a]] == (type.array() ? ValueType::Pointer : valueType(type.base)), "IR call argument type mismatch");
           }
           require(i.callee->result == Base::Void ? i.result == -1 : i.result >= 0, "IR call result mismatch");
@@ -362,6 +362,7 @@ void verify(const ModuleIR &module) {
         case Op::Return: arity = f.source->result == Base::Void ? 0 : 1; break;
         case Op::Phi:
           arity = i.edges.size(); require(f.ssa, "IR phi outside SSA form");
+          require(i.result >= 0 && i.args.size() == arity, "IR phi result or arity mismatch");
           for (size_t a = 0; a < arity; ++a) {
             require(i.edges[a] >= 0 && i.edges[a] < static_cast<int>(f.blocks.size()), "IR phi edge is out of range");
             require(f.values[i.args[a]] == f.values[i.result], "IR phi type mismatch");

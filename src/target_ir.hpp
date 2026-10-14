@@ -63,7 +63,7 @@ struct MachineFunction {
   std::vector<int> depth;
   std::vector<ValueType> slots;
 };
-MachineFunction selectTarget(FunctionIR function);
+MachineFunction selectTarget(FunctionIR function, Stats *stats = nullptr);
 void verifyTarget(const MachineFunction &function);
 void printTarget(const ModuleIR &module, std::ostream &out);
 void printAllocated(const ModuleIR &module, std::ostream &out, Stats *stats = nullptr, bool checkAllocation = false);

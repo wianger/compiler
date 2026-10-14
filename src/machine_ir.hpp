@@ -63,6 +63,7 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out);
 void printEffects(const ModuleIR &module, std::ostream &out);
 void emitAssembly(const ModuleIR &module, std::ostream &out, Stats *stats = nullptr, bool checkAllocation = false);
 void rewriteEqualities(FunctionIR &function);
+void normalizeAffine(FunctionIR &function);
 bool runAdvancedPass(ModuleIR &module, const std::string &name);
 void destroySSA(FunctionIR &function);
 std::vector<int> loopDepth(const FunctionIR &function);

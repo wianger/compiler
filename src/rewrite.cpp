@@ -161,6 +161,90 @@ bool pure(const FunctionIR &f, const Instruction &i) {
       (i.op == Op::Constant || i.op == Op::Add || i.op == Op::Sub || i.op == Op::Mul || i.op == Op::And || i.op == Op::Neg);
 }
 } // namespace
+// Carry single-base affine summaries across bounded equality regions. Only
+// single-use arithmetic is absorbed; shared values remain materialized leaves.
+// All coefficients are in Z/(2^32), so no signed-overflow assumptions or
+// floating-point reassociation enter this normalization.
+void normalizeAffine(FunctionIR &f) {
+  if (!f.ssa) return;
+  struct Form { int base; uint32_t scale, offset; size_t cost; };
+  std::vector<Form> forms;
+  std::vector<int> uses(f.values.size(),0);
+  for (size_t v = 0; v < f.values.size(); ++v) forms.push_back({static_cast<int>(v),1,0,0});
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+    for (int a : i.args) ++uses[a];
+    if (i.op == Op::Constant && f.values[i.result] == ValueType::Int)
+      forms[i.result] = {-1,0,static_cast<uint32_t>(i.immediate),0};
+  }
+  std::vector<bool> absorbed(f.values.size(),false);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions)
+    if (i.result >= 0 && f.values[i.result] == ValueType::Int &&
+        (i.op == Op::Move || i.op == Op::Neg || i.op == Op::Add || i.op == Op::Sub || i.op == Op::Mul))
+      for (size_t n = 0; n < i.args.size(); ++n)
+        if (uses[i.args[n]] == 1 && (i.args.size() == 1 || !forms[i.args[1-n]].scale)) absorbed[i.args[n]] = true;
+  auto input = [&](int v) {
+    auto form = forms[v];
+    return form.scale && uses[v] != 1 ? Form{v,1,0,0} : form;
+  };
+  std::map<uint32_t,int> literals;
+  std::vector<Instruction> constants;
+  auto fresh = [&] { int v = f.values.size(); f.values.push_back(ValueType::Int); return v; };
+  auto constant = [&](uint32_t n) {
+    auto found = literals.find(n); if (found != literals.end()) return found->second;
+    int v = fresh(); Instruction i{Op::Constant}; i.result = v; i.immediate = static_cast<int32_t>(n);
+    constants.push_back(std::move(i)); literals[n] = v; return v;
+  };
+  for (int b : controlFlow(f).order) {
+    std::vector<Instruction> output;
+    for (auto i : f.blocks[b].instructions) {
+      int dst = i.result;
+      if (dst < 0 || f.values[dst] != ValueType::Int ||
+          (i.op != Op::Move && i.op != Op::Add && i.op != Op::Sub && i.op != Op::Mul && i.op != Op::Neg)) {
+        output.push_back(std::move(i)); continue;
+      }
+      auto a = input(i.args[0]); Form form = a;
+      if (i.op == Op::Neg) { form.scale = 0u-a.scale; form.offset = 0u-a.offset; ++form.cost; }
+      else if (i.op != Op::Move) {
+        auto c = input(i.args[1]);
+        if ((i.op == Op::Mul && a.scale && c.scale) ||
+            (i.op != Op::Mul && a.scale && c.scale && a.base != c.base)) {
+          output.push_back(std::move(i)); continue;
+        }
+        form.cost = a.cost+c.cost+1;
+        if (i.op == Op::Mul) {
+          if (!a.scale) std::swap(a,c);
+          form.base = a.base; form.scale = a.scale*c.offset; form.offset = a.offset*c.offset;
+        } else {
+          form.base = a.scale ? a.base : c.base;
+          form.scale = a.scale+(i.op == Op::Sub ? 0u-c.scale : c.scale);
+          form.offset = a.offset+(i.op == Op::Sub ? 0u-c.offset : c.offset);
+        }
+      }
+      if (!form.scale) form.base = -1;
+      size_t cost = form.scale ? size_t(form.scale != 1)+size_t(form.offset != 0) : 0;
+      if (form.cost > cost && !absorbed[dst]) {
+        if (!form.scale) { i = Instruction{Op::Constant}; i.result = dst; i.immediate = static_cast<int32_t>(form.offset); output.push_back(std::move(i)); }
+        else {
+          int value = form.base;
+          if (form.scale != 1) {
+            Instruction mul{Op::Mul}; mul.args = {value,constant(form.scale)};
+            value = mul.result = form.offset ? fresh() : dst; output.push_back(std::move(mul));
+          }
+          if (form.offset) { Instruction add{Op::Add}; add.result = dst; add.args = {value,constant(form.offset)}; output.push_back(std::move(add)); }
+          else if (form.scale == 1) { Instruction copy{Op::Move}; copy.result = dst; copy.args = {value}; output.push_back(std::move(copy)); }
+        }
+        form.cost = cost;
+      } else output.push_back(std::move(i));
+      forms[dst] = form;
+    }
+    f.blocks[b].instructions = std::move(output);
+  }
+  // Read all incoming ABI parameters before any potentially cached constants.
+  auto &entry = f.blocks[0].instructions; size_t position = 0;
+  for (size_t n = 0; n < entry.size(); ++n) if (entry[n].op == Op::Parameter) position = n+1;
+  entry.insert(entry.begin()+position,constants.begin(),constants.end());
+}
+
 void rewriteEqualities(FunctionIR &f) {
   if (!f.ssa) return;
   for (auto &block : f.blocks) {

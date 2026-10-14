@@ -1248,11 +1248,12 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       throw std::runtime_error("inline must precede SSA construction");
     inlineCalls(module); return true;
   }
-  if (name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
     if (name == "gvn" || name == "licm" || name == "memory") summaries = summarize(module);
     for (auto &f : module.functions) {
-      if (name == "egraph") rewriteEqualities(f);
+      if (name == "affine") normalizeAffine(f);
+      else if (name == "egraph") rewriteEqualities(f);
       else if (name == "ssa") ssa(f);
       else if (name == "simplify") simplify(f);
       else if (name == "sccp") { sccp(f); repairPhi(f); }
@@ -1318,8 +1319,12 @@ void verifySSA(const FunctionIR &f) {
   }
   for (size_t b = 0; b < f.blocks.size(); ++b) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
     const auto &i = f.blocks[b].instructions[n];
-    if (i.op == Op::Phi && std::set<int>(i.edges.begin(), i.edges.end()) != std::set<int>(graph.pred[b].begin(), graph.pred[b].end()))
-      throw std::logic_error("SSA phi does not match CFG predecessors");
+    if (i.op == Op::Phi && i.edges != graph.pred[b]) {
+      auto edges = i.edges; std::sort(edges.begin(),edges.end());
+      // CFG predecessors are unique and ordered by source block ID. Compare
+      // vectors exactly: set equality previously hid duplicate incoming edges.
+      if (edges != graph.pred[b]) throw std::logic_error("SSA phi does not match CFG predecessors");
+    }
     for (size_t a = 0; a < i.args.size(); ++a) {
       int v = i.args[a], use = i.op == Op::Phi ? i.edges[a] : static_cast<int>(b);
       if (graph.rank[use] < 0) continue;

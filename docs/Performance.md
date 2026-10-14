@@ -1,5 +1,48 @@
 # 性能优化与测量
 
+## MIR 与活跃度增量（2026-10-14）
+
+本轮基线是工作开始前保存的 `a881e55` 编译器及其已验证程序，来自当前分支。新增跨区域的单基 SSA 仿射摘要及整数链归一化、目标 MIR 的局部合并、复制传播、临时值 DCE 和 ID 压缩；活跃度改为稀疏位块，分配查询改为有序区间索引，重载共享只在拆分名额用满的较高压力下启用；降低后释放语法 arena。每个 CFG PASS 后的完整验证仍然保留。
+
+| 指标 | 基线 | 本轮 | 结果 |
+|---|---:|---:|---|
+| 210 个原有输入的原生编译 wall 中位数总计 | 0.89490 s | 0.79543 s | 耗时减少 **11.1%**，总量比 **1.125×** |
+| 同组原生编译 CPU 时间总计 | 0.86524 s | 0.76673 s | 耗时减少 **11.4%** |
+| 逐用例编译 wall 加速几何平均 | — | — | **1.060×** |
+| 平均进程峰值 RSS | 5752 KiB | 5581 KiB | 减少 **3.0%**；每版本各采样一次 |
+| 60 个原有 performance 的 QEMU wall 几何平均 | — | — | **1.000×**，基本持平 |
+| 44 个基线区间至少 10ms 的计时区间几何平均 | — | — | **1.004×**，不视为显著整体加速 |
+| 同组链接后 `.text` 总计 | 201226 B | 201072 B | 减少 **0.08%** |
+| 47 个活跃整数的压力实验计时区间 | 62.101 ms | 57.884 ms | **1.073×** |
+| 除法／取余展开实验计时区间 | 48.428 ms | 36.035 ms | **1.344×** |
+| 2 万项表达式的原生编译 wall | 797.723 ms | 31.704 ms | **25.16×** |
+| 同一长表达式的进程峰值 RSS | 30952 KiB | 23088 KiB | 减少 **25.4%** |
+
+原生编译与常规 QEMU 程序各预热一次、交替七次取中位数，压力与除法实验各九次；同一 CPU 串行测量。原生耗时关闭 `--stats` 和分配符号检查；RSS 的两个版本也都关闭统计，候选阶段数据另行采样，避免统计开销影响 RSS 比较。328 次 ASan/UBSan 编译、符号检查和所有正确性执行先独立完成。常规 QEMU 数据与两个实验见 [performance-mir.csv](performance-mir.csv)。
+
+除法实验执行一千万次动态迭代，输入从 INT_MIN 开始，使用 int32 模运算递推，同时求 `/7`、`%7`、`/31`、`%31`、`/97`、`%97`。结果与最终状态由 Python 任意精度整数模型独立计算。MIR 值编号共享合法化中的乘积、移位及符号修正，常量保留重物化配方；此例 `.text` 从 3788 B 降到 3300 B。它展示展开后优化的用途，不代替常规 60 个程序的均值。
+
+有序索引的单项对照保持汇编不变：只加入索引时，2 万项表达式从 780.838 ms 降到 74.839 ms，**10.43×**，峰值 RSS 持平。原方案在许多不重叠的短区间上反复扫描所有已分配 bundle，形成二次成本。索引在原有 210 个输入的总量上基本持平，在压力实验的编译上约慢 3%；保留它的依据是明确的大函数收益。长表达式额外的 RSS 降低来自本轮其他改动，不能归因于索引。
+
+在已有 MIR 与分配改动之后，增加 `affine` 将 2 万项表达式从 **19771** 条机器指令降到 **6** 条；先消除整数链，再进入有预算的 EGraph，避免区域边界丢失代数知识。16 个固定种子的新增回归覆盖共享中间值、分支、循环及极端 int32 系数。
+
+重载簇的单项对照使压力实验加速 **1.061×**，但无条件启用在部分原有用例上退化；最终仅在 16 个拆分名额全部用满时共享。另一候选把常量改为复制，使矩阵循环出现额外搬运及寄存器占用，已撤掉。候选选择依据程序结构，代码不识别测试名称、输入数据或预期输出。
+
+115 个额外程序的原生编译总量从 1.16363 s 降到 0.36124 s，**3.221×**；逐程序几何平均 **1.091×**，总量改善主要来自长表达式。原有 210 个输入最终产生 **47881** 条机器指令、**27500** 个有效机器 Value ID、**88** 个拆分栈槽；`target.combine` 和 `hir.release` 单独计时。原始 JSON、候选二进制及中间产物留在忽略的 `build/research-round3` 中。
+
+验证：O2 / O3 各 **210/210**，O0 / O1 功能用例各 **150/150**；115 个额外程序在 O0 / O2 / O3 下共 **345** 次执行及 **20** 个诊断检查。**328** 个输入通过 ASan/UBSan、分配符号检查和默认 **8MiB** 栈；最终 O3 汇编与实测、已执行版本逐字相同。严格浮点、别名规则及 RV64GC 目标保持一致。
+
+```sh
+python3 tools/compile_bench.py "$BASE_COMPILER" build/compiler --repeats 7
+python3 tools/compile_bench.py "$BASE_COMPILER" build/compiler --tests build/regressions --repeats 5
+python3 tools/bench.py "$BASE_PROGRAMS" build/current-results --repeats 7
+# 生成两个独立预期值实验，分别编译、执行验证后再计时
+python3 tools/regression.py --benchmark
+python3 tools/test.py build/pressure-fixture/performance build/division-fixture/performance --opt 3 --check-alloc --output build/current-fixtures
+python3 tools/bench.py "$BASE_FIXTURES" build/current-fixtures --tests build/pressure-fixture/performance --repeats 9
+python3 tools/bench.py "$BASE_FIXTURES" build/current-fixtures --tests build/division-fixture/performance --repeats 9
+```
+
 ## 现代架构增量（2026-10-14）
 
 本轮原生编译基线为预先保存的 `2ec5e42` 编译器，其代码与 `18aedc7` 相同；QEMU 基线为 `18aedc7` 的已验证可执行文件。均来自当前分支的已有结果，未读取其他分支。

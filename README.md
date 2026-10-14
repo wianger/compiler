@@ -17,17 +17,17 @@ build/compiler -S -O3 test/functional/00_main.sy -o build/main.s
 ```
 Source → source-slice Token IR → arena Program IR → resolved HIR
        → tensor analysis / schedule IR → expanded HIR → CFG/SSA
-       → MemorySSA / bounded EGraph → target MIR
+       → MemorySSA / affine summaries / bounded EGraph → target MIR → local combine / compact
        → interval bundles / split / allocation → RV64 assembly
 ```
 
 - `frontend.cpp` 使用源码切片 Token 和稳定索引 arena，产生结构化 Program IR。
 - `semantic.cpp` 绑定符号、检查类型和数组形状、计算常量，并将嵌套初始化转为稀疏的行优先初始化。
 - `tensor.cpp` 保留并分析数组形状和生产者，推导行、列一致性，再选择矩阵算法。调度 IR 明确记录迭代域、列分块和尾块；一般矩阵使用四列或八列微内核，保持每个元素的浮点累加顺序；符合证明条件的矩阵使用二重循环。逐元素表达式融合，标量广播只求值一次；临时结果保证别名安全，返回值使用调用方提供的缓冲区。`-O3` 还分析无副作用的重复循环与整数加法归约。
-- `lowering.cpp` 将结构化控制流变成基本块，短路表达式变成分支，访存和调用显式化；提升不逃逸的局部标量，检查 PASS 前后约束。很长的算术表达式以迭代方式降级，减少编译器栈消耗。
-- `optimizer.cpp` 缓存支配分析，使用 def-use 工作队列 SCCP、结构化哈希 GVN、MemorySSA 及别名 walker；`rewrite.cpp` 在有预算的整数 EGraph 中做等价改写和成本提取。计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。通过调用图不动点与指针来源分析推导函数的读写摘要，合并相同纯函数调用，并跨基本块消除冗余加载。实现按循环位置选择的小函数内联、尾递归消除、稀疏条件常量传播、循环不变量外提、范围分析与整数算术简化、指针归纳变量和循环旋转。`-O3` 对合适的固定、动态次数循环展开；动态展开保留标量尾循环，浮点运算顺序保持一致。
-- `selection.cpp` 将 Phi 降为边上复制，选择布局和 RV64 目标指令；常量除法、地址计算及比较序列在寄存器分配前展开。目标 MIR 暴露临时值、bank、early/late 使用时刻及调用 clobber。
-- `backend.cpp` 使用精确活跃区间、复制 bundle、优先队列和驱逐重试；热溢出区间拆分后重新分配。独立冲突与 ABI 检查，以及可选的符号数据流检查，验证分配结果。ABI 参数按并行复制处理交换环；分配后消除无操作复制块和多余跳转，输出符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。
+- `lowering.cpp` 将结构化控制流变成基本块，短路表达式变成分支，访存和调用显式化；提升不逃逸的局部标量，检查 PASS 前后约束。很长的算术表达式以迭代方式降级，减少编译器栈消耗。降低完成后释放语法 arena，保留符号、类型及全局初值。
+- `optimizer.cpp` 缓存支配分析，使用 def-use 工作队列 SCCP、结构化哈希 GVN、MemorySSA 及别名 walker；`rewrite.cpp` 先用单基仿射摘要归一化单次使用的整数链，再进入有预算的 EGraph 做等价改写和成本提取。计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。通过调用图不动点与指针来源分析推导函数的读写摘要，合并相同纯函数调用，并跨基本块消除冗余加载。实现按循环位置选择的小函数内联、尾递归消除、稀疏条件常量传播、循环不变量外提、范围分析与整数算术简化、指针归纳变量和循环旋转。`-O3` 对合适的固定、动态次数循环展开；动态展开保留标量尾循环，浮点运算顺序保持一致。
+- `selection.cpp` 将 Phi 降为边上复制，选择布局和 RV64 目标指令；常量除法、地址计算及比较序列在寄存器分配前展开。目标 MIR 暴露临时值、bank、early/late 使用时刻及调用 clobber。展开后进行局部值编号和复制传播，以定义版本保护可多次写入的值，保留常量重物化配方，再用 def-use 工作队列删除无用临时值并压缩 ID。
+- `backend.cpp` 用稀疏 64 位块计算活跃度，以有序占用区间查询冲突，按优先队列分配复制 bundle 并驱逐重试；避免冷路径的受限复制压缩热 bundle 的寄存器选择。热溢出区间拆分后重新分配，较高压力下相邻使用共享重载。独立冲突与 ABI 检查，以及可选的符号数据流检查，验证分配结果。ABI 参数按并行复制处理交换环；分配后消除无操作复制块和多余跳转，输出符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。
 
 标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。Token、Program、SSA 和降 Phi 后的 IR 可单独打印，各 PASS 可以重新组合。
 
@@ -75,4 +75,4 @@ python3 tools/regression.py
 
 根据额外测试支持 `tensor int/float` 数组、逐元素 `+ - * / %`、一元 `+ -`、标量广播、`@` 二维矩阵乘法、tensor 参数和返回值。逐元素操作要求相同形状；矩阵乘法要求内部维度匹配；`%` 只接受整数。返回形状从函数体推导，各个 return 必须形状一致。tensor 运算和返回需要静态已知的维度；省略首维的 tensor 参数可按普通数组索引访问。
 
-性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 下全部 **210/210** 用例通过，`-O1` 功能用例 **150/150** 通过；99 个额外程序（含 40 个别名组合和 24 个活跃压力生成用例）分别验证 `-O0`、`-O2`、`-O3`，另有 **20** 个诊断回归。
+性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 下全部 **210/210** 用例通过，`-O0`、`-O1` 功能用例各 **150/150** 通过；115 个额外程序（含 40 个别名组合、24 个活跃压力和 16 个仿射边界生成用例）分别验证 `-O0`、`-O2`、`-O3`，另有 **20** 个诊断回归。

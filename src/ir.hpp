@@ -165,6 +165,9 @@ struct ProgramIR {
   std::vector<Item> items;
   std::vector<std::unique_ptr<Symbol>> symbols;
   std::vector<std::unique_ptr<Function>> runtime;
+  // After CFG lowering, keep stable semantic identities and global data while
+  // ending the lifetime of syntax arenas and all references into them.
+  void releaseSyntax();
 };
 
 TokenIR tokenize(const Source &source);

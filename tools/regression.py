@@ -253,6 +253,25 @@ def main():
             (fixture / "pressure.in").write_text(" ".join(map(str,data+[count]))+"\n")
             (fixture / "pressure.out").write_text(f"{wrap(sum(vector))}\n0\n")
             print(f"Wrote {width} live integers, coefficients {c1} and {c2}, {count} iterations to {fixture}")
+            # Quotient/remainder pairs expose shared reciprocal arithmetic
+            # only after instruction selection. Check against Python integers.
+            fixture = ROOT / "build/division-fixture/performance"
+            fixture.mkdir(parents=True,exist_ok=True)
+            source = '''int main(){int x=getint();int n=getint();int i=0;int sum=0;
+              starttime();while(i<n){sum=sum+x/7+x%7+x/31+x%31+x/97+x%97;
+                x=x*1664525+1013904223;i=i+1;}stoptime();
+              putf("%d %d\\n",sum,x);return 0;}'''
+            division_count = 10*count
+            x, total = -2147483648, 0
+            for _ in range(division_count):
+                for d in (7,31,97):
+                    q = abs(x)//d * (-1 if x < 0 else 1)
+                    total = wrap(total+q+x-q*d)
+                x = wrap(x*1664525+1013904223)
+            (fixture / "division.sy").write_text(source)
+            (fixture / "division.in").write_text(f"-2147483648 {division_count}\n")
+            (fixture / "division.out").write_text(f"{total} {x}\n0\n")
+            print(f"Wrote {division_count} quotient/remainder iterations to {fixture}")
             return
         name = f"pressure_generated_{k:02d}"
         cases[name] = (source,f"{wrap(sum(model))}\n0\n")
@@ -263,6 +282,27 @@ def main():
         int bad=0;i=0;while(i<2){int j=0;while(j<11){float sum=0;k=0;
           while(k<9){sum=sum+a[i][k]*b[k][j];k=k+1;}if(sum!=c[i][j])bad=bad+1;j=j+1;}i=i+1;}
         putint(bad);return 0;}''', "0\n0\n")
+    # Affine chains with wrapping coefficients, shared intermediate values,
+    # branch joins and loop backedges. Model each operation independently.
+    affine_rng = random.Random(20261014)
+    for k in range(16):
+        x,y = [affine_rng.randrange(-2**31,2**31) for _ in range(2)]
+        c = [affine_rng.choice([-2**31,2**31-1,-65537,-31,-1,0,2,17,65536]) for _ in range(8)]
+        mode,n = k%2,k%8
+        shared = wrap(wrap(x+c[0])*c[1])
+        p = wrap(wrap(shared+c[2])*c[3]+y)
+        q = wrap(wrap(shared-c[4])*c[5]-y)
+        p = wrap((p+c[6])*c[7]) if mode else wrap((p-c[7])*c[6])
+        for _ in range(n): p,q = wrap((p+17)*31),wrap(q*31+7)
+        source = f'''int main(){{int x=getint();int y=getint();int mode=getint();int n=getint();
+          int shared=(x+({c[0]}))*({c[1]});int p=(shared+({c[2]}))*({c[3]})+y;
+          int q=(shared-({c[4]}))*({c[5]})-y;
+          if(mode)p=(p+({c[6]}))*({c[7]});else p=(p-({c[7]}))*({c[6]});
+          int i=0;while(i<n){{p=(p+17)*31;q=q*31+7;i=i+1;}}
+          putf("%d %d %d %d\\n",p,q,shared,x);return 0;}}'''
+        name = f"affine_generated_{k:02d}"
+        cases[name] = (source,f"{p} {q} {shared} {x}\n0\n")
+        (directory / f"{name}.in").write_text(f"{x} {y} {mode} {n}\n")
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)

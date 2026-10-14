@@ -15,6 +15,55 @@ bool fp(ValueType type) { return type == ValueType::Float || type == ValueType::
 int64_t align(int64_t size, int64_t alignment) { return (size + alignment - 1) / alignment * alignment; }
 bool small(int64_t value) { return value >= -2048 && value <= 2047; }
 
+// Sparse 64-value chunks keep block liveness compact without allocating a
+// full values-by-blocks matrix. Union/difference operate on machine words.
+class ValueSet {
+  using Chunk = std::pair<int,uint64_t>;
+  std::vector<Chunk> chunks;
+  auto find(int word) const {
+    return std::lower_bound(chunks.begin(),chunks.end(),word,[](auto c, int w) { return c.first < w; });
+  }
+public:
+  bool count(int v) const {
+    auto it = find(v/64); return it != chunks.end() && it->first == v/64 && (it->second & (uint64_t{1}<<(v%64)));
+  }
+  void insert(int v) {
+    auto it = std::lower_bound(chunks.begin(),chunks.end(),v/64,[](auto c, int w) { return c.first < w; });
+    if (it == chunks.end() || it->first != v/64) it = chunks.insert(it,{v/64,0});
+    it->second |= uint64_t{1}<<(v%64);
+  }
+  void erase(int v) {
+    auto it = std::lower_bound(chunks.begin(),chunks.end(),v/64,[](auto c, int w) { return c.first < w; });
+    if (it != chunks.end() && it->first == v/64) {
+      it->second &= ~(uint64_t{1}<<(v%64)); if (!it->second) chunks.erase(it);
+    }
+  }
+  bool merge(const ValueSet &source, const ValueSet *exclude = nullptr) {
+    std::vector<Chunk> joined; joined.reserve(chunks.size()+source.chunks.size());
+    size_t a = 0, b = 0, e = 0;
+    while (a < chunks.size() || b < source.chunks.size()) {
+      int word = std::min(a < chunks.size() ? chunks[a].first : INT32_MAX,
+                          b < source.chunks.size() ? source.chunks[b].first : INT32_MAX);
+      uint64_t bits = 0;
+      if (b < source.chunks.size() && source.chunks[b].first == word) bits = source.chunks[b++].second;
+      if (exclude) {
+        while (e < exclude->chunks.size() && exclude->chunks[e].first < word) ++e;
+        if (e < exclude->chunks.size() && exclude->chunks[e].first == word) bits &= ~exclude->chunks[e].second;
+      }
+      if (a < chunks.size() && chunks[a].first == word) bits |= chunks[a++].second;
+      if (bits) joined.push_back({word,bits});
+    }
+    if (chunks == joined) return false;
+    chunks.swap(joined); return true;
+  }
+  bool operator!=(const ValueSet &other) const { return chunks != other.chunks; }
+  template<class F> void each(F visit) const {
+    for (auto [word,bits] : chunks) while (bits) {
+      visit(word*64+__builtin_ctzll(bits)); bits &= bits-1;
+    }
+  }
+};
+
 struct Argument { int reg = -1; bool floating = false; int64_t offset = 0; };
 std::vector<Argument> arguments(const std::vector<ValueType> &types, size_t named) {
   int integer = 0, floating = 0; int64_t stack = 0;
@@ -49,7 +98,7 @@ Allocation allocate(const MachineFunction &f) {
   std::vector<int> sites(count, 0);
   const auto &depth = f.depth;
   std::vector<double> weight(count, 0);
-  std::vector<std::unordered_set<int>> use(blocks), def(blocks), in(blocks), out(blocks);
+  std::vector<ValueSet> use(blocks), def(blocks), in(blocks), out(blocks);
   for (size_t b = 0; b < blocks; ++b) {
     for (const auto &i : f.blocks[b].instructions) {
       result.leaf &= i.op != Op::Call;
@@ -85,13 +134,11 @@ Allocation allocate(const MachineFunction &f) {
     changed = false;
     for (size_t reverse = blocks; reverse > 0; --reverse) {
       size_t b = reverse - 1;
-      auto oldIn = in[b], oldOut = out[b];
       const auto &last = f.blocks[b].instructions.back();
       for (int successor : {last.target, last.otherwise}) if (successor >= 0)
-        out[b].insert(in[successor].begin(), in[successor].end());
-      in[b] = use[b];
-      for (int v : out[b]) if (!def[b].count(v)) in[b].insert(v);
-      changed |= oldIn != in[b] || oldOut != out[b];
+        changed |= out[b].merge(in[successor]);
+      auto next = use[b]; next.merge(out[b],&def[b]);
+      if (next != in[b]) { in[b] = std::move(next); changed = true; }
     }
   } while (changed);
   std::vector<std::unordered_set<int>> interference(count);
@@ -104,7 +151,7 @@ Allocation allocate(const MachineFunction &f) {
     auto live = out[b];
     int blockEnd = blockStart + 2*f.blocks[b].instructions.size();
     std::map<int,int> ends;
-    for (int v : live) if (tracked(v)) ends[v] = blockEnd;
+    live.each([&](int v) { if (tracked(v)) ends[v] = blockEnd; });
     int point = blockEnd;
     for (auto it = f.blocks[b].instructions.rbegin(); it != f.blocks[b].instructions.rend(); ++it) {
       const auto &i = *it; point -= 2;
@@ -114,13 +161,14 @@ Allocation allocate(const MachineFunction &f) {
         if (end != ends.end()) ends.erase(end);
       }
       for (int a : i.args) if (tracked(a) && !ends.count(a)) ends[a] = point+1;
-      for (int v : live) if (v != i.result) forbidden[v] |= fp(f.values[v]) ? i.floatClobbers : i.integerClobbers;
+      if (i.integerClobbers || i.floatClobbers)
+        live.each([&](int v) { if (v != i.result) forbidden[v] |= fp(f.values[v]) ? i.floatClobbers : i.integerClobbers; });
       if (i.result >= 0 && tracked(i.result)) {
         int source = i.op == Op::Move ? i.args[0] : -1;
         if (source >= 0 && tracked(source)) { hints[i.result].push_back(source); hints[source].push_back(i.result); }
-        for (int v : live) if (v != i.result && v != source && tracked(v) && fp(f.values[v]) == fp(f.values[i.result])) {
+        live.each([&](int v) { if (v != i.result && v != source && tracked(v) && fp(f.values[v]) == fp(f.values[i.result])) {
           interference[v].insert(i.result); interference[i.result].insert(v);
-        }
+        } });
         live.erase(i.result);
       }
       for (int v : i.args) if (tracked(v)) live.insert(v);
@@ -137,14 +185,6 @@ Allocation allocate(const MachineFunction &f) {
     list = std::move(merged);
   };
   for (auto &list : ranges) normalize(list);
-  auto intersectRanges = [](const std::vector<Range> &a, const std::vector<Range> &b) {
-    size_t x = 0, y = 0;
-    while (x < a.size() && y < b.size()) {
-      if (a[x].first < b[y].second && b[y].first < a[x].second) return true;
-      if (a[x].second <= b[y].second) ++x; else ++y;
-    }
-    return false;
-  };
   std::vector<ValueType> parameterTypes;
   for (const auto &p : f.source->parameters) parameterTypes.push_back(p.symbol->type.array() ? ValueType::Pointer : p.base == Base::Float ? ValueType::Float : ValueType::Int);
   auto incoming = arguments(parameterTypes, parameterTypes.size());
@@ -181,6 +221,10 @@ Allocation allocate(const MachineFunction &f) {
       int a = leader(pair.first), b = leader(pair.second);
       uint32_t mask = masks[a] & masks[b];
       if (a == b || !mask || conflicts[a].count(b)) continue;
+      // Keep affinity as a hint when a cold, constrained copy would restrict
+      // a substantially hotter bundle. Fewer moves need not mean fewer spills.
+      if ((mask != masks[a] && weight[a] >= 10 && weight[a] > 2*weight[b]) ||
+          (mask != masks[b] && weight[b] >= 10 && weight[b] > 2*weight[a])) continue;
       auto neighbors = conflicts[a]; neighbors.insert(conflicts[b].begin(), conflicts[b].end());
       int high = 0, available = population(mask);
       for (int v : neighbors) high += conflicts[v].size() >= static_cast<size_t>(available);
@@ -198,7 +242,22 @@ Allocation allocate(const MachineFunction &f) {
     }
     std::vector<double> priority(count,0);
     std::vector<int> attempts(count,0);
-    std::vector<std::set<int>> occupants(colors);
+    // Per-register occupied ranges are disjoint. Queries visit only intervals
+    // intersecting the candidate, rather than scanning every allocated bundle.
+    std::vector<std::map<int,std::pair<int,int>>> occupancy(colors);
+    auto overlaps = [&](int r, const std::vector<Range> &candidate) {
+      std::set<int> found;
+      const auto &index = occupancy[r];
+      for (auto range : candidate) {
+        auto it = index.lower_bound(range.first);
+        if (it != index.begin()) {
+          auto previous = std::prev(it);
+          if (previous->second.first > range.first) found.insert(previous->second.second);
+        }
+        for (; it != index.end() && it->first < range.second; ++it) found.insert(it->second.second);
+      }
+      return found;
+    };
     std::priority_queue<std::pair<double,int>> work;
     for (int v : pending) {
       normalize(bundles[v]); size_t length = 0;
@@ -218,7 +277,7 @@ Allocation allocate(const MachineFunction &f) {
       for (int r : order) {
         if (!(masks[v] & (uint32_t{1} << r))) continue;
         double cost = 0; std::vector<int> conflictsHere;
-        for (int other : occupants[r]) if (intersectRanges(bundles[v],bundles[other])) {
+        for (int other : overlaps(r,bundles[v])) {
           conflictsHere.push_back(other);
           cost += attempts[other] >= 3 ? std::numeric_limits<double>::infinity() : priority[other];
         }
@@ -227,9 +286,13 @@ Allocation allocate(const MachineFunction &f) {
       }
       if (chosen < 0) continue;
       for (int other : victims) {
-        occupants[chosen].erase(other); result.registers[other] = -1; work.push({priority[other],other});
+        for (auto range : bundles[other]) occupancy[chosen].erase(range.first);
+        result.registers[other] = -1; work.push({priority[other],other});
       }
-      occupants[chosen].insert(v); result.registers[v] = chosen;
+      for (auto range : bundles[v]) {
+        if (!occupancy[chosen].emplace(range.first,std::make_pair(range.second,v)).second) throw std::logic_error("overlapping allocation index");
+      }
+      result.registers[v] = chosen;
     }
     for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v)) result.registers[v] = result.registers[leader(v)];
   }
@@ -261,8 +324,9 @@ Allocation allocate(const MachineFunction &f) {
   return result;
 }
 
-// Split spilled live ranges into instruction-local fragments. Values passed to
-// ABI call pseudos are left intact: all their arguments are simultaneous uses.
+// Split spilled live ranges into short use clusters with a write-through home.
+// Block edges and calls end a cluster; long gaps do not keep a register live.
+// ABI call operands remain intact because they are simultaneous uses.
 bool splitSpills(MachineFunction &f, const Allocation &allocation) {
   std::set<int> excluded, selected;
   for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.op == Op::Call)
@@ -273,25 +337,35 @@ bool splitSpills(MachineFunction &f, const Allocation &allocation) {
   if (selected.empty()) return false;
   std::map<int,int> slots;
   for (int v : selected) { slots[v] = f.slots.size(); f.slots.push_back(f.values[v]); }
+  // With few homes, short mandatory fragments already avoid most spills;
+  // sharing can instead increase pressure. Use clusters for heavier spilling.
+  bool clusterUses = selected.size() == 16;
   auto fresh = [&](int v) { int id = f.values.size(); f.values.push_back(f.values[v]); return id; };
   for (auto &b : f.blocks) {
     std::vector<MachineInstruction> code;
+    struct Cluster { int value; size_t start, last; };
+    std::map<int,Cluster> cached;
+    size_t point = 0;
     for (auto i : b.instructions) {
-      std::map<int,int> reloaded;
+      if (!clusterUses) cached.clear();
       for (int &a : i.args) if (slots.count(a)) {
         int original = a;
-        if (!reloaded.count(a)) {
+        auto found = cached.find(a);
+        if (found == cached.end() || point-found->second.last > 8 || point-found->second.start > 16) {
           int id = fresh(a); MachineInstruction reload{Op::SpillLoad}; reload.result = id; reload.immediate = slots.at(a);
-          code.push_back(std::move(reload)); reloaded[a] = id;
+          code.push_back(std::move(reload)); cached[original] = {id,point,point};
         }
-        a = reloaded.at(original);
+        auto &cluster = cached.at(original); a = cluster.value; cluster.last = point;
       }
+      if (i.op == Op::Call) cached.clear();
       int original = i.result;
       if (slots.count(original)) i.result = fresh(original);
       int produced = i.result; code.push_back(std::move(i));
       if (slots.count(original)) {
         MachineInstruction save{Op::SpillStore}; save.args = {produced}; save.immediate = slots.at(original); code.push_back(std::move(save));
+        cached[original] = {produced,point,point};
       }
+      ++point;
     }
     b.instructions = std::move(code);
   }
@@ -680,7 +754,7 @@ public:
   void run() {
     if (!dump) out << ".option nopic\n.attribute arch, \"rv64gc\"\n";
     if (!dump) for (const auto &item : module.source->items) for (const auto &v : item.variables) global(v);
-    for (const auto &source : module.functions) { auto select = [&] { return selectTarget(source); }; auto f = stats ? stats->measure("selection",select) : select(); emitFunction(f); ++functionId; }
+    for (const auto &source : module.functions) { auto select = [&] { return selectTarget(source,stats); }; auto f = stats ? stats->measure("selection",select) : select(); emitFunction(f); ++functionId; }
     if (!dump) out << ".section .note.GNU-stack,\"\",@progbits\n";
   }
 };

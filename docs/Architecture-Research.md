@@ -7,14 +7,14 @@
 | 阶段 | 实现与依据 | 实际用途与边界 |
 |---|---|---|
 | Token / 解析 | 源码切片 Token、连续 Token 数组、稳定索引的块状 AoS arena | 普通 Token 不复制字符；节点每 128 个成块分配，避免逐节点分配与递归销毁。孩子引用仍包含 arena 指针和索引，变长字段仍用 vector；尚非完整 SoA |
-| 语义 / HIR | 显式栈的有序后序遍历；保留类型、符号及 tensor 形状 | 消除长表达式的递归语义栈；2 万项表达式在默认 8MB 栈下通过 ASan/UBSan。语义属性仍在节点中，没有不可变 CST 或增量查询系统 |
+| 语义 / HIR | 显式栈的有序后序遍历；保留类型、符号及 tensor 形状；按阶段释放语法 arena | 消除长表达式的递归语义栈；降低后清除语法引用并释放节点，符号身份和全局数据继续有效。没有不可变 CST 或增量查询系统 |
 | CFG / SSA 分析 | 密集 Value ID、按准确拓扑快照缓存支配分析 | 指令改写保留缓存，改边、重排或增删块自动失效；比较完整边数组，避免哈希碰撞导致错误复用。不是所有分析都已缓存 |
 | 常量 / 值编号 | def-use 工作队列 SCCP、结构化 hash-cons 键、支配树作用域撤销表 | 只重新处理受变化影响的用户；GVN 避免字符串序列化和逐子树复制整个表达式表 |
 | 内存 | 全内存 MemorySSA，MemoryDef / Use / Phi、别名 clobber walker、查询缓存 | 替换可用加载状态的反复全图扫描；按对象来源与调用读写摘要跳过不相关写入。数组参数之间及参数与全局对象仍可能别名 |
-| 等价改写 | 有节点、匹配次数及迭代预算的整数 EGraph | union-find、hash-cons、congruence rebuild、恒等式、常量结合、公共因子提取、成本提取；在纯整数区域内工作，副作用和浮点运算保持 CFG 顺序。尚非跨 CFG 的完整 AEGraph |
+| 等价改写 | 单基 SSA 仿射摘要、共享感知归一化、有预算的整数 EGraph | 仿射 PASS 跨区域保留模 2³² 的系数与偏移，只吸收单次使用的整数算术；EGraph 做 hash-cons、congruence rebuild 和成本提取。尚非跨 CFG 的完整 AEGraph |
 | tensor / 循环 | 独立 TensorSchedule IR，显式迭代域、列分块、尾块及归约顺序 | 语义和调度分开；一般内核使用四列，较宽浮点矩阵使用八列；已证明一致性的矩阵保留专用算法。没有通用 polyhedral 搜索或自动调参框架 |
-| 指令选择 | 独立目标 MIR、RV opcode、GP / FP bank、early use / late def、调用 clobber | 常量除法、比较及地址计算在 RA 前展开，所有算术临时值参与分配。普通操作数内联；ABI 搬运、frame、访存、清零及重物化仍为显式 pseudo |
-| 寄存器分配 | 精确程序点区间、复制 bundle、优先队列、驱逐重试、热溢出区间拆分 | 使用 Briggs 保守合并；拆分为指令附近的短片段，重新分配，产生显式 spill slot。调用参数保留原范围；尚无完整跨调用区域拆分和 regalloc2 全部约束模型 |
+| 指令选择 | 独立目标 MIR、RV opcode、bank、early / late、clobber；展开后局部值编号、复制传播和工作队列 DCE | 消除除法与取余等展开的重复子式；定义版本保护降 Phi 后的可变值，常量仍为独立重物化配方。压缩有效 Value ID；尚无跨块目标 GVN |
+| 寄存器分配 | 稀疏 64 位活跃块、有序占用区间、复制 bundle、优先队列、驱逐、热溢出拆分 | Briggs 合并保留热 bundle 的寄存器选择；较高压力下使用短重载簇，调用及块边界终止共享。尚无 min-cut 全局区域拆分或 regalloc2 全部约束模型 |
 | 验证 / 输出 | 独立冲突图与 ABI 检查、分配后符号 must-dataflow、活跃压力生成测试 | 符号检查跟踪物理位置包含哪些当前虚拟值，汇合取交集，检查复制、调用破坏及溢出。不是完整机器语义的形式证明 |
 
 代码分别位于 [arena.hpp](../src/arena.hpp)、[ir.hpp](../src/ir.hpp)、[optimizer.cpp](../src/optimizer.cpp)、[rewrite.cpp](../src/rewrite.cpp)、[tensor.cpp](../src/tensor.cpp)、[target_ir.hpp](../src/target_ir.hpp)、[selection.cpp](../src/selection.cpp)、[backend.cpp](../src/backend.cpp)。`--stats` 记录每个 PASS、验证、选择、分配的耗时及计数；指标与复现见 [Performance.md](Performance.md)。
@@ -22,8 +22,8 @@
 ```text
 Source → Token IR → arena Program IR → resolved HIR
        → tensor facts → TensorSchedule IR → expanded HIR
-       → CFG/SSA → MemorySSA / bounded EGraph → optimized CFG
-       → phi edge copies → target MIR → split / allocate
+       → CFG/SSA → MemorySSA / affine summaries / bounded EGraph → optimized CFG
+       → phi edge copies → target MIR → local combine / compact → split / allocate
        → allocated locations → frame / ABI expansion → assembly
 ```
 
@@ -48,6 +48,22 @@ Source → Token IR → arena Program IR → resolved HIR
 [GlobalISel 的流水线](https://llvm.org/docs/GlobalISel/Pipeline.html)区分合法化、bank 选择和指令选择；[ISLE](https://cfallin.org/blog/2023/01/20/cranelift-isle/)用类型化规则描述模式。本项目借鉴边界和约束表达，用 C++ 规则生成自己的 RV64 MIR，没有实现 ISLE DSL 或使用 GlobalISel。三地址目标指令暴露真实临时值，ABI pseudo 承担固定位置搬运，并声明调用者保存寄存器的破坏。
 
 [regalloc2 的 ION 文档](https://github.com/bytecodealliance/regalloc2/blob/main/doc/ION.md)与[作者设计说明](https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/)提供区间、bundle、优先级、驱逐及拆分的依据。[RAGreedy 实现](https://llvm.org/doxygen/RegAllocGreedy_8cpp_source.html)也包含区间拆分机制。本项目将这些可用设计落到自己的分配器：early/late 半开区间、ABI mask、复制合并、低成本 bundle 驱逐、最多三次尝试及热溢出拆分。独立冲突分析验证实际分配，符号检查再验证位置中的值；它不是 regalloc2 或 RAGreedy 的完整移植。
+
+## 进一步调研与实测筛选（2026-10-14）
+
+[rustc 的 THIR 文档](https://rustc-dev-guide.rust-lang.org/thir.html)明确区分稳定的语义身份与临时的函数体 IR：不再需要的 THIR 及时释放。本项目在所有函数完成 CFG 降低后释放整个语法 arena，并先清除函数体、维度和初始化器中的节点引用；函数签名、Symbol 和全局初值继续有效。`hir.release` 单独计时。
+
+[Cranelift 的有类型整数重写规则](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/opts/arithmetic.isle)与 AEGraph 提供组合整数恒等式的参照。检查长表达式时发现，有预算的 EGraph 把区域外表达式当作普通叶子，不能归一化跨区域的长链。新增独立 `affine` PASS，以 RPO 单次扫描构造 `(base Value ID, uint32 scale, uint32 offset, cost)` 摘要；只展开单次使用的整数算术，保留共享值，按操作数成本决定重建。可被下一条算术吸收的值只传摘要，避免先构造大量无用常量。新常量置于参数读取之后，维持 ABI 约束；随后 DCE 再进入 EGraph。这是模 2³² 的单基标量归一化，不是一般 polyhedral 分析；Phi、加载、调用和浮点转换作为不透明的已求值输入。
+
+[GlobalISel 的 Combiner 扩展点](https://llvm.org/docs/GlobalISel/Pipeline.html)支持在不同降低阶段插入优化。这里的 `target.combine` 是自有 C++ PASS，处理合法化后才出现的子式。局部表达式键使用操作码、类型、立即数及输入的值版本；复制传播在源值被重新定义时失效。常量按内容编号，但保留各自配方，避免把重物化变成额外复制和寄存器压力。无用单定义通过工作队列删除，最终压缩 ID。
+
+[regalloc2 的稀疏 BitVec 与 allocation map](https://github.com/bytecodealliance/regalloc2/blob/main/doc/ION.md)指出，活跃度通常全局稀疏、局部密集。本项目使用排序的 `(word ID, uint64)` 数组，按字做并集与差集，空块不储存；物理寄存器的占用则以 `std::map` 保存不相交半开区间。它是平衡有序树，不是 regalloc2 的 BTree 实现。重叠查询从前驱及 lower_bound 开始，驱逐按 bundle 去重。
+
+[Factor 0.102 的 greedy 分配文档，2026-10-02](https://docs.factorcode.org/content/article-compiler.cfg.register-allocation.greedy.html)包含全局 min-cut 和局部使用簇。本项目先实现可测量的局部部分：当 16 个拆分名额全部用满时，相邻使用共享短片段；最大间隔八条指令、最大跨度十六条指令。定义写穿到私有 home，跨块与跨调用不缓存。没有实现 Factor 的物理空闲窗口搜索、min-cut 或末次重着色。
+
+[Magellan，2026-01 预印本](https://arxiv.org/abs/2601.21096)强调把可维护的启发式与参数搜索分开，并在其他负载上检查泛化。此次分别保存候选编译器，比较指令局部拆分、无条件重载簇、压力门控，以及展开后不同的值编号方案；使用原有 60 个程序和独立算术模型筛选。无条件共享及将常量替换为复制的方案均出现退化，未采用。没有引入论文的 AlphaEvolve 服务或 LLVM/XLA 管线。
+
+检查器仍在每个 CFG PASS 后运行。Phi 前驱改用精确的排序数组比较，减少集合分配，并拒绝过去集合相等检查会漏过的重复入边；Phi 在索引操作数前检查结果与 arity。
 
 ## 调度与验证的后续边界
 

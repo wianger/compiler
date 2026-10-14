@@ -33,7 +33,7 @@ void help() {
       "  --emit-effects     print function read/write and observable-effect summaries\n"
       "  --stats            print stage timings and peak RSS as JSON to stderr\n"
       "  --passes=PIPELINE  override ordered IR passes (comma separated)\n"
-      "    prune,inline,globaldce,promote,ssa,simplify,sccp,gvn,memory,egraph,tail,arith,licm,strength,rotate,unroll,dce,compact,lower-phi,isel,layout\n"
+      "    prune,inline,globaldce,promote,ssa,simplify,sccp,gvn,memory,affine,egraph,tail,arith,licm,strength,rotate,unroll,dce,compact,lower-phi,isel,layout\n"
       "  --help             print this help\n";
 }
 Options options(int argc, char **argv) {
@@ -113,6 +113,9 @@ int main(int argc, char **argv) {
           if (o.kind == Output::ExpandedIR) sysy::printIR(program, result);
           else {
             auto module = stats.measure("lower", [&] { return sysy::lower(program); });
+            stats.count("expr.nodes", program.expressions->size());
+            stats.count("stmt.nodes", program.statements->size());
+            stats.measure("hir.release", [&] { program.releaseSyntax(); });
             sysy::verify(module);
             if (o.passes) sysy::runPasses(module, *o.passes, &stats);
             else sysy::optimize(module, o.optimization, &stats);
@@ -129,8 +132,8 @@ int main(int argc, char **argv) {
           }
         }
       }
-      stats.count("expr.nodes", program.expressions->size());
-      stats.count("stmt.nodes", program.statements->size());
+      if (program.expressions) stats.count("expr.nodes", program.expressions->size());
+      if (program.statements) stats.count("stmt.nodes", program.statements->size());
     }
     if (o.output == "-") std::cout << result.str();
     else {

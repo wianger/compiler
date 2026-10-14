@@ -64,7 +64,8 @@ def main():
                     samples[v].append(sample)
         mode = "--emit-hir" if opts.hir else "-S"
         baseline_rss, _ = profile(opts.baseline,source,mode,False)
-        candidate_rss, stats = profile(opts.candidate,source,mode,True)
+        candidate_rss, _ = profile(opts.candidate,source,mode,False)
+        _, stats = profile(opts.candidate,source,mode,True)
         results.append({"case": str(source), "samples": samples, "stats": stats, "rss_kib": [baseline_rss,candidate_rss],
                         **{name: [statistics.median(s[name] for s in group) for group in samples]
                            for name in ("wall", "cpu")}})

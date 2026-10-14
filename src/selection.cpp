@@ -1,6 +1,8 @@
 #include "target_ir.hpp"
 #include <algorithm>
 #include <functional>
+#include <numeric>
+#include <unordered_map>
 
 namespace sysy {
 const char *rvName(RV op) {
@@ -167,10 +169,99 @@ public:
     return std::move(result);
   }
 };
+
+// Legalization exposes computations absent from the source IR (reciprocal
+// products, sign correction and scaled addresses). Number those expressions
+// locally, including versions of mutable values after phi edge lowering.
+void combineTarget(MachineFunction &f) {
+  struct Key {
+    Op op; RV opcode; ValueType type; int64_t immediate; int a, b;
+    bool operator==(const Key &k) const {
+      return op == k.op && opcode == k.opcode && type == k.type &&
+        immediate == k.immediate && a == k.a && b == k.b;
+    }
+  };
+  struct Hash {
+    size_t operator()(const Key &k) const {
+      size_t h = static_cast<size_t>(k.op);
+      for (auto x : {static_cast<int64_t>(k.opcode),static_cast<int64_t>(k.type),k.immediate,int64_t(k.a),int64_t(k.b)})
+        h ^= std::hash<int64_t>{}(x)+0x9e3779b9+(h<<6)+(h>>2);
+      return h;
+    }
+  };
+  const size_t count = f.values.size();
+  auto pure = [](Op op) { return op == Op::Target || op == Op::Constant || op == Op::Move; };
+  for (auto &b : f.blocks) {
+    std::vector<int> numbers(count); std::iota(numbers.begin(),numbers.end(),0);
+    std::vector<std::pair<int,int>> aliases(count,{-1,-1});
+    int next = count;
+    std::unordered_map<Key,std::pair<int,int>,Hash> available;
+    for (auto &i : b.instructions) {
+      for (int &a : i.args) {
+        auto alias = aliases[a];
+        if (alias.first >= 0 && numbers[alias.first] == alias.second) a = alias.first;
+      }
+      if (i.result < 0) continue;
+      aliases[i.result] = {-1,-1};
+      int number = next++;
+      if (i.op == Op::Move) { number = numbers[i.args[0]]; aliases[i.result] = {i.args[0],number}; }
+      else if (pure(i.op)) {
+        Key key{i.op,i.opcode,f.values[i.result],i.immediate,
+          i.args.empty() ? -1 : numbers[i.args[0]],i.args.size() < 2 ? -1 : numbers[i.args[1]]};
+        auto found = available.find(key);
+        if (found != available.end() && numbers[found->second.first] == found->second.second) {
+          number = found->second.second;
+          // Constants remain independent recipes: a copy would turn a free
+          // rematerialization into a live register and an extra instruction.
+          if (i.op != Op::Constant) {
+            i.op = Op::Move; i.opcode = RV::Pseudo; i.immediate = 0; i.args = {found->second.first};
+            aliases[i.result] = found->second;
+          }
+        } else available[key] = {i.result,number};
+      }
+      numbers[i.result] = number;
+    }
+  }
+  // Delete unused single-definition expansion temporaries with a def-use
+  // worklist. Mutable edge-copy values retain their original definitions.
+  std::vector<int> uses(count,0), definitions(count,0);
+  std::vector<MachineInstruction *> defs(count,nullptr);
+  for (auto &b : f.blocks) for (auto &i : b.instructions) {
+    for (int a : i.args) ++uses[a];
+    if (i.result >= 0) { defs[i.result] = &i; ++definitions[i.result]; }
+  }
+  std::vector<int> work;
+  auto enqueue = [&](int v) {
+    if (!uses[v] && definitions[v] == 1 && pure(defs[v]->op)) work.push_back(v);
+  };
+  for (size_t v = 0; v < count; ++v) enqueue(v);
+  while (!work.empty()) {
+    int v = work.back(); work.pop_back(); auto &i = *defs[v];
+    for (int a : i.args) { --uses[a]; enqueue(a); }
+    i.result = -1;
+  }
+  for (auto &b : f.blocks) b.instructions.erase(std::remove_if(b.instructions.begin(),b.instructions.end(),
+    [&](const MachineInstruction &i) { return i.result < 0 && pure(i.op); }),b.instructions.end());
+  std::vector<int> ids(count,-1);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+    if (i.result >= 0) ids[i.result] = 0;
+    for (int a : i.args) ids[a] = 0;
+  }
+  std::vector<ValueType> types;
+  for (size_t v = 0; v < count; ++v) if (ids[v] == 0) { ids[v] = types.size(); types.push_back(f.values[v]); }
+  for (auto &b : f.blocks) for (auto &i : b.instructions) {
+    if (i.result >= 0) i.result = ids[i.result];
+    for (int &a : i.args) a = ids[a];
+  }
+  f.values = std::move(types);
+}
 } // namespace
-MachineFunction selectTarget(FunctionIR f) {
+MachineFunction selectTarget(FunctionIR f, Stats *stats) {
   destroySSA(f); selectInstructions(f); layoutBlocks(f);
-  auto result = Selector(f).run(); verifyTarget(result); return result;
+  auto result = Selector(f).run();
+  auto combine = [&] { combineTarget(result); };
+  if (stats) stats->measure("target.combine",combine); else combine();
+  verifyTarget(result); return result;
 }
 void verifyTarget(const MachineFunction &f) {
   for (const auto &b : f.blocks) {
