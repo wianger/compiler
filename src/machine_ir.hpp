@@ -8,7 +8,7 @@ namespace sysy {
 enum class ValueType { Int, Float, Pointer, Double };
 enum class Op {
   Constant, Address, String, Parameter, Move, Load, Store, Offset, Zero,
-  Add, Sub, Mul, Div, Rem, Neg, Convert, Eq, Ne, Lt, Le, Gt, Ge,
+  Add, Sub, Mul, Div, Rem, And, Shr, Neg, Convert, Eq, Ne, Lt, Le, Gt, Ge,
   Call, Jump, Branch, Return, Phi, BranchCompare
 };
 struct Instruction {
@@ -43,6 +43,7 @@ void optimize(ModuleIR &module, int level);
 void runPasses(ModuleIR &module, const std::string &pipeline);
 void verify(const ModuleIR &module);
 void printIR(const ModuleIR &module, std::ostream &out);
+void printEffects(const ModuleIR &module, std::ostream &out);
 void emitAssembly(const ModuleIR &module, std::ostream &out);
 bool runAdvancedPass(ModuleIR &module, const std::string &name);
 void destroySSA(FunctionIR &function);

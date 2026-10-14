@@ -86,6 +86,34 @@ CASES = {
       int main(){i=0;dirty();while(i<2){int j=0;while(j<3){a[i][j]=i+1;j=j+1;}i=i+1;}
         i=0;while(i<3){int j=0;while(j<2){b[i][j]=j+1;j=j+1;}i=i+1;}
         c=a@b;putarray(4,c[0]);return 0;}''', "4: 9 18 6 12\n0\n"),
+    "recursive_purity": ('''int fib(int n){if(n<2)return n+1;return fib(n-1)+fib(n-2);}
+      int data[6]={1,2,3,4,5,6};
+      int main(){int n=getint();int i=0;int s=0;while(i<n){s=s+fib(8)+data[i%6];i=i+1;}
+        putint(s);return 0;}''', "1053\n0\n"),
+    "memory_call_effects": ('''int g;int a[2]={3,4};int b[2]={5,6};
+      int read(int p[],int n){if(n==0)return p[0]+g;return read(p,n-1);}
+      void write(int p[],int n){if(n==0){p[0]=p[0]+7;return;}write(p,n-1);}
+      int main(){g=1;int x=read(a,3);write(b,2);int y=read(a,3);write(a,2);
+        int z=read(a,3);g=2;int w=read(a,3);putf("%d %d %d %d %d\\n",x,y,z,w,b[0]);return 0;}''', "4 4 11 12 12\n0\n"),
+    "parameter_alias": ('''int calc(int a[],int b[]){int i=0;int s=0;
+      while(i<8){a[0]=a[0]+i;s=s+b[0];i=i+1;}return s;}
+      int main(){int a[2]={1,2};int b[2]={3,4};int x=calc(a,a);int y=calc(a,b);
+        putf("%d %d %d\\n",x,y,a[0]);return 0;}''', "92 24 57\n0\n"),
+    "tail_parallel_state": ('''int go(int n,int a,int b,int c){if(n==0)return a*100+b*10+c;
+      return go(n-1,b,c,a+1);}
+      int main(){putint(go(getint(),1,2,3));return 0;}''', "656\n0\n"),
+    "loop_multiple_exits": ('''int f(int n){int i=0;int s=0;
+      while(i<n){if(i==7)return s;if(i==5)break;s=s+i;i=i+1;}return s+i;}
+      int main(){putf("%d %d %d\\n",f(0),f(4),f(9));return 0;}''', "0 10 15\n0\n"),
+    "guarded_divergence": ('''int spin(int n){if(n==0)return spin(n);return 7;}
+      int main(){int n=getint();int i=0;int s=0;while(i<n){s=s+spin(0);i=i+1;}
+        putint(s);return 0;}''', "0\n0\n"),
+    "argument_copy_cycles": ('''int sink(int a,int b,int c,int d,int e,int f,int g,int h,float x,float y,float z){
+      putf("%d %d %d %d %d %d %d %d %.2f %.2f %.2f\\n",a,b,c,d,e,f,g,h,x,y,z);return a;}
+      int relay(int a,int b,int c,int d,int e,int f,int g,int h,float x,float y,float z){
+        return sink(h,g,f,e,d,c,b,a,z,y,x);}
+      int main(){putint(relay(1,2,3,4,5,6,7,8,1.25,2.5,3.75));return 0;}''',
+      "8 7 6 5 4 3 2 1 3.75 2.50 1.25\n8\n0\n"),
 }
 
 INVALID = {
@@ -150,6 +178,39 @@ def main():
           if(sum!=c[i][j])bad=bad+1;j=j+1;}i=i+1;}putint(bad);return 0;}'''
     cases["uniform_rectangular"] = (matrix.replace("MODIFY", ""), "0\n0\n")
     cases["uniform_invalidation"] = (matrix.replace("MODIFY", "a[0][1]=9.0;"), "0\n0\n")
+    lengths = [-1,0,1,2,3,4,5,7,8,9,15,16,17,31]
+    cases["runtime_unroll_tails"] = ('''int main(){int r=0;while(r<14){int n=getint();
+      int a[32]={};int i=0;int sum=0;float f=0.0;
+      while(i<n){a[i]=i*3+1;sum=sum+a[i];f=f+0.1;i=i+1;}
+      float ref=0.0;int j=0;while(j<n){ref=ref+0.1;j=j+1;}
+      putf("%d %d %d %d\\n",sum,i,a[0],f==ref);r=r+1;}return 0;}''',
+      "\n".join(f"{sum(i*3+1 for i in range(max(n,0)))} {max(n,0)} {int(n>0)} 1" for n in lengths)+"\n0\n")
+    cases["signed_mask_tests"] = ('''int main(){int n=getint();int x=getint();int i=0;int sum=0;
+      while(i<n){sum=sum+i/8+i%8+i/(-4)+i%(-4);if((x-i)%8==0)sum=sum+100;
+        if((x+i)%(-16)!=0)sum=sum+1;i=i+1;}putint(sum);return 0;}''',
+      f"{sum(i//8+i%8-(i//4)+i%4+100*int((-99-i)%8==0)+int((-99+i)%16!=0) for i in range(137))}\n0\n")
+    # Seeded combinations of parameter aliasing, recursive read/write effects,
+    # zero trips and unroll tails. Compute expected values independently.
+    import struct
+    alias_rng = random.Random(8143)
+    for k in range(40):
+        n = alias_rng.choice([0,1,2,3,4,5,7,8,9,16,23,31])
+        sign, offset, same = alias_rng.choice([-1,1]), alias_rng.randrange(-19,20), k % 2
+        source = f'''int g;int a[32];int b[32];
+          int read(int p[],int n){{if(n==0)return p[0]+g;return read(p,n-1);}}
+          void write(int p[],int n){{if(n==0){{p[0]=p[0]+7;return;}}write(p,n-1);}}
+          int calc(int x[],int y[],int n){{int i=0;int s=0;float f=0.0;
+            while(i<n){{x[i]=x[i]+i+({offset});s=s+y[i]+read(y,2);f=f+0.1;i=i+1;}}
+            write(x,2);s=s+read(y,2);putfloat(f);putch(32);return s;}}
+          int main(){{int n=getint();int i=0;while(i<32){{a[i]=i*({sign});b[i]=31-i;i=i+1;}}
+            int s=calc(a,{'a' if same else 'b'},n);putf("%d %d %d\\n",s,a[0],b[0]);return 0;}}'''
+        a0 = (offset if n else 0)+7
+        total = (sign+1)*n*(n-1)//2 + 2*offset*n + a0 if same else 62*n-n*(n-1)//2+31
+        f32 = lambda x: struct.unpack('f', struct.pack('f', x))[0]
+        value = 0.0
+        for _ in range(n): value = f32(value+f32(0.1))
+        cases[f"alias_generated_{k:02d}"] = (source, f"{value.hex()} {total} {a0} 31\n0\n")
+        (directory / f"alias_generated_{k:02d}.in").write_text(f"{n}\n")
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)
@@ -159,6 +220,11 @@ def main():
     (directory / "saved_predicate.in").write_text("3 5\n")
     (directory / "constant_division.in").write_text("\n".join(map(str,numerators)) + "\n")
     (directory / "repeat_integer.in").write_text("-7\n")
+    (directory / "recursive_purity.in").write_text("18\n")
+    (directory / "tail_parallel_state.in").write_text("11\n")
+    (directory / "guarded_divergence.in").write_text("0\n")
+    (directory / "runtime_unroll_tails.in").write_text("\n".join(map(str,lengths))+"\n")
+    (directory / "signed_mask_tests.in").write_text("137 -99\n")
     for opt in (0, 2, 3):
         subprocess.run(["python3", str(ROOT / "tools/test.py"), str(directory), "--compiler", str(opts.compiler),
                         "--opt", str(opt), "--output", str(ROOT / f"build/regression-o{opt}")], check=True)

@@ -305,7 +305,11 @@ ModuleIR lower(const ProgramIR &program) { return Lowering().run(program); }
 void optimize(ModuleIR &module, int level) {
   if (level == 0) runPasses(module, "prune");
   else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact");
-  else runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,licm,gvn,simplify,dce,strength,gvn,simplify,sccp,prune,dce,compact");
+  else {
+    runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,memory,simplify,dce,tail,prune,licm,gvn,simplify,dce,arith,strength,gvn,simplify,dce,rotate,licm,gvn,memory,simplify,dce");
+    if (level >= 3) runPasses(module, "unroll,gvn,memory,simplify,dce");
+    runPasses(module, "sccp,prune,dce,compact");
+  }
 }
 void runPasses(ModuleIR &module, const std::string &pipeline) {
   size_t start = 0;
@@ -344,7 +348,7 @@ void verify(const ModuleIR &module) {
         size_t arity = 0;
         switch (i.op) {
         case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Convert: case Op::Branch: arity = 1; break;
-        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem:
+        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem: case Op::And: case Op::Shr:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::BranchCompare: arity = 2; break;
         case Op::Call:
           require(i.callee != nullptr, "IR call has no callee");
@@ -389,6 +393,7 @@ void verify(const ModuleIR &module) {
           require(a(0) == ValueType::Int || a(0) == ValueType::Float, "IR arithmetic requires numeric values");
           if (i.op == Op::Rem) require(a(0) == ValueType::Int, "IR remainder requires int values");
         }
+        if (i.op == Op::And || i.op == Op::Shr) require(a(0) == ValueType::Int && a(1) == ValueType::Int && f.values[i.result] == ValueType::Int, "IR bit operation requires int values");
         if (i.op >= Op::Eq && i.op <= Op::Ge)
           require(a(0) == a(1) && f.values[i.result] == ValueType::Int, "IR comparison type mismatch");
         bool terminal = i.op == Op::Jump || i.op == Op::Branch || i.op == Op::BranchCompare || i.op == Op::Return;
@@ -404,7 +409,7 @@ void verify(const ModuleIR &module) {
 }
 void printIR(const ModuleIR &module, std::ostream &out) {
   static const char *ops[] = {"constant", "address", "string", "parameter", "move", "load", "store", "offset", "zero",
-      "add", "sub", "mul", "div", "rem", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare"};
+      "add", "sub", "mul", "div", "rem", "and", "shr", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare"};
   static const char *types[] = {"i32", "f32", "ptr", "f64"};
   for (const auto &f : module.functions) {
     out << "function " << f.source->name << " {\n";

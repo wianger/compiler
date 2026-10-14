@@ -1,37 +1,48 @@
 # 性能优化与测量
 
-基线是优化前的 `4ab4a47` 编译器，使用 `-O2`；新版使用 `-O3`。基线可执行文件在修改开始前保存在本地，未读取其他分支。
+比较使用两份事先保存在本地的编译器：首次基线 `4ab4a47` 使用 `-O2`，上一轮优化 `1ab8c39` 使用 `-O3`；当前版本使用 `-O3`。未读取其他分支。
 
 2026-10-14，在本机 x86-64 Linux、QEMU RISC-V 用户态下测量全部 60 个 performance 用例：
 
 - 编译、链接和正确性检查先完成，计时不包含编译、链接过程。
-- 每个版本预热一次，再交替执行三次，取中位数。
+- 每个版本预热一次，再交替执行五次，取中位数。
 - 测量进程绑定到同一个可用 CPU，串行执行。
 - 分别记录整个 QEMU 进程的时间和程序 `starttime` / `stoptime` 区间的时间。
-- 整体进程时间的几何平均加速为 **2.66 倍**。
-- 55 个基线计时区间至少 10ms 的用例，区间时间几何平均加速为 **4.44 倍**。5 个较短用例仍完整记录，未纳入这个区间平均值，以减小计时噪声。
-- 60 个可执行文件的 `.text` 总计从 **214,822** 字节降到 **187,242** 字节，减少约 **12.8%**；这个数包含链接的运行库代码。
+- 相对首次基线：整体进程时间几何平均加速 **3.18 倍**；55 个基线区间至少 10ms 的用例，区间时间几何平均加速 **5.96 倍**。
+- 相对上一轮优化：整体进程时间几何平均再加速 **1.20 倍**；44 个上一轮区间至少 10ms 的用例，区间时间几何平均再加速 **1.33 倍**。两个计时区间平均值采用各自基线的筛选条件，不能直接相乘。
+- 所有用例均保存结果；较短用例不纳入对应的区间平均值，以减小计时噪声。
+- `.text` 总计 **201,160** 字节，较首次基线的 **214,822** 字节减少 **6.4%**。循环展开以代码大小换取执行速度，较上一轮的 **187,242** 字节增加 **7.4%**。这些数包含链接的运行库代码。
 
-| 用例 | 基线区间时间 / ms | 新版区间时间 / ms | 加速 |
+本轮增量的代表性测量：
+
+| 用例 | 上一轮区间时间 / ms | 当前区间时间 / ms | 增量加速 |
 |---|---:|---:|---:|
-| crypto-1 | 644.883 | 148.713 | 4.34× |
-| lcs-1 | 448.064 | 123.394 | 3.63× |
-| tensor_g1_elementwise_int-1 | 308.873 | 0.869 | 355.43× |
-| tensor_g2_elementwise_float-1 | 2735.868 | 7.807 | 350.44× |
-| tensor_g3_matmul_int-3 | 309.516 | 1.896 | 163.25× |
-| tensor_g4_matmul_float-3 | 1170.281 | 9.044 | 129.40× |
-| tensor_g5_stencil_int-3 | 273.272 | 168.237 | 1.62× |
-| gaussian-1 | 295.486 | 268.625 | 1.10× |
+| h-1-01 | 54.853 | 11.414 | 4.81× |
+| bitonic_sort-1 | 482.247 | 176.196 | 2.74× |
+| fft1 | 85.817 | 34.468 | 2.49× |
+| many_mat_cal-1 | 164.038 | 122.472 | 1.34× |
+| matmul2 | 152.688 | 128.065 | 1.19× |
+| conv2d-1 | 676.259 | 532.628 | 1.27× |
+| tensor_g5_stencil_int-3 | 166.547 | 139.674 | 1.19× |
+| gaussian-1 | 271.875 | 263.293 | 1.03× |
 
 这些结果只描述本机 QEMU 的表现；真实 RISC-V 硬件需要另行测量。
 
-全部 60 个用例的中位数和代码大小保存在 [performance.csv](performance.csv)。
+全部 60 个用例的首次基线对比保存在 [performance.csv](performance.csv)，上一轮对比保存在 [performance-incremental.csv](performance-incremental.csv)。两组实验独立测量，候选版本中位数可能略有差异。很短的计时区间仍有噪声；Gaussian 等用例的本轮收益较小，尚有优化空间。
 
 ## 优化依据
 
 新增 SSA 层为常量传播、值编号、循环分析提供共同的数据表示。支配关系和 Phi 入边在每个 PASS 后验证；控制流改写同步修复 Phi。指令选择明确产生比较分支，寄存器分配能够看到比较操作数的实际活跃时间。设计参考 [Cranelift 的指令选择](https://cfallin.org/blog/2023/01/20/cranelift-isle/)与[寄存器分配](https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/)讨论，实现保留在本仓库内。
 
 寄存器分配使用冲突图、复制偏好、调用约束和循环权重，利用调用者保存寄存器，减少热值溢出。循环不变量可保留在寄存器中；经过下标范围证明的地址计算转为指针递增。后端选择立即数和常数除法的移位、倒数乘法序列。
+
+调用图上的不动点分析生成函数的外部读写摘要；参数读写映射到调用方的实际指针来源。不同参数可能互相别名，也可能指向全局对象。没有外部读写和可观察副作用的调用能够被合并；只读调用的读依赖阻止不合法外提。跨块访存前向分析在汇合处取可用值交集，写入只使可能别名的值失效。`--emit-effects` 可直接检查这些摘要。
+
+尾递归转换成带参数 Phi 的循环；具有局部内存对象的函数保持原调用方式，避免改变逃逸对象的生存期。小函数内联放宽热循环中的预算。循环旋转保留零次执行入口检查，支持在受保护的入口外提纯函数调用；提前返回和多个出口会限制变换。整数范围与取模使用位置分析将合适的除法、整除测试降为移位和掩码，负数截断语义保持不变。
+
+循环展开借鉴 [MLIR 的循环变换](https://mlir.llvm.org/docs/Passes/)所采用的显式循环与依赖分析思路，代码由本仓库实现。固定次数循环选择可整除的展开因子；动态次数循环使用四次主循环和标量尾循环，入口条件保证展开边界计算不会溢出。展开按原顺序执行加载、存储与浮点累加，不需要假定数组之间无别名。
+
+寄存器分配的 Briggs 合并同时检查冲突图和 ABI 允许寄存器的交集。非叶函数也使用没有跨调用存活的参数寄存器。参数搬运先保存栈参数，再处理寄存器并行复制和交换环；分配完成后跳过无操作复制块，消除循环中的多余跳转。
 
 tensor 阶段保留生产者与维度信息。具有一致行、列的整数矩阵可使用模 2³² 等价的二重循环。浮点矩阵必须额外证明输入、乘积和所有部分和都能以 binary32 精确表示；不满足条件时使用保持累加顺序的四列微内核。零符号和 [RISC-V NaN 规则](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)保持一致，不启用 fast-math 或 FMA 重结合。
 
@@ -42,9 +53,11 @@ tensor 阶段保留生产者与维度信息。具有一致行、列的整数矩�
 - `-O3`：210/210 原有用例通过。
 - `-O2`：210/210 原有用例通过。
 - `-O1`：150/150 功能用例通过。
-- 24 个额外程序在 `-O0`、`-O2`、`-O3` 下执行，共 72 次回归；另有 20 个诊断回归。
+- 73 个额外程序在 `-O0`、`-O2`、`-O3` 下执行，共 219 次回归；另有 20 个诊断回归。
 - 额外覆盖 108 个整数边界、随机被除数与 21 个正负常数除数、保存的比较结果、浮点累加舍入、负零、NaN、非方阵、结构失效、循环内存写入和调用副作用。
-- AddressSanitizer / UndefinedBehaviorSanitizer 编译全部 210 个原有程序和 24 个额外程序，234/234 通过。
+- 新增递归读写摘要、参数别名、尾递归状态交换、零次执行的发散函数、多个出口、动态展开的各种余数和两组参数寄存器交换环。
+- 40 个固定种子 `8143` 的组合用例覆盖不同数组别名与递归读写，预期值由 Python 独立计算；额外与事先保存的未优化编译器进行差分执行，40/40 一致。
+- AddressSanitizer / UndefinedBehaviorSanitizer 编译全部 210 个原有程序和 73 个额外程序，283/283 通过。
 
 ## 复现
 
@@ -53,7 +66,7 @@ tensor 阶段保留生产者与维度信息。具有一致行、列的整数矩�
 ```sh
 python3 tools/test.py test/performance --compiler /path/to/baseline-compiler --opt 2 --jobs 1 --output build/bench/baseline
 python3 tools/test.py test/performance --compiler build/compiler --opt 3 --jobs 1 --output build/bench/candidate
-python3 tools/bench.py build/bench/baseline build/bench/candidate --repeats 3 --warmups 1 --output build/bench/report.json
+python3 tools/bench.py build/bench/baseline build/bench/candidate --repeats 5 --warmups 1 --output build/bench/report.json
 ```
 
 JSON 保留全部样本、中位数、代码大小、CPU 绑定、版本路径与每个用例的加速比。`--filter` 可选择用例名子串用于单独排查。
@@ -62,7 +75,8 @@ JSON 保留全部样本、中位数、代码大小、CPU 绑定、版本路径�
 build/compiler -O3 --emit-expanded-hir input.sy
 build/compiler -O3 --emit-ir input.sy
 build/compiler -O3 --emit-mir input.sy
+build/compiler -O3 --emit-effects input.sy
 build/compiler -O3 --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce input.sy
 ```
 
-`--passes` 控制 CFG/SSA 层的顺序；tensor 结构分析由 `-O2` / `-O3` 启用，重复循环归约由 `-O3` 启用。`promote` 和 `inline` 应在 SSA 构造之前运行，`lower-phi`、`isel`、`layout` 可单独检查后端边界。
+`--passes` 控制 CFG/SSA 层的顺序。新增 `memory`、`tail`、`arith`、`rotate`、`unroll` 可分别检查访存、尾递归、整数算术、循环旋转与展开。`unroll` 通常放在 `rotate` 和 `licm` 之后。tensor 结构分析由 `-O2` / `-O3` 启用，重复循环归约与展开由 `-O3` 启用。`promote` 和 `inline` 应在 SSA 构造之前运行，`lower-phi`、`isel`、`layout` 可单独检查后端边界。

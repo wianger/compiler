@@ -117,7 +117,7 @@ Allocation allocate(const FunctionIR &f) {
   auto incoming = arguments(parameterTypes, parameterTypes.size());
   auto preferred = [&](int v) {
     const auto *i = result.original[v];
-    if (!result.leaf || !i || i->op != Op::Parameter) return -1;
+    if (!i || i->op != Op::Parameter) return -1;
     auto a = incoming.at(i->immediate);
     if (a.reg < 0 || (fp(f.values[v]) && !a.floating)) return -1;
     return a.reg + (fp(f.values[v]) ? 21 : 13);
@@ -129,33 +129,59 @@ Allocation allocate(const FunctionIR &f) {
     return true;
   };
   for (bool floating : {false, true}) {
-    int colors = floating ? (result.leaf ? 29 : 21) : (result.leaf ? 21 : 13);
+    int colors = floating ? 29 : 21;
+    std::vector<int> parent(count); std::iota(parent.begin(), parent.end(), 0);
+    auto leader = [&](int v) { while (v != parent[v]) v = parent[v]; return v; };
+    std::vector<uint32_t> masks(count, 0);
+    std::vector<std::set<int>> conflicts(count);
     std::set<int> pending;
-    for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v) && weight[v] > 0) pending.insert(v);
+    for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v) && weight[v] > 0) {
+      pending.insert(v);
+      for (int r = 0; r < colors; ++r) if (allowed(v, r)) masks[v] |= uint32_t{1} << r;
+      conflicts[v].insert(interference[v].begin(), interference[v].end());
+    }
+    auto population = [](uint32_t mask) { int n = 0; for (; mask; mask &= mask-1) ++n; return n; };
+    std::vector<std::pair<int, int>> moves;
+    for (int v : pending) for (int other : hints[v]) if (v < other) moves.push_back({v, other});
+    std::stable_sort(moves.begin(), moves.end(), [&](auto a, auto b) { return weight[a.first]+weight[a.second] > weight[b.first]+weight[b.second]; });
+    for (auto pair : moves) {
+      int a = leader(pair.first), b = leader(pair.second);
+      uint32_t mask = masks[a] & masks[b];
+      if (a == b || !mask || conflicts[a].count(b)) continue;
+      auto neighbors = conflicts[a]; neighbors.insert(conflicts[b].begin(), conflicts[b].end());
+      int high = 0, available = population(mask);
+      for (int v : neighbors) high += conflicts[v].size() >= static_cast<size_t>(available);
+      if (high >= available) continue;
+      // Conservative Briggs coalescing with the intersection of ABI masks.
+      parent[b] = a; pending.erase(b); masks[a] = mask; weight[a] += weight[b];
+      conflicts[a] = std::move(neighbors); conflicts[b].clear();
+      for (int v : conflicts[a]) { conflicts[v].erase(b); conflicts[v].insert(a); }
+    }
     std::vector<int> degree(count), order;
-    for (int v : pending) degree[v] = interference[v].size();
+    for (int v : pending) degree[v] = conflicts[v].size();
     while (!pending.empty()) {
       int selected = -1; double cheapest = std::numeric_limits<double>::infinity();
       for (int v : pending) {
-        int available = 0; for (int r = 0; r < colors; ++r) available += allowed(v, r);
+        int available = population(masks[v]);
         if (degree[v] < available) { selected = v; break; }
         double cost = weight[v] / std::max(1, degree[v]);
         if (cost < cheapest) { cheapest = cost; selected = v; }
       }
       pending.erase(selected); order.push_back(selected);
-      for (int v : interference[selected]) if (pending.count(v)) --degree[v];
+      for (int v : conflicts[selected]) if (pending.count(v)) --degree[v];
     }
     for (auto it = order.rbegin(); it != order.rend(); ++it) {
       int v = *it; std::set<int> occupied;
-      for (int neighbor : interference[v]) if (result.registers[neighbor] >= 0) occupied.insert(result.registers[neighbor]);
-      auto choose = [&](int r) { if (r >= 0 && r < colors && allowed(v, r) && !occupied.count(r)) { result.registers[v] = r; return true; } return false; };
+      for (int neighbor : conflicts[v]) if (result.registers[neighbor] >= 0) occupied.insert(result.registers[neighbor]);
+      auto choose = [&](int r) { if (r >= 0 && r < colors && (masks[v] & (uint32_t{1} << r)) && !occupied.count(r)) { result.registers[v] = r; return true; } return false; };
       if (choose(preferred(v))) continue;
       bool chosen = false;
-      for (int hint : hints[v]) if (choose(result.registers[hint])) { chosen = true; break; }
+      for (int hint : hints[v]) if (choose(result.registers[leader(hint)])) { chosen = true; break; }
       if (chosen) continue;
       for (int r = 12; r < colors && !chosen; ++r) chosen = choose(r);
       for (int r = 0; r < 12 && !chosen; ++r) chosen = choose(r);
     }
+    for (size_t v = 0; v < count; ++v) if (fp(f.values[v]) == floating && tracked(v)) result.registers[v] = result.registers[leader(v)];
   }
   int64_t offset = 0;
   for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.op == Op::Call) {
@@ -184,7 +210,8 @@ class Assembly {
   size_t functionId = 0;
   int privateLabel = 0;
   std::vector<Argument> incoming;
-  int currentBlock = 0;
+  int nextEmittedBlock = 0;
+  std::vector<int> emissionTargets;
   std::optional<int64_t> scratchConstant;
 
   void line(const std::string &text) { out << "\t" << text << '\n'; }
@@ -274,17 +301,45 @@ class Assembly {
     std::vector<ValueType> types;
     for (int arg : i.args) types.push_back(function->values[arg]);
     auto abi = arguments(types, i.callee->timer ? 1 : i.callee->parameters.size());
+    // Stack arguments must consume their sources before register arguments
+    // overwrite any caller-saved register. Register arguments form a parallel
+    // copy, including mixed-bank transfers for floating variadic arguments.
+    struct Copy { int value; ValueType type; std::string dst, src; };
+    std::vector<Copy> copies;
     for (size_t n = 0; n < i.args.size(); ++n) {
       auto type = types[n]; auto location = abi[n];
-      auto bank = (location.floating ? "fa" : "a") + std::to_string(location.reg);
-      auto scratch = location.reg >= 0 && (!fp(type) || location.floating) ? bank : fp(type) ? "ft0" : "t0";
-      auto src = read(i.args[n], scratch);
-      if (location.reg < 0) memory(type == ValueType::Float ? "fsw" : type == ValueType::Double ? "fsd" : "sd", src, location.offset);
-      else {
+      if (location.reg < 0) {
+        auto src = read(i.args[n], fp(type) ? "ft0" : "t0");
+        memory(type == ValueType::Float ? "fsw" : type == ValueType::Double ? "fsd" : "sd", src, location.offset);
+      } else {
         auto dst = (location.floating ? "fa" : "a") + std::to_string(location.reg);
-        if (fp(type) && !location.floating) line(std::string(type == ValueType::Double ? "fmv.x.d " : "fmv.x.w ") + dst + ", " + src);
-        else move(dst, src, type);
+        std::string src;
+        if (!allocation.definitions[i.args[n]] && allocation.registers[i.args[n]] >= 0) src = reg(i.args[n]);
+        if (src != dst) copies.push_back({i.args[n], type, dst, src});
       }
+    }
+    while (!copies.empty()) {
+      auto ready = std::find_if(copies.begin(), copies.end(), [&](const Copy &c) {
+        return std::none_of(copies.begin(), copies.end(), [&](const Copy &other) { return other.src == c.dst; });
+      });
+      if (ready == copies.end()) {
+        // Break a cycle with a reserved register in the destination bank.
+        auto dst = copies.front().dst;
+        bool floating = dst[0] == 'f'; auto scratch = floating ? "ft0" : "t0";
+        move(scratch, dst, floating ? ValueType::Double : ValueType::Pointer);
+        for (auto &c : copies) if (c.src == dst) c.src = scratch;
+        continue;
+      }
+      auto c = *ready; copies.erase(ready);
+      auto src = c.src;
+      if (src.empty()) {
+        // Rematerialization needs a distinct scratch while a saved cycle is
+        // pending; ft1/t1 are also reserved by the allocator.
+        src = read(c.value, fp(c.type) ? "ft1" : "t1");
+      }
+      if (fp(c.type) && c.dst[0] != 'f')
+        line(std::string(c.type == ValueType::Double ? "fmv.x.d " : "fmv.x.w ") + c.dst + ", " + src);
+      else move(c.dst, src, c.type);
     }
     line("call " + i.callee->linkageName);
     if (i.result >= 0 && allocation.uses[i.result]) {
@@ -297,6 +352,8 @@ class Assembly {
     auto constant = allocation.original[i.args[1]];
     if (!constant || constant->op != Op::Constant) return false;
     int32_t d = constant->immediate;
+    if (i.op == Op::And && small(d)) { line("andi " + dst + ", " + a + ", " + std::to_string(d)); return true; }
+    if (i.op == Op::Shr) { line("srliw " + dst + ", " + a + ", " + std::to_string(d & 31)); return true; }
     if ((i.op == Op::Add && small(d)) || (i.op == Op::Sub && small(-static_cast<int64_t>(d)))) {
       line("addiw " + dst + ", " + a + ", " + std::to_string(i.op == Op::Add ? d : -static_cast<int64_t>(d))); return true;
     }
@@ -368,11 +425,12 @@ class Assembly {
     if (i.op == Op::Parameter) { parameter(i); return; }
     if (i.op == Op::Load || i.op == Op::Store) { loadStore(i); return; }
     if (i.op == Op::Call) { scratchConstant.reset(); call(i); return; }
-    if (i.op == Op::Jump) { if (i.target != currentBlock + 1) line("j " + label(i.target)); return; }
+    if (i.op == Op::Jump) { int target = emissionTargets[i.target]; if (target != nextEmittedBlock) line("j " + label(target)); return; }
     if (i.op == Op::Branch || i.op == Op::BranchCompare) {
       bool fused = i.op == Op::BranchCompare;
-      bool inverse = i.target == currentBlock + 1;
-      int taken = inverse ? i.otherwise : i.target, fall = inverse ? i.target : i.otherwise;
+      int yes = emissionTargets[i.target], no = emissionTargets[i.otherwise];
+      bool inverse = yes == nextEmittedBlock;
+      int taken = inverse ? no : yes, fall = inverse ? yes : no;
       if (fused) {
         auto a = read(i.args[0], "t0"), b = read(i.args[1], "t1");
         std::string op;
@@ -388,7 +446,7 @@ class Assembly {
       } else {
         auto test = read(i.args[0], "t0"); line(std::string(inverse ? "beqz " : "bnez ") + test + ", " + label(taken));
       }
-      if (fall != currentBlock + 1) line("j " + label(fall));
+      if (fall != nextEmittedBlock) line("j " + label(fall));
       return;
     }
     if (i.op == Op::Return) {
@@ -452,6 +510,8 @@ class Assembly {
             if (i.op == Op::Le || i.op == Op::Ge) line("xori " + dst + ", " + dst + ", 1");
           }
         }
+      } else if (i.op == Op::And || i.op == Op::Shr) {
+        line(std::string(i.op == Op::And ? "and " : "srlw ") + dst + ", " + a + ", " + b);
       } else {
         std::string op = i.op == Op::Add ? "add" : i.op == Op::Sub ? "sub" : i.op == Op::Mul ? "mul" : i.op == Op::Div ? "div" : "rem";
         op = fp(type) ? "f" + op + ".s" : op + "w";
@@ -462,6 +522,22 @@ class Assembly {
   }
   void emitFunction(const FunctionIR &f) {
     function = &f; allocation = allocate(f);
+    emissionTargets.resize(f.blocks.size()); std::iota(emissionTargets.begin(), emissionTargets.end(), 0);
+    std::vector<bool> neutral(f.blocks.size(), false);
+    for (size_t b = 0; b < f.blocks.size(); ++b) {
+      const auto &code = f.blocks[b].instructions;
+      neutral[b] = code.back().op == Op::Jump;
+      for (size_t n = 0; n+1 < code.size(); ++n) {
+        const auto &i = code[n];
+        neutral[b] = neutral[b] && i.op == Op::Move && allocation.registers[i.result] >= 0 &&
+            allocation.registers[i.result] == allocation.registers[i.args[0]] && !allocation.definitions[i.args[0]];
+      }
+    }
+    for (size_t b = 0; b < f.blocks.size(); ++b) {
+      int target = b; std::set<int> seen;
+      while (neutral[target] && seen.insert(target).second) target = f.blocks[target].instructions.back().target;
+      if (!neutral[target]) emissionTargets[b] = target;
+    }
     std::vector<ValueType> types;
     for (const auto &p : f.source->parameters) types.push_back(p.symbol->type.array() ? ValueType::Pointer : p.base == Base::Float ? ValueType::Float : ValueType::Int);
     incoming = arguments(types, types.size());
@@ -474,7 +550,9 @@ class Assembly {
     for (int r : allocation.integers) { memory("sd", "s" + std::to_string(r), offset); offset += 8; }
     for (int r : allocation.floats) { memory("fsd", "fs" + std::to_string(r), offset); offset += 8; }
     for (size_t b = 0; b < f.blocks.size(); ++b) {
-      currentBlock = b;
+      if (emissionTargets[b] != static_cast<int>(b)) continue;
+      nextEmittedBlock = b+1;
+      while (nextEmittedBlock < static_cast<int>(f.blocks.size()) && emissionTargets[nextEmittedBlock] != nextEmittedBlock) ++nextEmittedBlock;
       scratchConstant.reset();
       out << label(b) << ":\n";
       for (const auto &i : f.blocks[b].instructions) instruction(i);

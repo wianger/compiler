@@ -69,6 +69,89 @@ std::vector<const Instruction *> definitions(const FunctionIR &f) {
   return defs;
 }
 
+using Regions = std::set<const Symbol *>;
+struct Effects { Regions reads, writes; bool observable = false; };
+using Summaries = std::map<const Function *, Effects>;
+
+// Pointer provenance is a union lattice. Distinct objects cannot overlap;
+// parameters may alias each other or globals, but not this frame's locals.
+std::vector<Regions> provenance(const FunctionIR &f) {
+  std::vector<Regions> roots(f.values.size());
+  bool changed;
+  do {
+    changed = false;
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+      if (i.result < 0 || f.values[i.result] != ValueType::Pointer) continue;
+      auto next = roots[i.result];
+      if (i.op == Op::Address) next.insert(i.symbol);
+      else if (i.op == Op::Parameter) next.insert(f.source->parameters.at(i.immediate).symbol);
+      else if (i.op == Op::Offset || i.op == Op::Move) next.insert(roots[i.args[0]].begin(), roots[i.args[0]].end());
+      else if (i.op == Op::Phi) for (int a : i.args) next.insert(roots[a].begin(), roots[a].end());
+      else next.insert(nullptr);
+      if (next != roots[i.result]) { roots[i.result] = std::move(next); changed = true; }
+    }
+  } while (changed);
+  for (size_t v = 0; v < roots.size(); ++v) if (f.values[v] == ValueType::Pointer && roots[v].empty()) roots[v].insert(nullptr);
+  return roots;
+}
+bool overlaps(const Regions &a, const Regions &b) {
+  for (auto x : a) for (auto y : b) {
+    if (!x || !y || x == y) return true;
+    bool localX = !x->global && !x->parameter, localY = !y->global && !y->parameter;
+    if (!localX && !localY && (x->parameter || y->parameter)) return true;
+  }
+  return false;
+}
+Effects callEffects(const Instruction &i, const std::vector<Regions> &roots, const Summaries &summaries) {
+  auto found = summaries.find(i.callee);
+  if (found == summaries.end()) return {{nullptr}, {nullptr}, true};
+  Effects result; result.observable = found->second.observable;
+  auto map = [&](const Regions &source, Regions &dest) {
+    for (auto s : source) {
+      if (s && s->parameter) {
+        auto p = std::find_if(i.callee->parameters.begin(), i.callee->parameters.end(), [&](const Variable &v) { return v.symbol == s; });
+        if (p == i.callee->parameters.end()) { dest.insert(nullptr); continue; }
+        const auto &actual = roots.at(i.args.at(p - i.callee->parameters.begin()));
+        dest.insert(actual.begin(), actual.end());
+      } else dest.insert(s);
+    }
+  };
+  map(found->second.reads, result.reads); map(found->second.writes, result.writes);
+  return result;
+}
+Summaries summarize(const ModuleIR &module) {
+  Summaries summaries;
+  std::map<const Function *, std::vector<Regions>> roots;
+  for (const auto &f : module.functions) { summaries[f.source] = {}; roots[f.source] = provenance(f); }
+  bool changed;
+  do {
+    changed = false;
+    for (const auto &f : module.functions) {
+      Effects next; const auto &pointers = roots.at(f.source);
+      auto merge = [](const Regions &from, Regions &to) {
+        for (auto s : from) if (!s || s->global || s->parameter) to.insert(s);
+      };
+      for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+        if (i.op == Op::Load) merge(pointers[i.args[0]], next.reads);
+        if (i.op == Op::Store || i.op == Op::Zero) merge(pointers[i.args[0]], next.writes);
+        if (i.op == Op::Call) {
+          auto e = callEffects(i, pointers, summaries);
+          merge(e.reads, next.reads); merge(e.writes, next.writes); next.observable |= e.observable;
+        }
+      }
+      auto &old = summaries[f.source];
+      if (next.reads != old.reads || next.writes != old.writes || next.observable != old.observable) {
+        old = std::move(next); changed = true;
+      }
+    }
+  } while (changed);
+  return summaries;
+}
+bool constantCall(const Instruction &i, const Summaries &summaries) {
+  auto found = summaries.find(i.callee);
+  return i.op == Op::Call && found != summaries.end() && !found->second.observable && found->second.reads.empty() && found->second.writes.empty();
+}
+
 void ssa(FunctionIR &f) {
   if (f.ssa) return;
   Graph graph(f);
@@ -134,7 +217,7 @@ void inlineCalls(ModuleIR &module) {
   for (const auto &f : module.functions) {
     size_t count = 0; bool leaf = true;
     for (const auto &b : f.blocks) for (const auto &i : b.instructions) { ++count; leaf &= i.op != Op::Call; }
-    if (leaf && count <= 80 && f.blocks.size() <= 12) candidates.emplace(f.source, f);
+    if (leaf && count <= 160 && f.blocks.size() <= 24) candidates.emplace(f.source, f);
   }
   for (auto &f : module.functions) {
     size_t budget = 3000;
@@ -144,6 +227,7 @@ void inlineCalls(ModuleIR &module) {
       if (at == code.end() || budget == 0) continue;
       Instruction call = *at; const auto &callee = candidates.at(call.callee);
       size_t cost = 0; for (const auto &block : callee.blocks) cost += block.instructions.size();
+      if (cost > 80 && loopDepth(f)[b] == 0) continue;
       if (cost > budget) continue;
       budget -= cost;
       std::vector<Instruction> before(code.begin(), at), after(at + 1, code.end());
@@ -222,6 +306,8 @@ std::optional<int64_t> fold(const Instruction &i, const FunctionIR &f, const std
   case Op::Add: return static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(b));
   case Op::Sub: return static_cast<int32_t>(static_cast<uint32_t>(a) - static_cast<uint32_t>(b));
   case Op::Mul: return static_cast<int32_t>(static_cast<uint32_t>(a) * static_cast<uint32_t>(b));
+  case Op::And: return a & b;
+  case Op::Shr: return static_cast<int32_t>(static_cast<uint32_t>(a) >> (b & 31));
   case Op::Div: case Op::Rem:
     if (b == 0) return {};
     if (a == INT32_MIN && b == -1) return i.op == Op::Div ? INT32_MIN : 0;
@@ -341,7 +427,7 @@ void sccp(FunctionIR &f) {
   }
 }
 
-void gvn(FunctionIR &f) {
+void gvn(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
   Graph graph(f); std::vector<int> aliases(f.values.size());
   for (size_t v = 0; v < aliases.size(); ++v) aliases[v] = v;
@@ -351,7 +437,7 @@ void gvn(FunctionIR &f) {
     for (auto &i : f.blocks[b].instructions) {
       for (int &a : i.args) a = root(aliases, a);
       if (i.op == Op::Store) { memory.clear(); memory[i.args[0]] = i.args[1]; }
-      if (i.op == Op::Zero || i.op == Op::Call) memory.clear();
+      if (i.op == Op::Zero || (i.op == Op::Call && !constantCall(i, summaries))) memory.clear();
       if (i.result < 0) continue;
       if (i.op == Op::Move) { aliases[i.result] = i.args[0]; continue; }
       if (i.op == Op::Load) {
@@ -360,9 +446,9 @@ void gvn(FunctionIR &f) {
         else memory[i.args[0]] = i.result;
         continue;
       }
-      if (i.op == Op::Phi || i.op == Op::Parameter || i.op == Op::Call) continue;
+      if (i.op == Op::Phi || i.op == Op::Parameter || (i.op == Op::Call && !constantCall(i, summaries))) continue;
       std::ostringstream key;
-      key << static_cast<int>(i.op) << ':' << static_cast<int>(f.values[i.result]) << ':' << i.immediate << ':' << i.symbol << ':' << i.text;
+      key << static_cast<int>(i.op) << ':' << static_cast<int>(f.values[i.result]) << ':' << i.immediate << ':' << i.symbol << ':' << i.callee << ':' << i.text;
       auto args = i.args;
       if (args.size() == 2 && (i.op == Op::Eq || i.op == Op::Ne ||
           ((i.op == Op::Add || i.op == Op::Mul) && f.values[i.result] == ValueType::Int)) && args[0] > args[1]) std::swap(args[0], args[1]);
@@ -380,6 +466,60 @@ void gvn(FunctionIR &f) {
 }
 
 struct Loop { int header; std::set<int> blocks; };
+
+void memoryForward(FunctionIR &f, const Summaries &summaries) {
+  if (!f.ssa) return;
+  Graph graph(f); auto roots = provenance(f);
+  using Key = std::pair<int, ValueType>;
+  using State = std::map<Key, int>;
+  std::vector<State> in(f.blocks.size()), out(f.blocks.size());
+  auto transfer = [&](int b, State state) {
+    auto invalidate = [&](const Regions &writes) {
+      for (auto it = state.begin(); it != state.end();)
+        if (overlaps(roots[it->first.first], writes)) it = state.erase(it); else ++it;
+    };
+    for (const auto &i : f.blocks[b].instructions) {
+      if (i.op == Op::Store || i.op == Op::Zero) invalidate(roots[i.args[0]]);
+      if (i.op == Op::Call) invalidate(callEffects(i, roots, summaries).writes);
+      if (i.op == Op::Store) state[{i.args[0], f.values[i.args[1]]}] = i.args[1];
+      if (i.op == Op::Load) state.emplace(Key{i.args[0], f.values[i.result]}, i.result);
+    }
+    return state;
+  };
+  bool changed;
+  do {
+    changed = false;
+    for (int b : graph.order) {
+      State available;
+      if (b != 0 && !graph.pred[b].empty()) {
+        available = out[graph.pred[b][0]];
+        for (int p : graph.pred[b]) for (auto it = available.begin(); it != available.end();) {
+          auto other = out[p].find(it->first);
+          if (other == out[p].end() || other->second != it->second) it = available.erase(it); else ++it;
+        }
+      }
+      auto next = transfer(b, available);
+      if (next != out[b] || available != in[b]) { in[b] = std::move(available); out[b] = std::move(next); changed = true; }
+    }
+  } while (changed);
+  for (int b : graph.order) {
+    auto state = in[b];
+    auto invalidate = [&](const Regions &writes) {
+      for (auto it = state.begin(); it != state.end();)
+        if (overlaps(roots[it->first.first], writes)) it = state.erase(it); else ++it;
+    };
+    for (auto &i : f.blocks[b].instructions) {
+      if (i.op == Op::Store || i.op == Op::Zero) invalidate(roots[i.args[0]]);
+      if (i.op == Op::Call) invalidate(callEffects(i, roots, summaries).writes);
+      if (i.op == Op::Store) state[{i.args[0], f.values[i.args[1]]}] = i.args[1];
+      if (i.op == Op::Load) {
+        auto inserted = state.emplace(Key{i.args[0], f.values[i.result]}, i.result);
+        if (!inserted.second && inserted.first->second != i.result) { i.op = Op::Move; i.args = {inserted.first->second}; }
+      }
+    }
+  }
+}
+
 std::vector<Loop> loops(const Graph &graph) {
   std::map<int, std::set<int>> headers;
   for (int tail : graph.order) for (int h : graph.succ[tail]) if (graph.dominates(h, tail)) {
@@ -397,7 +537,358 @@ std::vector<Loop> loops(const Graph &graph) {
   return result;
 }
 
-void licm(FunctionIR &f) {
+void rotate(FunctionIR &f) {
+  if (!f.ssa) return;
+  auto nests = loops(Graph(f));
+  for (const auto &original : nests) {
+    Graph graph(f);
+    auto current = loops(graph);
+    auto found = std::find_if(current.begin(), current.end(), [&](const Loop &l) { return l.header == original.header; });
+    if (found == current.end()) continue;
+    const auto loop = *found;
+    const auto code = f.blocks[loop.header].instructions;
+    if (code.size() < 2) continue;
+    const auto compare = code[code.size()-2], branch = code.back();
+    if (branch.op != Op::Branch || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise) ||
+        compare.result != branch.args[0] || compare.op < Op::Eq || compare.op > Op::Ge) continue;
+    bool valid = true;
+    for (size_t n = 0; n+2 < code.size(); ++n) valid &= code[n].op == Op::Phi && code[n].edges.size() == 2;
+    int entry = -1, latch = -1;
+    for (int p : graph.pred[loop.header]) (loop.blocks.count(p) ? latch : entry) = p;
+    int body = branch.target, exit = branch.otherwise;
+    valid &= entry >= 0 && latch >= 0 && graph.pred[loop.header].size() == 2 && graph.succ[entry].size() == 1 &&
+        graph.pred[body].size() == 1 && graph.pred[exit].size() == 1;
+    for (int b : loop.blocks) {
+      valid &= f.blocks[b].instructions.back().op != Op::Return;
+      for (int s : graph.succ[b]) if (!loop.blocks.count(s)) valid &= s == exit;
+    }
+    if (!valid) continue;
+    // Comparisons may only feed the loop test. The general case requires a
+    // second value Phi for the cloned comparison, so leave it untouched.
+    int uses = 0;
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions) for (int a : i.args) uses += a == compare.result;
+    if (uses != 1) continue;
+    std::map<int, int> initial, back, after;
+    for (size_t n = 0; n+2 < code.size(); ++n) {
+      const auto &phi = code[n]; int outside = phi.edges[0] == entry ? 0 : 1;
+      initial[phi.result] = phi.args[outside]; back[phi.result] = phi.args[1-outside];
+    }
+    // A comparison operand must be a header Phi or a dominating invariant.
+    for (int a : compare.args) if (!initial.count(a)) {
+      for (size_t n = 0; n+2 < code.size(); ++n) valid &= code[n].result != a;
+    }
+    if (!valid) continue;
+    int preheader = f.blocks.size(); Instruction jump{Op::Jump}; jump.target = body;
+    f.blocks.push_back({"rotated.preheader", {jump}});
+    auto first = compare; first.result = newValue(f, ValueType::Int);
+    for (int &a : first.args) if (initial.count(a)) a = initial.at(a);
+    auto guard = branch; guard.args = {first.result}; guard.target = preheader;
+    auto &enter = f.blocks[entry].instructions; enter.back() = first; enter.push_back(guard);
+    std::vector<Instruction> phis;
+    for (size_t n = 0; n+2 < code.size(); ++n) {
+      const auto &old = code[n]; auto phi = old;
+      phi.edges = {preheader, loop.header}; phi.args = {initial.at(old.result), back.at(old.result)}; phis.push_back(phi);
+      auto final = phi; final.result = newValue(f, f.values[old.result]); final.edges = {entry, loop.header};
+      after[old.result] = final.result; f.blocks[exit].instructions.insert(f.blocks[exit].instructions.begin(), final);
+    }
+    auto &bodyCode = f.blocks[body].instructions; bodyCode.insert(bodyCode.begin(), phis.begin(), phis.end());
+    auto last = compare; for (int &a : last.args) if (back.count(a)) a = back.at(a);
+    f.blocks[loop.header].instructions = {last, branch};
+    for (size_t b = 0; b < f.blocks.size(); ++b) if (!loop.blocks.count(b) && static_cast<int>(b) != entry && static_cast<int>(b) != preheader) {
+      for (auto &i : f.blocks[b].instructions) {
+        if (static_cast<int>(b) == exit && i.op == Op::Phi && std::any_of(after.begin(), after.end(), [&](auto pair) { return pair.second == i.result; })) continue;
+        for (int &a : i.args) if (after.count(a)) a = after.at(a);
+      }
+    }
+  }
+}
+
+void unrollRuntime(FunctionIR &f, int h, int test, const std::vector<Instruction> &body,
+    const std::vector<Instruction> &phis, size_t first, int iv, const Instruction &compare) {
+  Graph graph(f);
+  int pre = -1;
+  for (int p : graph.pred[h]) if (p != test) pre = p;
+  if (pre < 0 || graph.succ[pre].size() != 1 || body.size()-first-1 > 32) return;
+  int bound = compare.args[1], site = -1;
+  for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions) if (i.result == bound) site = b;
+  if (site < 0 || !graph.dominates(site, pre)) return;
+  for (const auto &i : body) if (i.op == Op::Call) return;
+  for (const auto &phi : phis) if (phi.edges.size() != 2 || std::find(phi.edges.begin(), phi.edges.end(), pre) == phi.edges.end()) return;
+  int main = f.blocks.size(), check = main+1, gate = main+2;
+  int exit = f.blocks[test].instructions.back().otherwise;
+  std::map<int, int> remap, initial, carried, gateState;
+  auto value = [&](int v) { auto it = remap.find(v); return it == remap.end() ? v : it->second; };
+  std::vector<Instruction> mainPhis, mainCode, gateCode;
+  for (const auto &old : phis) {
+    int edge = old.edges[0] == pre ? 0 : 1;
+    initial[old.result] = old.args[edge]; carried[old.result] = old.args[1-edge];
+    auto phi = old; phi.result = newValue(f, f.values[old.result]); phi.edges = {pre, check}; phi.args = {old.args[edge], -1};
+    remap[old.result] = phi.result; mainPhis.push_back(phi);
+  }
+  for (int iteration = 0; iteration < 4; ++iteration) {
+    if (iteration) {
+      std::map<int, int> next;
+      for (auto pair : carried) next[pair.first] = value(pair.second);
+      for (auto pair : next) remap[pair.first] = pair.second;
+    }
+    for (size_t n = first; n+1 < body.size(); ++n) {
+      auto i = body[n]; for (int &a : i.args) a = value(a);
+      if (i.result >= 0) { int old = i.result; i.result = newValue(f, f.values[old]); remap[old] = i.result; }
+      mainCode.push_back(std::move(i));
+    }
+  }
+  for (size_t n = 0; n < phis.size(); ++n) {
+    mainPhis[n].args[1] = value(carried.at(phis[n].result));
+    Instruction phi{Op::Phi}; phi.result = newValue(f, f.values[phis[n].result]);
+    phi.edges = {pre, check}; phi.args = {initial.at(phis[n].result), mainPhis[n].args[1]};
+    gateState[phis[n].result] = phi.result; gateCode.push_back(phi);
+  }
+  // Loop-closed values select the final unrolled result when there is no tail.
+  for (auto &phi : f.blocks[exit].instructions) if (phi.op == Op::Phi) {
+    auto edge = std::find(phi.edges.begin(), phi.edges.end(), test);
+    if (edge == phi.edges.end()) continue;
+    size_t n = edge-phi.edges.begin(), other = n == 0 ? 1 : 0;
+    Instruction result{Op::Phi}; result.result = newValue(f, f.values[phi.result]); result.edges = {pre, check};
+    result.args = {phi.args[other], value(phi.args[n])}; gateCode.push_back(result);
+    phi.edges.push_back(gate); phi.args.push_back(result.result);
+  }
+  for (auto &phi : f.blocks[h].instructions) if (phi.op == Op::Phi) for (size_t n = 0; n < phi.edges.size(); ++n) if (phi.edges[n] == pre) {
+    phi.edges[n] = gate; phi.args[n] = gateState.at(phi.result);
+  }
+  // The rotated entry guard proves bound > initial >= 0. bound-4 therefore
+  // cannot wrap; each main iteration has four valid scalar iterations.
+  Instruction four{Op::Constant}; four.result = newValue(f, ValueType::Int); four.immediate = 4;
+  Instruction threshold{Op::Sub}; threshold.result = newValue(f, ValueType::Int); threshold.args = {bound, four.result};
+  Instruction enough{Op::Le}; enough.result = newValue(f, ValueType::Int); enough.args = {initial.at(iv), threshold.result};
+  Instruction enter{Op::Branch}; enter.args = {enough.result}; enter.target = main; enter.otherwise = gate;
+  auto &preCode = f.blocks[pre].instructions; preCode.pop_back();
+  preCode.insert(preCode.end(), {four, threshold, enough, enter});
+  Instruction jump{Op::Jump}; jump.target = check;
+  mainPhis.insert(mainPhis.end(), mainCode.begin(), mainCode.end()); mainPhis.push_back(jump);
+  auto again = enough; again.result = newValue(f, ValueType::Int); again.args[0] = value(carried.at(iv));
+  auto repeat = enter; repeat.args = {again.result};
+  auto tail = compare; tail.result = newValue(f, ValueType::Int); tail.args[0] = gateState.at(iv);
+  auto remainder = enter; remainder.args = {tail.result}; remainder.target = h; remainder.otherwise = exit;
+  gateCode.push_back(tail); gateCode.push_back(remainder);
+  f.blocks.push_back({"unroll.main", std::move(mainPhis)});
+  f.blocks.push_back({"unroll.test", {again, repeat}});
+  f.blocks.push_back({"unroll.tail", std::move(gateCode)});
+}
+
+void unroll(FunctionIR &f) {
+  if (!f.ssa) return;
+  auto nests = loops(Graph(f));
+  for (const auto &loop : nests) {
+    if (loop.blocks.size() != 2) continue;
+    Graph graph(f); auto defs = definitions(f);
+    int h = loop.header; const auto body = f.blocks[h].instructions;
+    if (body.back().op != Op::Jump) continue;
+    int test = body.back().target;
+    if (test == h || !loop.blocks.count(test)) continue;
+    const auto &condition = f.blocks[test].instructions;
+    if (condition.size() != 2 || condition.back().op != Op::Branch || condition.back().target != h ||
+        loop.blocks.count(condition.back().otherwise)) continue;
+    const auto compare = condition[0];
+    if ((compare.op != Op::Lt && compare.op != Op::Le) || f.values[compare.args[0]] != ValueType::Int) continue;
+    auto limit = defs[compare.args[1]], update = defs[compare.args[0]];
+    if (!limit || !update || update->op != Op::Add) continue;
+    int iv = -1;
+    for (int n = 0; n < 2; ++n) {
+      auto step = defs[update->args[n]], phi = defs[update->args[1-n]];
+      if (step && step->op == Op::Constant && step->immediate == 1 && phi && phi->op == Op::Phi) iv = phi->result;
+    }
+    if (iv < 0) continue;
+    std::vector<Instruction> phis;
+    size_t first = 0;
+    while (first < body.size() && body[first].op == Op::Phi) phis.push_back(body[first++]);
+    auto induction = std::find_if(phis.begin(), phis.end(), [&](const Instruction &i) { return i.result == iv; });
+    if (induction == phis.end() || induction->edges.size() != 2) continue;
+    int incoming = induction->edges[0] == test ? 1 : 0;
+    auto start = defs[induction->args[incoming]];
+    if (!start || start->op != Op::Constant || induction->args[1-incoming] != update->result) continue;
+    if (limit->op != Op::Constant) {
+      if (compare.op == Op::Lt && start->immediate >= 0) unrollRuntime(f,h,test,body,phis,first,iv,compare);
+      continue;
+    }
+    int64_t end = limit->immediate + (compare.op == Op::Le);
+    int64_t trips = end - start->immediate;
+    if (trips <= 1 || end > INT32_MAX) continue;
+    size_t cost = body.size() - first - 1;
+    int factor = 1;
+    for (int candidate : {4, 3, 2, 5}) if (trips % candidate == 0 && cost * candidate <= 160) { factor = candidate; break; }
+    if (factor == 1 || std::any_of(body.begin()+first, body.end(), [](const Instruction &i) { return i.op == Op::Call; })) continue;
+    bool valid = true;
+    for (const auto &phi : phis) valid &= phi.edges.size() == 2 && std::find(phi.edges.begin(), phi.edges.end(), test) != phi.edges.end();
+    if (!valid) continue;
+    std::map<int, int> remap;
+    auto value = [&](int v) { auto it = remap.find(v); return it == remap.end() ? v : it->second; };
+    std::vector<Instruction> expanded(body.begin(), body.end()-1);
+    for (int iteration = 1; iteration < factor; ++iteration) {
+      std::map<int, int> carried;
+      for (const auto &phi : phis) {
+        size_t edge = std::find(phi.edges.begin(), phi.edges.end(), test) - phi.edges.begin();
+        carried[phi.result] = value(phi.args[edge]);
+      }
+      for (auto pair : carried) remap[pair.first] = pair.second;
+      for (size_t n = first; n+1 < body.size(); ++n) {
+        auto i = body[n]; for (int &a : i.args) a = value(a);
+        if (i.result >= 0) { int old = i.result; i.result = newValue(f, f.values[old]); remap[old] = i.result; }
+        expanded.push_back(std::move(i));
+      }
+    }
+    expanded.push_back(body.back());
+    for (auto &phi : expanded) if (phi.op == Op::Phi) for (size_t n = 0; n < phi.edges.size(); ++n) if (phi.edges[n] == test) phi.args[n] = value(phi.args[n]);
+    f.blocks[h].instructions = std::move(expanded);
+    for (size_t b = 0; b < f.blocks.size(); ++b) if (static_cast<int>(b) != h)
+      for (auto &i : f.blocks[b].instructions) for (int &a : i.args) a = value(a);
+  }
+}
+
+void tailRecursion(FunctionIR &f) {
+  if (!f.ssa || !f.objects.empty()) return;
+  struct Tail { int block; size_t position; Instruction call; };
+  std::vector<Tail> tails;
+  for (size_t b = 0; b < f.blocks.size(); ++b) {
+    const auto &code = f.blocks[b].instructions;
+    if (code.size() < 2) continue;
+    size_t pos = code.size()-2; const auto &call = code[pos];
+    if (call.op != Op::Call || call.callee != f.source) continue;
+    Instruction terminator = code.back(); std::set<int> seen;
+    while (terminator.op == Op::Jump && seen.insert(terminator.target).second) {
+      const auto &next = f.blocks[terminator.target].instructions;
+      if (next.size() != 1) break;
+      terminator = next.back();
+    }
+    if (terminator.op != Op::Return) continue;
+    bool valid = f.source->result == Base::Void ? terminator.args.empty() : terminator.args.size() == 1 && terminator.args[0] == call.result;
+    if (valid) tails.push_back({static_cast<int>(b), pos, call});
+  }
+  if (tails.empty()) return;
+  const auto entry = f.blocks[0].instructions;
+  int header = f.blocks.size();
+  std::vector<Instruction> parameters, body, phis;
+  for (auto i : entry) {
+    if (i.op != Op::Parameter) { body.push_back(i); continue; }
+    Instruction phi{Op::Phi}; phi.result = i.result;
+    i.result = newValue(f, f.values[i.result]); phi.args = {i.result}; phi.edges = {0};
+    for (const auto &tail : tails) { phi.args.push_back(tail.call.args.at(i.immediate)); phi.edges.push_back(tail.block == 0 ? header : tail.block); }
+    parameters.push_back(i); phis.push_back(phi);
+  }
+  for (auto &b : f.blocks) for (auto &i : b.instructions) {
+    if (i.target == 0) i.target = header;
+    if (i.otherwise == 0) i.otherwise = header;
+    for (int &edge : i.edges) if (edge == 0) edge = header;
+  }
+  phis.insert(phis.end(), body.begin(), body.end()); f.blocks.push_back({"tail.header", std::move(phis)});
+  for (const auto &tail : tails) {
+    auto &code = f.blocks[tail.block == 0 ? header : tail.block].instructions;
+    // Entry parameter instructions have moved out of a tail in block zero.
+    size_t position = tail.position;
+    if (tail.block == 0) position = tail.position + parameters.size() - std::count_if(entry.begin(), entry.begin()+tail.position, [](const Instruction &i) { return i.op == Op::Parameter; });
+    code.erase(code.begin()+position, code.end());
+    Instruction jump{Op::Jump}; jump.target = header; code.push_back(jump);
+  }
+  Instruction jump{Op::Jump}; jump.target = header; parameters.push_back(jump); f.blocks[0].instructions = std::move(parameters);
+}
+
+void arithmetic(FunctionIR &f) {
+  if (!f.ssa) return;
+  auto borrowed = definitions(f); std::vector<std::optional<Instruction>> defs(f.values.size());
+  for (size_t v = 0; v < defs.size(); ++v) if (borrowed[v]) defs[v] = *borrowed[v];
+  using Range = std::optional<std::pair<int64_t, int64_t>>;
+  std::vector<Range> ranges(f.values.size());
+  std::vector<int> sites(f.values.size(), -1);
+  for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions) if (i.result >= 0) {
+    sites[i.result] = b;
+    if (i.op == Op::Constant && f.values[i.result] == ValueType::Int) ranges[i.result] = {{i.immediate, i.immediate}};
+    if (i.op >= Op::Eq && i.op <= Op::Ge) ranges[i.result] = {{0, 1}};
+  }
+  Graph graph(f);
+  for (const auto &loop : loops(graph)) {
+    const auto &branch = f.blocks[loop.header].instructions.back();
+    if (branch.op != Op::Branch || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise)) continue;
+    auto compare = defs[branch.args[0]];
+    if (!compare || compare->op != Op::Lt) continue;
+    for (const auto &phi : f.blocks[loop.header].instructions) {
+      if (phi.op != Op::Phi || phi.result != compare->args[0] || phi.args.size() != 2 || f.values[phi.result] != ValueType::Int) continue;
+      int outside = loop.blocks.count(phi.edges[0]) ? 1 : 0;
+      if (loop.blocks.count(phi.edges[outside])) continue;
+      auto init = defs[phi.args[outside]], update = defs[phi.args[1-outside]];
+      if (!init || init->op != Op::Constant || init->immediate < 0 || !update || update->op != Op::Add ||
+          !graph.dominates(branch.target, sites[update->result])) continue;
+      int step = update->args[0] == phi.result ? update->args[1] : update->args[1] == phi.result ? update->args[0] : -1;
+      if (step < 0 || !defs[step] || defs[step]->op != Op::Constant || defs[step]->immediate != 1) continue;
+      auto limit = defs[compare->args[1]];
+      int64_t high = limit && limit->op == Op::Constant ? std::max(init->immediate, limit->immediate) : INT32_MAX;
+      ranges[phi.result] = {{init->immediate, high}};
+      // The update executes only on the true edge, where the old IV < INT_MAX.
+      ranges[update->result] = {{1, high}};
+    }
+  }
+  bool changed;
+  do {
+    changed = false;
+    for (size_t v = 0; v < defs.size(); ++v) {
+      if (!defs[v] || ranges[v] || f.values[v] != ValueType::Int) continue;
+      const auto &i = *defs[v]; Range next;
+      if (i.op == Op::Move) next = ranges[i.args[0]];
+      if (i.op == Op::Phi && !i.args.empty()) {
+        bool all = true; int64_t lo = INT32_MAX, hi = INT32_MIN;
+        for (int a : i.args) { if (!ranges[a]) { all = false; break; } lo = std::min(lo, ranges[a]->first); hi = std::max(hi, ranges[a]->second); }
+        if (all) next = {{lo, hi}};
+      }
+      if (i.op == Op::Add || i.op == Op::Sub || i.op == Op::Mul) {
+        auto a = ranges[i.args[0]], b = ranges[i.args[1]];
+        if (a && b) {
+          int64_t lo = 0, hi = 0;
+          if (i.op == Op::Add) { lo = a->first+b->first; hi = a->second+b->second; }
+          if (i.op == Op::Sub) { lo = a->first-b->second; hi = a->second-b->first; }
+          if (i.op == Op::Mul) {
+            int64_t p[] = {a->first*b->first,a->first*b->second,a->second*b->first,a->second*b->second};
+            lo = *std::min_element(p,p+4); hi = *std::max_element(p,p+4);
+          }
+          if (lo >= INT32_MIN && hi <= INT32_MAX) next = {{lo, hi}};
+        }
+      }
+      if (i.op == Op::Rem && defs[i.args[1]] && defs[i.args[1]]->op == Op::Constant) {
+        int64_t d = defs[i.args[1]]->immediate, magnitude = std::abs(d);
+        if (magnitude) next = {{ranges[i.args[0]] && ranges[i.args[0]]->first >= 0 ? 0 : 1-magnitude, magnitude-1}};
+      }
+      if (next) { ranges[v] = next; changed = true; }
+    }
+  } while (changed);
+  std::vector<bool> zeroTest(defs.size(), true);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) for (int a : i.args) {
+    bool test = (i.op == Op::Eq || i.op == Op::Ne) && i.args.size() == 2;
+    int other = test ? i.args[i.args[0] == a ? 1 : 0] : -1;
+    zeroTest[a] = zeroTest[a] && test && defs[other] && defs[other]->op == Op::Constant && defs[other]->immediate == 0;
+  }
+  for (auto &b : f.blocks) {
+    std::vector<Instruction> code;
+    for (auto i : b.instructions) {
+      if ((i.op == Op::Div || i.op == Op::Rem) && f.values[i.result] == ValueType::Int && defs[i.args[1]] && defs[i.args[1]]->op == Op::Constant) {
+        int64_t divisor = defs[i.args[1]]->immediate, magnitude = std::abs(divisor);
+        bool nonnegative = ranges[i.args[0]] && ranges[i.args[0]]->first >= 0;
+        bool power = magnitude && !(magnitude & (magnitude-1));
+        if (power && (nonnegative || (i.op == Op::Rem && zeroTest[i.result]))) {
+          Instruction c{Op::Constant}; c.result = newValue(f, ValueType::Int);
+          if (i.op == Op::Rem) c.immediate = magnitude-1;
+          else for (int64_t n = magnitude; n > 1; n >>= 1) ++c.immediate;
+          code.push_back(c); bool negative = divisor < 0 && i.op == Op::Div;
+          i.op = i.op == Op::Rem ? Op::And : Op::Shr; i.args[1] = c.result;
+          if (negative) {
+            int result = i.result; i.result = newValue(f, ValueType::Int); code.push_back(i);
+            Instruction negate{Op::Neg}; negate.result = result; negate.args = {i.result}; i = negate;
+          }
+        }
+      }
+      code.push_back(std::move(i));
+    }
+    b.instructions = std::move(code);
+  }
+}
+
+void licm(FunctionIR &f, const Summaries &summaries) {
   if (!f.ssa) return;
   auto nests = loops(Graph(f));
   for (const auto &original : nests) {
@@ -418,8 +909,11 @@ void licm(FunctionIR &f) {
     }
     std::vector<int> site(f.values.size(), -1);
     for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions) if (i.result >= 0) site[i.result] = b;
-    bool memory = false;
-    for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) memory |= i.op == Op::Store || i.op == Op::Zero || i.op == Op::Call;
+    auto roots = provenance(f); Regions writes;
+    for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) {
+      if (i.op == Op::Store || i.op == Op::Zero) writes.insert(roots[i.args[0]].begin(), roots[i.args[0]].end());
+      if (i.op == Op::Call) { auto e = callEffects(i, roots, summaries); writes.insert(e.writes.begin(), e.writes.end()); }
+    }
     bool changed;
     do {
       changed = false;
@@ -428,21 +922,24 @@ void licm(FunctionIR &f) {
         if (i.op == Op::Address) addresses[i.result] = {i.symbol, i.immediate};
       for (int b : loop.blocks) {
         auto &code = f.blocks[b].instructions;
+        bool priorEffect = false;
         for (size_t n = 0; n < code.size();) {
           auto &i = code[n]; bool movable = i.result >= 0 && !effect(i.op) && i.op != Op::Phi && i.op != Op::Parameter;
+          if (constantCall(i, summaries)) movable = b == loop.header && !priorEffect;
           for (int a : i.args) movable &= !loop.blocks.count(site[a]);
           if (i.op == Op::Load) {
             auto pointer = addresses[i.args[0]];
             // Speculate only fixed, valid object accesses, and only in a loop
             // with no writes or calls. Unknown addresses remain guarded.
-            movable &= !memory && pointer.first && pointer.second >= 0 &&
+            bool fixed = pointer.first && pointer.second >= 0 &&
                 !pointer.first->parameter && pointer.second / 4 < pointer.first->type.elements();
+            movable &= !overlaps(roots[i.args[0]], writes) && (fixed || (b == loop.header && !priorEffect));
           }
           if (movable) {
             site[i.result] = preheader; auto moved = std::move(i);
             code.erase(code.begin() + n);
             auto &pre = f.blocks[preheader].instructions; pre.insert(pre.end() - 1, std::move(moved)); changed = true;
-          } else ++n;
+          } else { priorEffect |= effect(i.op) && i.op != Op::Jump; ++n; }
         }
       }
     } while (changed);
@@ -582,6 +1079,21 @@ void strength(FunctionIR &f) {
 }
 } // namespace
 
+void printEffects(const ModuleIR &module, std::ostream &out) {
+  auto summaries = summarize(module);
+  for (const auto &f : module.functions) {
+    const auto &e = summaries.at(f.source);
+    auto regions = [&](const Regions &set) {
+      std::vector<std::string> names;
+      for (auto s : set) names.push_back(!s ? "unknown" : std::string(s->global ? "global:" : "argument:") + s->name);
+      std::sort(names.begin(), names.end());
+      out << '{'; for (size_t n = 0; n < names.size(); ++n) out << (n ? ", " : "") << names[n]; out << '}';
+    };
+    out << "function " << f.source->name << " reads="; regions(e.reads);
+    out << " writes="; regions(e.writes); out << " observable=" << (e.observable ? "yes" : "no") << '\n';
+  }
+}
+
 bool runAdvancedPass(ModuleIR &module, const std::string &name) {
   if (name == "globaldce") {
     std::map<const Function *, const FunctionIR *> functions;
@@ -604,13 +1116,20 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       throw std::runtime_error("inline must precede SSA construction");
     inlineCalls(module); return true;
   }
-  if (name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength") {
+  if (name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+    Summaries summaries;
+    if (name == "gvn" || name == "licm" || name == "memory") summaries = summarize(module);
     for (auto &f : module.functions) {
       if (name == "ssa") ssa(f);
       else if (name == "simplify") simplify(f);
       else if (name == "sccp") { sccp(f); repairPhi(f); }
-      else if (name == "gvn") gvn(f);
-      else if (name == "licm") licm(f);
+      else if (name == "gvn") gvn(f, summaries);
+      else if (name == "licm") licm(f, summaries);
+      else if (name == "memory") memoryForward(f, summaries);
+      else if (name == "rotate") rotate(f);
+      else if (name == "unroll") unroll(f);
+      else if (name == "tail") tailRecursion(f);
+      else if (name == "arith") arithmetic(f);
       else if (name == "compact") compact(f);
       else if (name == "strength") strength(f);
       else destroySSA(f);
