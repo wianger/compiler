@@ -36,10 +36,10 @@
 | 常量 | def-use SCCP、跨过程常量／返回摘要 | SCCP 已是工作队列。P1：常量参数专化与返回值摘要，须控制克隆增长及递归求解预算 |
 | 控制条件 | 边／位置约束：[LazyValueInfo](https://llvm.org/docs/doxygen/classllvm_1_1LazyValueInfo.html)、[CVP](https://llvm.org/docs/doxygen/CorrelatedValuePropagation_8cpp_source.html) | P0：分支作用域范围、惰性查询和比较消除。P1：KnownBits、同余与区间组成产品域，处理更多 Phi／汇合 |
 | 冗余计算 | phi translation、PRE：[NewGVN 工程记录](https://blog.llvm.org/posts/2024-09-01-reviving-newgvn/) | 已有支配 GVN，尚不能复用只在各前驱可用的不同值。P1：先做不新增执行的 Phi-of-Ops，再评估插入式 PRE |
-| 等价图 | congruence rebuilding、bounded saturation：[egg](https://arxiv.org/abs/2004.03082) | 已实现有限整数区域。P1：只提取 live-out、改善共享成本；先修提取质量再扩大搜索 |
+| 等价图 | congruence rebuilding、bounded saturation：[egg](https://arxiv.org/abs/2004.03082) | 已实现有限整数区域及 live-out 提取。P1：目标成本和压力反馈；先修提取质量再扩大搜索 |
 | 持久等价 | [AEGraph](https://cfallin.org/blog/2026/04/09/aegraph/)、[Persistent EGraphs，2026-08 修订](https://arxiv.org/abs/2602.16707) | P2：跨 PASS 保留替代项有价值，但内存版本、支配、作用域与循环需要独立协议；不能把局部协作遍历称为完整持久图 |
-| 图成本 | [e-boost，2025](https://arxiv.org/abs/2508.13020) 的 DAG 成本、剪枝与精确求解 | P1：借鉴共享计数与候选剪枝；P3：直接引入并行 ILP。当前区域很小，复杂求解器成本可能大于收益 |
-| 内存语义 | 字节 AA、Mod/Ref、MemorySSA：[AA](https://llvm.org/docs/AliasAnalysis.html)、[MemorySSA](https://llvm.org/docs/MemorySSA.html) | 已有对象＋字节分析和版本图。P1：跨 Phi 加载前向、字节级调用摘要及受预算的全路径 DSE |
+| 图成本 | [e-boost，2025](https://arxiv.org/abs/2508.13020) 的 DAG 成本、剪枝与精确求解 | 已借鉴跨 root 共享计数和有界候选搜索。P3：直接引入并行 ILP；现有启发式不保证全局最优 |
+| 内存语义 | 字节 AA、Mod/Ref、MemorySSA：[AA](https://llvm.org/docs/AliasAnalysis.html)、[MemorySSA](https://llvm.org/docs/MemorySSA.html) | 已有对象＋字节分析、版本图及完整写入路径的 Phi 前向。P1：复用路径加载、字节级调用摘要及受预算的全路径 DSE |
 | 标量替换 | 部分分区／逃逸感知 SROA：[SROA](https://llvm.org/doxygen/SROA_8cpp_source.html) | 当前动态访问拒绝整对象。P1：把固定、不受动态访问影响的分区单独提升，须证明未知访问与分区不重叠 |
 | 循环内存 | 必别名状态提升、出口存储：[LICM](https://llvm.org/doxygen/LICM_8cpp_source.html) | P0：补上有状态读写，不再仅限不变加载；支持多个出口，拒绝观察者和重叠访问 |
 | 循环形态 | preheader、dedicated exits、LCSSA：[Loop terminology](https://llvm.org/docs/LoopTerminology.html) | 已有自然循环／旋转。P1：统一规范化契约、循环出口值接口，降低各个变换重复处理边的成本 |
@@ -82,13 +82,15 @@ P1 的部分 SROA、跨 Phi 加载前向和 PRE 应以同一位置／类型／�
 
 ## 深入分析：等价发现、提取与持久化
 
-当前 EGraph 的树成本可能重复计算共享子式，且提取所有原始结果后再依赖 DCE 清除死值。扩大节点预算会加剧这一成本，不一定提高代码质量。优先实验应是 live-out roots、跨 root 的共享计数和有上界的候选比较，并记录目标展开后的实际指令、spill 和代码大小。
+EGraph 现先计算区域外使用，保持这些原始 SSA ID，删除仅在区域内使用的结果根。树成本给出无环起点，然后按所有 live-out 的共同依赖 DAG 计费：每个选中的等价类只计一次；候选若引入环就拒绝，只有总成本严格下降才采用。最多两轮、256 个替代候选和 65536 次依赖访问，耗尽后保留最后一个完整方案。常量／普通算术／乘法采用静态权重，尚未建模流水线、寄存器压力或全局最优；验收看目标展开后的指令和执行时间。
 
 [e-boost](https://arxiv.org/abs/2508.13020)区分树成本与 DAG 成本，并用启发式剪枝后做精确求解；其评估主要针对逻辑综合／验证，面积收益不能直接当作 RV64 运行收益。我们优先借鉴共享与剪枝，暂不增加 ILP 或并行求解依赖。
 
 [2026 年持久 EGraph 论文](https://arxiv.org/abs/2602.16707)把等价类保留在 IR 中，将选择与替换分开，允许多个成本模型接续使用；论文实现明确限制于纯直线片段，未探索结构化控制流。它的浮点准确度案例追求数值误差改善，并不等价于本项目的逐位严格计算。将这一机制扩展到我们的 CFG，需要支配／作用域协议、不可观察的纯操作、内存版本和退出表示；不能直接把加载、调用、Phi 都纳入原来局部整数图。
 
 [AEGraph 的工程说明](https://cfallin.org/blog/2026/04/09/aegraph/)则强调效果 CFG 与纯等价计算分离、按需求协作分析。本项目的 GVN／MemorySSA 即时协作只是其中一部分。可行的增量是先让范围与值编号共享接口，再以小整数区域验证持久化；每步都有旧路径回退。
+
+`memory` 新增内存 Phi 到值 Phi 的翻译：逐路径寻找完整覆盖且类型一致的 store，跳过已证不相交的写，并检查每个输入对对应前驱的支配。嵌套汇合可以生成嵌套值 Phi；相同输入直接折叠。未知入口、Zero、可能覆盖的调用／其他地址写入以及未解开的内存环使查询失败，回滚本次暂存的 Phi／Value ID，保留原 load。每函数最多 64 次候选查询、32 个新 Phi，解析每次 256 步、总共 8192 步；现有 clobber walker 自己的查询成本另计。只处理 Int/Float，不新增访存或地址计算。这个步骤与原来的支配遍历共享 AA／MemorySSA，插入 Phi 后用位置偏移映射回旧快照，并在同一次遍历中传播新结果。初版独立 PASS 的重复分析和额外验证已从默认管线移除。
 
 ## 深入分析：循环、tensor 与数据布局
 
@@ -132,11 +134,13 @@ CGO 2026 的[规则合成研究](https://db.in.tum.de/~drescher/paper-isel-syn.p
 |---|---|---|
 | 1 | 分析版本／作用域协议，KnownBits＋区间＋同余的小型产品域 | 负数、溢出、Phi、回边、比较反例；无新增投机；SMT 局部规则＋独立源模型 |
 | 2 | 多面体符号域与安全 alias 版本化 | 动态／零尺寸、同一缓冲与交叠子数组、端点溢出、triangular 域；guard 失败执行原版本 |
-| 3 | EGraph live-out／DAG 成本与目标压力预算 | 共享子式、多个结果、不同区域尺寸；比较提取后的 MIR／spill／运行成本，不能只数图节点 |
-| 4 | 无新增执行的 Phi-of-Ops、内存 Phi 前向、部分 SROA | 每个前驱独立的值与版本；调用／未知访问反例；随后才做插入式 PRE 和跨路径 DSE |
+| 3 | 已做 live-out／DAG；下一步是目标成本与压力预算 | 共享子式、多个结果、不同区域尺寸；比较提取后的 MIR／spill／运行成本，不能只数图节点 |
+| 4 | 已做完整 store 路径的内存 Phi 前向；下一步是路径 load、Phi-of-Ops、部分 SROA | 每个前驱独立的值与版本；调用／未知访问反例；随后才做插入式 PRE 和跨路径 DSE |
 | 5 | 区域拆分、使用位置约束、栈槽复用与块频率 | 高压力、调用、边复制环、varargs、冷分支；独立符号检查及压力模型，保留原分配对照 |
 | 6 | tensor footprint／producer-consumer／生存期 | 原地别名、快照、多消费者、严格浮点；只有消费顺序和写入可观察性证明成立才融合 |
 | 7 | 紧凑 AST／操作数池、函数级存储复用 | 普通 210 输入＋长表达式／大初始化／大函数；看总编译 CPU／RSS，而非只看容器大小 |
 | 8 | RVV、目标延迟模型或学习型调度 | 先确定 ISA／机器描述及独立负载；依赖类型、寄存器组与硬件验证，不在 GC 目标上伪实现 |
 
 采用门槛是正确性条件可审查、至少有独立样本上的稳定收益、原有负载不出现无法解释的明显退化，并记录编译／RSS／代码大小代价。拒绝的候选也保留实验依据，不用扩大测试名称相关启发式弥补。
+
+2026-10-15 增加了 [sysy-competition 的共同输入对照](Performance.md)：本项目的编译成本较低，运行耗时则在共同 44 个程序上明显落后，矩阵程序是例外。下一批实验应优先追踪排序／卷积／整数热路径的动态工作量与重复执行，建立跨过程对象／参数事实、符号域和有证明的循环状态简化；这些观测不能直接证明差距来自 RA，也不能仅因一次排序后结果不变就把一般函数认定为幂等。寄存器拆分、Phi 合并和调度仍需用实际 spill／热路径证据验收。已经有收益的 bounded DAG 和内存 Phi 作为基础保留，不据此扩大图预算或声称整体性能已经接近对照。

@@ -726,10 +726,14 @@ struct MemorySSA {
   }
 };
 
-void memoryForward(FunctionIR &f, const Summaries &summaries) {
+std::vector<size_t> forwardMemoryPhis(FunctionIR &f, const AliasAnalysis &alias, const MemorySSA &memory);
+void memoryForward(FunctionIR &f, const Summaries &summaries, bool phiForward = true) {
   if (!f.ssa) return;
   const auto &graph = controlFlow(f); AliasAnalysis alias(f); const auto &roots = alias.roots;
   MemorySSA memory(f, summaries, alias);
+  // The value-phi phase changes reads, never memory definitions or topology.
+  // Keep the shared snapshot and translate its positions past inserted phis.
+  auto inserted = phiForward ? forwardMemoryPhis(f,alias,memory) : std::vector<size_t>(f.blocks.size(),0);
   using Key = std::tuple<PointerLocation, ValueType, int>;
   std::map<Key, int> loads;
   std::map<std::string, int> calls;
@@ -744,14 +748,14 @@ void memoryForward(FunctionIR &f, const Summaries &summaries) {
       for (int &a : i.args) a = root(aliases,a);
       if (i.op == Op::Load) {
         uint64_t size = accessSize(f.values[i.result]);
-        int version = memory.clobber(memory.before[b][n], roots[i.args[0]], i.args[0], size);
+        int version = memory.clobber(memory.before[b][n-inserted[b]], roots[i.args[0]], i.args[0], size);
         Key key{alias.locations[i.args[0]], f.values[i.result], version}; int available = -1;
         auto previous = loads.find(key);
         if (previous != loads.end()) available = previous->second;
         const auto &node = memory.nodes[version];
         if (available < 0 && node.kind == MemoryNode::Def && graph.dominates(node.block, b) &&
-            (node.block != b || node.position < static_cast<int>(n))) {
-          const auto &store = f.blocks[node.block].instructions[node.position];
+            (node.block != b || node.position+inserted[b] < n)) {
+          const auto &store = f.blocks[node.block].instructions[node.position+inserted[node.block]];
           if (store.op == Op::Store && alias.covers(store.args[0],accessSize(f.values[store.args[1]]),i.args[0],size) &&
               f.values[store.args[1]] == f.values[i.result]) available = store.args[1];
         }
@@ -760,7 +764,7 @@ void memoryForward(FunctionIR &f, const Summaries &summaries) {
       } else if (i.op == Op::Call && i.result >= 0) {
         auto e = callEffects(i, roots, summaries);
         if (e.observable || !e.writes.empty()) continue;
-        std::ostringstream text; text << i.callee << ':' << memory.clobber(memory.before[b][n], e.reads);
+        std::ostringstream text; text << i.callee << ':' << memory.clobber(memory.before[b][n-inserted[b]], e.reads);
         for (int a : i.args) text << ':' << a;
         auto key = text.str(); auto previous = calls.find(key);
         if (previous != calls.end()) aliases[i.result] = root(aliases,previous->second);
@@ -786,6 +790,90 @@ void memoryForward(FunctionIR &f, const Summaries &summaries) {
       i.op = Op::Move; i.args = {root(aliases,i.result)}; i.edges.clear(); i.callee = nullptr;
     }
   }
+}
+
+// Translate memory phis into value phis only when every incoming memory state
+// supplies a full, exactly typed store. No load, address or computation is
+// inserted on a predecessor. Unknown clobbers and unresolved cycles fail closed.
+std::vector<size_t> forwardMemoryPhis(FunctionIR &f, const AliasAnalysis &alias, const MemorySSA &memory) {
+  std::vector<size_t> inserted(f.blocks.size(),0);
+  if (!f.ssa) return inserted;
+  bool load = false, store = false;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+    load |= i.op == Op::Load; store |= i.op == Op::Store;
+  }
+  if (!load || !store) return inserted;
+  const auto &graph = controlFlow(f);
+  if (std::none_of(graph.pred.begin(),graph.pred.end(),[](const auto &p) { return p.size() > 1; })) return inserted;
+  std::vector<int> definition(f.values.size(),-1);
+  std::vector<int> position(f.values.size(),-1);
+  for (size_t b = 0; b < f.blocks.size(); ++b) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
+    int result = f.blocks[b].instructions[n].result;
+    if (result >= 0) { definition[result] = b; position[result] = n; }
+  }
+  struct Pending { int block; Instruction phi; };
+  std::vector<Pending> pending;
+  size_t budget = 8192, queries = 0;
+  for (int b : graph.order) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
+    auto &i = f.blocks[b].instructions[n];
+    if (i.op != Op::Load || !budget || queries >= 64 || pending.size() >= 32 ||
+        (f.values[i.result] != ValueType::Int && f.values[i.result] != ValueType::Float)) continue;
+    int pointer = i.args[0]; ValueType type = f.values[i.result]; uint64_t size = accessSize(type);
+    int clobber = memory.clobber(memory.before[b][n],alias.roots[pointer],pointer,size);
+    if (memory.nodes[clobber].kind != MemoryNode::Phi) continue;
+    ++queries; size_t steps = 256, checkpoint = pending.size(), values = f.values.size();
+    std::map<int,int> known;
+    std::function<int(int)> resolve = [&](int version) -> int {
+      if (!budget || !steps) return -1;
+      --budget; --steps;
+      auto found = known.find(version);
+      if (found != known.end()) return found->second;
+      known[version] = -1; // An active recursion is an unresolved memory cycle.
+      const auto &node = memory.nodes[version]; int value = -1;
+      if (node.kind == MemoryNode::Def) {
+        bool conflict = node.pointer >= 0 ? alias.mayAlias(pointer,size,node.pointer,node.size) :
+                                           overlaps(node.writes,alias.roots[pointer]);
+        if (!conflict) value = resolve(node.previous);
+        else {
+          const auto &write = f.blocks[node.block].instructions[node.position];
+          if (write.op == Op::Store && f.values[write.args[1]] == type &&
+              alias.covers(write.args[0],accessSize(type),pointer,size)) value = write.args[1];
+        }
+      } else if (node.kind == MemoryNode::Phi) {
+        Instruction phi{Op::Phi}; phi.edges = graph.pred[node.block];
+        for (size_t edge = 0; edge < node.inputs.size(); ++edge) {
+          int incoming = resolve(node.inputs[edge]);
+          if (incoming < 0 || definition[incoming] < 0 ||
+              !graph.dominates(definition[incoming],phi.edges[edge])) return -1;
+          phi.args.push_back(incoming);
+        }
+        if (!phi.args.empty()) {
+          value = phi.args.front();
+          if (!std::all_of(phi.args.begin(),phi.args.end(),[&](int a) { return a == value; })) {
+            if (pending.size() >= 32) return -1;
+            value = phi.result = f.values.size(); f.values.push_back(type);
+            definition.push_back(node.block); position.push_back(-1);
+            pending.push_back({node.block,std::move(phi)});
+          }
+        }
+      }
+      return known[version] = value;
+    };
+    int value = resolve(memory.before[b][n]);
+    if (value >= 0 && definition[value] >= 0 && graph.dominates(definition[value],b) &&
+        (definition[value] != b || position[value] < static_cast<int>(n))) {
+      i.op = Op::Move; i.args = {value};
+    } else {
+      pending.erase(pending.begin()+checkpoint,pending.end()); f.values.resize(values);
+      definition.resize(values); position.resize(values);
+    }
+  }
+  // Preserve instruction positions in the memory snapshot until all queries
+  // finish. Each pending phi has already passed the predecessor dominance check.
+  for (auto &p : pending) {
+    ++inserted[p.block]; f.blocks[p.block].instructions.insert(f.blocks[p.block].instructions.begin(),std::move(p.phi));
+  }
+  return inserted;
 }
 
 // Bound local DSE work independently of source size. Each retained later write
@@ -1620,9 +1708,9 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       throw std::runtime_error("inline must precede SSA construction");
     inlineCalls(module); return true;
   }
-  if (name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
-    if (name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "dse") summaries = summarize(module);
+    if (name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse") summaries = summarize(module);
     for (auto &f : module.functions) {
       if (name == "loop-promote") promoteLoopMemory(f,summaries);
       else if (name == "sroa") scalarReplace(f);
@@ -1635,6 +1723,9 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       else if (name == "gvn") gvn(f, summaries);
       else if (name == "licm") licm(f, summaries);
       else if (name == "memory") memoryForward(f, summaries);
+      else if (name == "memory-basic") memoryForward(f, summaries,false);
+      else if (name == "memory-phi" && f.ssa) { AliasAnalysis alias(f); MemorySSA memory(f,summaries,alias); forwardMemoryPhis(f,alias,memory); }
+      else if (name == "memory-phi") {}
       else if (name == "rotate") rotate(f);
       else if (name == "unroll") unroll(f);
       else if (name == "tail") tailRecursion(f);

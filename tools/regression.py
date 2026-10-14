@@ -652,6 +652,93 @@ def main():
           sum=sum+x/8+x%8;if(x>=0){{x=x*1664525+1013904223;sum=sum+x/8+x%8;}}
           putf("%d %d\\n",sum,x);return 0;}}''',f"{total} {x}\n0\n")
         (directory / f"{name}.in").write_text(f"{original}\n")
+    # Memory joins: missing writes, nested joins, recursive Mod/Ref, aliases and
+    # dynamic offsets must all preserve the source's reaching memory contents.
+    for case in range(48):
+        x = [-2147483648,-17,-1,0,1,2147483647][case%6]
+        same,index,mode = case%2,[0,2,7][case%3],case//6
+        a = [wrap(x+j) for j in range(8)]
+        b = a if same else [wrap(31-j) for j in range(8)]
+        yes = x > 0
+        left = "a[2]=x+17;"; right = "a[2]=x*31;"
+        if mode == 1: right = "a[3]=x*31;"
+        if mode == 2: right = "if(x%3==0)a[2]=x+3;else a[2]=x-7;"
+        if yes: a[2] = wrap(x+17)
+        elif mode == 1: a[3] = wrap(x*31)
+        elif mode == 2: a[2] = wrap(x+3 if remainder(x,3)==0 else x-7)
+        else: a[2] = wrap(x*31)
+        suffix = ""
+        if mode in (3,4):
+            suffix = "touch(b,2);";b[2] = wrap(b[2]+7)
+        if mode == 5:
+            suffix = "b[index]=x+99;";b[index] = wrap(x+99)
+        if mode == 6:
+            suffix = "int seen=observe(a,2);touch(b,2);a[4]=seen;"
+            seen=a[2];b[2]=wrap(b[2]+7);a[4]=seen
+        if mode == 7:
+            suffix = "int j=0;while(j<index){if(j%2==0)a[2]=a[2]+j;else b[2]=x-j;j=j+1;}"
+            for j in range(index):
+                if j%2 == 0: a[2]=wrap(a[2]+j)
+                else: b[2]=wrap(x-j)
+        name = f"memory_phi_{case:02d}"
+        source = f'''void touch(int p[],int n){{if(n)touch(p,n-1);else p[2]=p[2]+7;}}
+          int observe(int p[],int n){{if(n)return observe(p,n-1);return p[2];}}
+          int calc(int a[],int b[],int x,int index,int depth){{if(depth)return calc(a,b,x,index,depth-1);
+            if(x>0){{{left}}}else{{{right}}}{suffix}return a[2]+a[3]+a[4]+b[2];}}
+          int main(){{int x=getint();int index=getint();int a[8];int b[8];int i=0;
+            while(i<8){{a[i]=x+i;b[i]=31-i;i=i+1;}}
+            putint(calc(a,{ 'a' if same else 'b' },x,index,2));putch(32);putarray(8,a);return 0;}}'''
+        cases[name] = (source,f"{wrap(a[2]+a[3]+a[4]+b[2])} 8: "+" ".join(map(str,a))+"\n0\n")
+        (directory / f"{name}.in").write_text(f"{x} {index}\n")
+    for width in (1,8,40):
+        for positive in (False,True):
+            x = 2147483647 if positive else -2147483648
+            left = "".join(f"a[{j}]=x*{j*3+1};" for j in range(width))
+            right = "".join(f"a[{j}]=x*{j*7+3};" for j in range(width))
+            selected = [wrap(x*(j*3+1 if positive else j*7+3)) for j in range(width)]
+            name = f"memory_phi_budget_{width}_{int(positive)}"
+            cases[name] = (f'''int observe(int p[],int n){{if(n)return observe(p,n-1);return p[0];}}
+              int main(){{int x=getint();int a[{width}]={{}};if(x>0){{{left}}}else{{{right}}}
+              int sum={'+'.join(f'a[{j}]' for j in range(width))};
+              putf("%d %d\\n",sum,observe(a,2));return 0;}}''',f"{wrap(sum(selected))} {selected[0]}\n0\n")
+            (directory / f"{name}.in").write_text(f"{x}\n")
+    for negative in (False,True):
+        name = f"memory_phi_float_{int(negative)}"
+        cases[name] = ('''float a[2];int main(){int x=getint();float z=getfloat();
+          if(x<0)a[0]=-z;else a[0]=z;if(x%2)a[1]=z/z;else a[1]=3.5;
+          putf("%f %f\\n",a[0],a[1]);return 0;}''',
+          ("-0.000000 nan" if negative else "0.000000 3.500000")+"\n0\n")
+        (directory / f"{name}.in").write_text(f"{'-1' if negative else '0'} 0\n")
+    # Pure integer DAGs with several observable roots, effects, Phi edges and
+    # regions exceeding the extraction budget. Model each source operation in
+    # Python's unbounded integers, reducing after each operation.
+    equality_rng = random.Random(20261016)
+    for case in range(24):
+        inputs = [equality_rng.choice(numerators) for _ in range(4)]
+        values = inputs[:]
+        declarations = [f"int v{i}=getint();" for i in range(4)]
+        for group in range(8 if case < 20 else 90):
+            a,b,c = equality_rng.sample(range(len(values)),3)
+            first = len(values)
+            expressions = [f"v{a}*v{b}",f"v{a}*v{c}",f"v{first}+v{first+1}",
+                           f"v{a}*(v{b}+v{c})",f"(v{first+2}-v{first+3})+v{b}"]
+            model = [wrap(values[a]*values[b]),wrap(values[a]*values[c]),
+                     wrap(values[a]*values[b]+values[a]*values[c]),
+                     wrap(values[a]*wrap(values[b]+values[c])),values[b]]
+            for expression,value in zip(expressions,model):
+                declarations.append(f"int v{len(values)}={expression};"); values.append(value)
+        selected = sorted(equality_rng.sample(range(4,len(values)),12))
+        fmt = " ".join(["%d"]*len(selected))+"\\n"
+        arguments = ",".join(f"v{i}" for i in selected)
+        # Keep several products live while their sums have factored alternatives.
+        selected += [len(values)-5,len(values)-4,len(values)-3]
+        tail = f"putint(v{selected[-3]});putch(32);putint(v{selected[-2]});putch(32);int z;"
+        tail += f"if(v0<0)z=v{selected[-1]};else z=v{selected[-3]}+v{selected[-2]};putint(z);"
+        name = f"equality_dag_{case:02d}"
+        cases[name] = ("int main(){"+"".join(declarations)+f'putf("{fmt}",{arguments});'+tail+"return 0;}",
+                       " ".join(str(values[i]) for i in selected[:-3])+"\n"+
+                       " ".join(str(values[i]) for i in selected[-3:])+"\n0\n")
+        (directory / f"{name}.in").write_text(" ".join(map(str,inputs))+"\n")
     if opts.benchmark:
         fixture = ROOT / "build/polyhedral-fixture/performance"
         fixture.mkdir(parents=True,exist_ok=True)
@@ -727,6 +814,58 @@ def main():
         (fixture / "guarded_division.in").write_text(f"{seed} {count}\n")
         (fixture / "guarded_division.out").write_text(f"{total} {x}\n0\n")
         print(f"Wrote loop-state, write-only and predicate-range fixtures to {fixture}")
+        fixture = ROOT / "build/equality-fixture/performance"
+        fixture.mkdir(parents=True,exist_ok=True)
+        count = 10000000
+        # Loop-carried products are observable separately and as a sum. A tree
+        # cost favors factoring the sum even though the products already exist.
+        source = '''int main(){int a=getint();int b=getint();int c=getint();int n=getint();
+          int sum=7;int i=0;starttime();while(i<n){int p=a*b;int q=a*c;int r=p+q;
+            sum=sum+p*q+r*sum;a=p+1;b=q+3;c=r+5;i=i+1;}stoptime();
+          putf("%d %d %d %d\\n",a,b,c,sum);return 0;}'''
+        a,b,c,total = -731,17,23,7
+        for _ in range(count):
+            p,q = wrap(a*b),wrap(a*c);r = wrap(p+q)
+            total = wrap(total+p*q+r*total);a,b,c = wrap(p+1),wrap(q+3),wrap(r+5)
+        (fixture / "shared_outputs.sy").write_text(source)
+        (fixture / "shared_outputs.in").write_text(f"-731 17 23 {count}\n")
+        (fixture / "shared_outputs.out").write_text(f"{a} {b} {c} {total}\n0\n")
+        print(f"Wrote shared-output equality fixture to {fixture}")
+        fixture = ROOT / "build/memory-phi-fixture/performance"
+        fixture.mkdir(parents=True,exist_ok=True)
+        source = '''int run(int a[],int b[],int seed,int n,int depth){
+          if(depth)return run(a,b,seed,n,depth-1);int i=0;int sum=0;
+          while(i<n){if(seed>=0)a[2]=seed*31;else a[2]=seed+17;
+            sum=sum+a[2];b[2]=sum;seed=seed*1664525+1013904223;i=i+1;}
+          return sum+a[2]+b[2];}
+          int main(){int seed=getint();int n=getint();int a[4]={};int b[4]={};
+            starttime();int result=run(a,b,seed,n,2);stoptime();putint(result);return 0;}'''
+        seed,total,value = -31,0,0
+        for _ in range(count):
+            value = wrap(seed*31 if seed>=0 else seed+17)
+            total = wrap(total+value);seed = wrap(seed*1664525+1013904223)
+        (fixture / "branch_state.sy").write_text(source)
+        (fixture / "branch_state.in").write_text(f"-31 {count}\n")
+        (fixture / "branch_state.out").write_text(f"{wrap(total*2+value)}\n0\n")
+        left = "".join(f"a[{j}]=seed*{j*2+3}+{j};" for j in range(8))
+        right = "".join(f"a[{j}]=seed+{j*7+17};" for j in range(8))
+        source = f'''int run(int a[],int b[],int seed,int n,int depth){{
+          if(depth)return run(a,b,seed,n,depth-1);int i=0;int sum=0;
+          while(i<n){{if(seed>=0){{{left}}}else{{{right}}}
+            sum=sum+{'+'.join(f'a[{j}]' for j in range(8))};b[0]=sum;
+            seed=seed*1664525+1013904223;i=i+1;}}
+          return sum+a[0]+b[0];}}
+          int main(){{int seed=getint();int n=getint();int a[8]={{}};int b[8]={{}};
+            starttime();int result=run(a,b,seed,n,2);stoptime();putint(result);return 0;}}'''
+        seed,total,value = -31,0,0
+        for _ in range(count):
+            value = wrap(seed*3 if seed>=0 else seed+17)
+            contribution = seed*80+28 if seed>=0 else seed*8+332
+            total = wrap(total+contribution);seed = wrap(seed*1664525+1013904223)
+        (fixture / "branch_fields.sy").write_text(source)
+        (fixture / "branch_fields.in").write_text(f"-31 {count}\n")
+        (fixture / "branch_fields.out").write_text(f"{wrap(total*2+value)}\n0\n")
+        print(f"Wrote path-specific memory fixture to {fixture}")
         return
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)

@@ -120,6 +120,12 @@ public:
   }
   void extract(FunctionIR &f, const std::vector<Instruction> &original, const std::vector<int> &roots,
                std::vector<Instruction> &out) {
+    if (roots.empty()) return;
+    auto weight = [](const Node &n) {
+      if (n.leaf >= 0) return 0;
+      if (n.op == Op::Constant) return n.number == 0 ? 0 : n.number >= -2048 && n.number <= 2047 ? 1 : 2;
+      return n.op == Op::Mul ? 3 : 1;
+    };
     const double infinity = std::numeric_limits<double>::infinity();
     std::vector<double> cost(nodes.size(), infinity);
     std::vector<int> best(nodes.size(), -1);
@@ -127,11 +133,43 @@ public:
       bool progress = false;
       for (size_t id = 0; id < nodes.size(); ++id) {
         const auto &n = nodes[id]; int r = root(id);
-        double c = n.leaf >= 0 ? 0 : n.op == Op::Constant ? (n.number == 0 ? 0 : n.number >= -2048 && n.number <= 2047 ? 1 : 2) : 1;
+        double c = weight(n);
         if (n.a >= 0) c += cost[root(n.a)];
         if (n.b >= 0) c += cost[root(n.b)];
-        if (n.op == Op::Mul) c += 2;
         if (c < cost[r]) { cost[r] = c; best[r] = id; progress = true; }
+      }
+      if (!progress) break;
+    }
+    // Tree extraction provides an acyclic seed. Improve the joint live-out DAG,
+    // charging each selected e-class once, including sharing between outputs.
+    // An alternative that closes a cycle is rejected, even if its local cost
+    // is attractive. Exhaustion retains the last complete, validated choice.
+    size_t budget = 65536, trials = 0;
+    std::vector<unsigned char> reached(nodes.size());
+    auto score = [&]() {
+      std::fill(reached.begin(),reached.end(),0); double total = 0;
+      std::function<bool(int)> visit = [&](int id) {
+        if (!budget) return false;
+        --budget; int r = root(id);
+        if (reached[r]) return reached[r] == 2;
+        if (best[r] < 0) return false;
+        reached[r] = 1; const auto &n = nodes[best[r]];
+        if ((n.a >= 0 && !visit(n.a)) || (n.b >= 0 && !visit(n.b))) return false;
+        total += weight(n); reached[r] = 2; return true;
+      };
+      for (int r : roots) if (!visit(r)) return infinity;
+      return total;
+    };
+    double total = score(); auto live = reached;
+    if (total == infinity) throw std::logic_error("egraph seed is cyclic");
+    for (int round = 0; round < 2 && budget && trials < 256; ++round) {
+      bool progress = false;
+      for (size_t id = 0; id < nodes.size() && budget && trials < 256; ++id) {
+        int r = root(id), previous = best[r];
+        if (!live[r] || previous == static_cast<int>(id)) continue;
+        ++trials; best[r] = id; double candidate = score();
+        if (candidate < total) { total = candidate; live = reached; progress = true; }
+        else best[r] = previous;
       }
       if (!progress) break;
     }
@@ -247,6 +285,11 @@ void normalizeAffine(FunctionIR &f) {
 
 void rewriteEqualities(FunctionIR &f) {
   if (!f.ssa) return;
+  // Counts refer to the original SSA graph. Region replacement preserves every
+  // externally used ID; newly materialized IDs cannot occur in later regions.
+  std::vector<int> uses(f.values.size(),0), internal(f.values.size(),0);
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions)
+    for (int a : i.args) ++uses[a];
   for (auto &block : f.blocks) {
     std::vector<Instruction> output;
     for (size_t start = 0; start < block.instructions.size();) {
@@ -255,6 +298,8 @@ void rewriteEqualities(FunctionIR &f) {
       if (end-start < 2) { output.push_back(block.instructions[start++]); continue; }
       EGraph graph(std::min<size_t>(4096,(end-start)*12+32)); std::map<int,int> values;
       std::vector<Instruction> original; std::vector<int> roots;
+      for (size_t n = start; n < end; ++n)
+        for (int a : block.instructions[n].args) ++internal[a];
       for (size_t n = start; n < end; ++n) {
         const auto &i = block.instructions[n]; Node node{i.op}; node.number = i.immediate;
         std::vector<int> args;
@@ -265,8 +310,11 @@ void rewriteEqualities(FunctionIR &f) {
         }
         if (!args.empty()) node.a = args[0];
         if (args.size() > 1) node.b = args[1];
-        int id = graph.add(node); values[i.result] = id; roots.push_back(id); original.push_back(i);
+        int id = graph.add(node); values[i.result] = id;
+        if (uses[i.result] > internal[i.result]) { roots.push_back(id); original.push_back(i); }
       }
+      for (size_t n = start; n < end; ++n)
+        for (int a : block.instructions[n].args) --internal[a];
       graph.saturate(); graph.extract(f,original,roots,output); start = end;
     }
     block.instructions = std::move(output);

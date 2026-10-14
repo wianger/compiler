@@ -106,6 +106,20 @@ def check_smt():
     for offset in (0,1,17,1024,2**31-1):
         prove(f"guarded nonnegative addition/{offset}", x+offset >= 0, z3.BoolVal(True),
               x >= 0,x <= 2**31-1-offset)
+    # Equality discovery operates in the int32 ring. Validate its factoring,
+    # constant reassociation and identities without signed-overflow premises.
+    y,z = accumulator,term
+    prove("integer factoring",x*y+x*z,x*(y+z))
+    prove("add reassociation",(x+y)+z,x+(y+z))
+    prove("multiply reassociation",(x*y)*z,x*(y*z))
+    prove("and reassociation",(x & y) & z,x & (y & z))
+    prove("subtraction to addition",x-y,x+(-y))
+    prove("negation",-(-x),x)
+    for name,before,after in (("add zero",x+0,x),("multiply one",x*1,x),
+                               ("multiply zero",x*0,z3.BitVecVal(0,32)),
+                               ("and ones",x & -1,x),("and zero",x & 0,z3.BitVecVal(0,32)),
+                               ("subtract self",x-x,z3.BitVecVal(0,32))):
+        prove(name,before,after)
     # A mutation must produce a counterexample: dropping the sign guard is unsound.
     solver=z3.Solver();solver.add(x/8 != z3.LShR(x,3))
     if solver.check() != z3.sat:

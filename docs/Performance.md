@@ -1,5 +1,70 @@
 # 性能优化与测量
 
+## 与 sysy-competition 的共同输入对照（2026-10-15）
+
+按用户指定，对照 `/home/wiang/sysy-competition` 当前提交 `fcc36336197ae450ffe923a1b289a8385501edee`，没有读取其他分支或修改对照仓库。两边使用同一宿主 `c++` 的 `-std=c++17 -O3 -DNDEBUG` 构建；对照按默认优化管线运行 `--rv -S`，本仓库使用 `-O3`。两份汇编通过同一汇编器／链接器、RV64GC／LP64D 参数、运行库、sysroot 和 QEMU 执行。对照的 Python 参数适配器仅用于准备程序，QEMU 计时直接运行 ELF；编译计时也直接启动原生二进制，不包含适配器。
+
+正确性：本仓库 O2／O3 各 **210/210**；对照不支持 25 个 tensor 输入，剩余 **184/185** 通过。`performance/flood_fill-3` 输出 `156252`，预期 `156259`，排除计时。共同正确的标准输入为 184 个，其中 44 个 performance 程序。另补八个排序观察实验：输出完整有序数组，覆盖负值／int32 环绕，并加入每轮修改数组的非幂等变体；两边都通过。这些观察实验用于加强校验，不纳入原有 44 个程序的均值。
+
+| 指标 | sysy-competition | 本仓库 | 结果 |
+|---|---:|---:|---|
+| 44 个程序的 QEMU wall 几何平均比 | — | — | 本仓库耗时为对照 **1.444×**，慢约 **44%** |
+| 对照计时区间至少 10ms 的 32 个程序 | — | — | 本仓库区间耗时为对照 **1.343×**，慢约 **34%** |
+| 44 个程序的 `.text` 总计 | 129752 B | 151412 B | 本仓库增加 **16.7%** |
+| 184 个输入的编译 wall 中位数总计 | 31.66413 s | 0.88184 s | 总量比 **35.907×**；逐用例加速几何平均 **6.293×** |
+| 同组编译 CPU 总计 | 31.60239 s | 0.84793 s | 总量比 **37.270×** |
+| 平均进程峰值 RSS | 25727 KiB | 5865 KiB | 本仓库降低约 **77.2%**，各版本每输入采样一次 |
+
+本仓库 `matmul1/2/3` 的区间约快 **2.49× / 2.71× / 2.57×**。对照在排序、卷积、`h-10` 与 crypto 等负载明显占优；例如 conv2d-1 为 **23.364 / 593.851 ms**，bitonic_sort-3 为 **2.049 / 212.519 ms**。这里按相同输出要求比较完整编译结果，不把差距简单归因于某一种寄存器算法或指令。后续应先检查重复循环的观测状态与读写依赖、跨过程参数／对象事实、符号边界及热路径代码，再决定增加哪些 PASS；不能以编译速度弥补运行性能差距。
+
+两个额外的参数数组内存实验也在对照下通过：本仓库单字段状态约快 **1.129×**、八字段约快 **1.185×**。多输出整数实验在对照的编译阶段超过 **120 秒**，未进入其性能均值；本仓库通过独立 int32 模型校验。原有用例、额外实验分别报告。
+
+QEMU 与原生编译均固定一个 CPU、串行执行、预热一次、交替七次取中位数；额外内存实验十七次。构建和正确性执行在测量前完成。RSS 由独立 `/usr/bin/time` 启动器采样，统计另外采样。[performance-competition.csv](performance-competition.csv)保存 44 个程序的运行、编译、RSS 与代码大小；完整原始样本、184 个输入的编译数据、失败日志、构建脚本和二进制保留在忽略目录 `build/research-round7`。结果是本机 QEMU 测量，不能换算为真实 RV64 芯片速度。
+
+原生对照调用可复现为：
+
+```sh
+python3 tools/compile_bench.py /path/to/sysc build/compiler \
+  --baseline-args='--rv -S' --tests /path/to/common-correct-inputs \
+  --repeats 7 --output build/comparison/compile.json
+```
+
+## 共享 DAG 与内存 Phi 的补强（2026-10-15）
+
+基线为预先保存的当前分支 `9c7ee36`。EGraph 只保留区域外使用的 SSA 结果，以无环树方案为起点搜索多个输出共同依赖的 DAG；按选中的等价类计一次成本，拒绝形成环的替代项并限制工作量。`memory` 将每条路径上完整覆盖、类型匹配的 store 翻译为值 Phi，并与原有 GVN／加载前向共享 AA 与 MemorySSA；没有新增访存。算法、预算与未覆盖情形见 [Compiler-Research.md](Compiler-Research.md)。
+
+| 指标 | 基线 | 本轮 | 结果 |
+|---|---:|---:|---|
+| 原有 210 个输入的编译 wall 中位数总计 | 0.95096 s | 0.95338 s | 增加 **0.3%**，接近持平 |
+| 同组编译 CPU 总计 | 0.91509 s | 0.91780 s | 增加 **0.3%** |
+| 平均峰值 RSS | 5800 KiB | 5824 KiB | 增加 **0.4%**；每版本各采样一次 |
+| 多输出共享实验，计时区间 | 20.143 ms | 18.820 ms | **1.070×** |
+| 八字段内存实验，计时区间 | 97.028 ms | 90.090 ms | **1.077×** |
+| 同一编译器仅关闭内存 Phi 前向，八字段 | 95.332 ms | 89.433 ms | **1.066×** |
+
+三个实验每个执行一千万次动态迭代，输入运行时读取，预期由 Python 任意精度整数逐步归约到 int32 的模型计算。共享实验分别观测两个乘积及其和：树成本偏好重新因式分解，DAG 成本复用已经存在的乘积，最终展开体的 `mulw` 从 **25** 条减至 **20** 条，`.text` 从 **2740 B** 降至 **2716 B**。原生 snapshot 中仅加入 EGraph 的版本与最终该实验汇编一致，独立隔离其影响。首次十七次测量为 **1.049×**，后续二十七次为 **1.070×**；不将定向样本推广为整体加速。
+
+内存实验通过递归参数函数保持真实未知别名，每个分支先写入同一单元／八个相邻字段，再在汇合后使用它们；读写路径、未知调用、动态偏移、部分路径没有写入、循环回边、Float／负零都有额外模型校验。八字段 `.text` 从 **2794 B** 增到 **2842 B**，包含 Phi 边复制和压力成本，仍获得单项收益。单字段实验相对旧版本约快 2%，但同一最终编译器的 `memory-basic` 对照为 **0.999×**，没有稳定的单项速度收益，不据此宣传加速。
+
+首版把 `memory-phi` 作为独立 PASS，重复建立 AA／MemorySSA 并重复验证，使编译总耗时增加约 **4.3%**；共享分析后的最终管线接近持平。`memory-basic` 仅关闭 Phi 前向；单独的 `memory-phi` 保留为 IR 检查入口。没有增加运行时依赖。
+
+原有 60 个 performance 程序的汇编逐字相同，链接后 `.text` 总计仍为 **202126 B**，因此本轮不声称它们整体加速。原有输入的 7 个功能程序改变汇编并通过检查。[performance-equality.csv](performance-equality.csv)保留三个实验及单项对照。原生编译预热一次、交替七次；两个内存实验和消融十七次，多输出最终二十七次，均固定同一 CPU 串行计时。
+
+验证：O2／O3 各 **210/210**；337 个额外程序在 O0／O2／O3 共 **1011 次执行**、**20 个诊断**通过；4 个语言文档示例、8 个排序观察实验在 O3 通过。ASan／UBSan、8MiB 原生栈及分配符号检查共 **574 次编译**通过。MIR 检查拒绝 **54** 个故意破坏的输入，SMT 证明 **207** 条局部 int32 规则义务；新义务包括因式分解、结合和恒等变换，编译器不依赖求解器。这些验证不构成整个优化管线的形式证明。
+
+```sh
+python3 tools/regression.py
+python3 tools/regression.py --benchmark
+python3 tools/test.py build/equality-fixture build/memory-phi-fixture \
+  --compiler /path/to/baseline-compiler --opt 3 --check-alloc --output build/equality-before
+python3 tools/test.py build/equality-fixture build/memory-phi-fixture \
+  --opt 3 --check-alloc --output build/equality-after
+python3 tools/bench.py build/equality-before build/equality-after \
+  --tests build/equality-fixture/performance --repeats 27
+python3 tools/bench.py build/equality-before build/equality-after \
+  --tests build/memory-phi-fixture/performance --repeats 17
+```
+
 ## 现有实现补强与全阶段筛选（2026-10-14）
 
 基线是预先保存的当前分支 `8366f03`。新增 `loop-promote` 完善固定可写内存的循环状态及出口回写，覆盖有状态累加、只写覆盖、条件写和多个出口；`arith` 加入支配作用域的条件事实、惰性范围查询及比较消除。MIR 补操作数／位宽／边／clobber／slot 检查，GP 池纳入未被展开使用的 `t2`。全阶段调研、深入取舍与下一批验收实验见 [Compiler-Research.md](Compiler-Research.md)。

@@ -5,16 +5,17 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import statistics
 import subprocess
 import tempfile
 import time
 
 
-def run(compiler, source, mode, stats):
+def run(compiler, source, mode, stats, arguments=None):
     with tempfile.TemporaryFile() as errors:
         start = time.perf_counter()
-        child = subprocess.Popen([str(compiler.resolve()), "-O3", mode, str(source),
+        child = subprocess.Popen([str(compiler.resolve()), *(arguments if arguments is not None else ["-O3",mode]), str(source),
                                   "-o", "/dev/null"] + (["--stats"] if stats else []),
                                  stdout=subprocess.DEVNULL, stderr=errors, close_fds=False)
         _, status, usage = os.wait4(child.pid, 0)
@@ -28,10 +29,10 @@ def run(compiler, source, mode, stats):
                 "stats": json.loads(diagnostics) if stats else None}
 
 
-def profile(compiler, source, mode, stats):
+def profile(compiler, source, mode, stats, arguments=None):
     # A small exec'd launcher prevents the Python parent's resident memory from
     # becoming the compiler's inherited high-water mark on Linux.
-    command = ["/usr/bin/time", "-f", "rss=%M", str(compiler.resolve()), "-O3", mode,
+    command = ["/usr/bin/time", "-f", "rss=%M", str(compiler.resolve()), *(arguments if arguments is not None else ["-O3",mode]),
                str(source), "-o", "/dev/null"] + (["--stats"] if stats else [])
     run = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if run.returncode:
@@ -47,6 +48,7 @@ def main():
     parser.add_argument("--tests", type=Path, default=Path("test"))
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--hir", action="store_true")
+    parser.add_argument("--baseline-args", type=shlex.split, help="replace baseline -O3/mode flags for another compiler")
     parser.add_argument("--output", type=Path, default=Path("build/architecture/compile.json"))
     opts = parser.parse_args()
     if opts.repeats < 1:
@@ -59,11 +61,11 @@ def main():
         for iteration in range(opts.repeats + 1):
             for v in ([0, 1] if iteration % 2 == 0 else [1, 0]):
                 sample = run([opts.baseline, opts.candidate][v], source,
-                             "--emit-hir" if opts.hir else "-S", False)
+                             "--emit-hir" if opts.hir else "-S", False, opts.baseline_args if v == 0 else None)
                 if iteration:
                     samples[v].append(sample)
         mode = "--emit-hir" if opts.hir else "-S"
-        baseline_rss, _ = profile(opts.baseline,source,mode,False)
+        baseline_rss, _ = profile(opts.baseline,source,mode,False,opts.baseline_args)
         candidate_rss, _ = profile(opts.candidate,source,mode,False)
         _, stats = profile(opts.candidate,source,mode,True)
         results.append({"case": str(source), "samples": samples, "stats": stats, "rss_kib": [baseline_rss,candidate_rss],
@@ -71,6 +73,7 @@ def main():
                            for name in ("wall", "cpu")}})
     report = {"baseline": str(opts.baseline), "candidate": str(opts.candidate),
               "mode": "hir" if opts.hir else "assembly", "repeats": opts.repeats,
+              "baseline_args": opts.baseline_args,
               "affinity": sorted(os.sched_getaffinity(0)), "results": results}
     opts.output.parent.mkdir(parents=True, exist_ok=True)
     opts.output.write_text(json.dumps(report, indent=2) + "\n")

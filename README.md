@@ -10,6 +10,8 @@ build/compiler -S -O3 test/functional/00_main.sy -o build/main.s
 
 构建需要 CMake 和普通 C++17 编译器，不依赖编译器框架。`--stats` 的 RSS 采样使用宿主 POSIX 接口。
 
+[语言定义](docs/SysY-Language-Definition.md)包含测试使用的 tensor 扩展，规定广播、`@`、形状匹配、参数和返回值；[运行库定义](docs/SysY-Runtime-Library.md)说明 I/O 接口。
+
 ## PASS 与 IR
 
 每次变换都围绕数据表示展开，前后端之间没有工具或文本协议依赖：
@@ -53,7 +55,7 @@ build/compiler --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce in
 
 默认 `-O0`。`-O1` 使用标量 SSA 优化，`-O2` 增加调用、内存、循环和 tensor 结构优化，`-O3` 增加循环展开与经过数据流检查的重复循环归约。追求执行性能时使用 `-O3`。`-o -` 输出到标准输出，`-` 输入从标准输入读取。错误带文件、行、列；失败不会覆盖已有输出文件。
 
-`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数规则，编译器本身无需此依赖。
+`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。`memory` 在同一分析快照中先将可证明的内存 Phi 转成值 Phi，再协作执行 GVN 与加载前向；`memory-basic` 关闭 Phi 前向，`memory-phi` 可单独检查该步骤。EGraph 只提取区域外使用的结果，并按共同依赖的 DAG 对共享子式计费，搜索超预算保留已验证的候选。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数规则，编译器本身无需此依赖。
 
 优化保留浮点运算顺序，不启用 fast-math 或 FMA 重结合。浮点矩阵算法变换要求证明每一步乘积和部分和都能精确表示；未知浮点值走普通内核。常量求值采用目标的 [NaN 规则](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)。
 

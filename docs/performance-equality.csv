@@ -1,0 +1,6 @@
+experiment,case,repeats,baseline_timer_ms,candidate_timer_ms,speedup,baseline_text_bytes,candidate_text_bytes
+baseline,shared_outputs,27,20.143000,18.820000,1.070298,2740,2716
+baseline,branch_fields,17,97.028000,90.090000,1.077012,2794,2842
+baseline,branch_state,17,57.293000,56.149000,1.020374,2570,2566
+memory-basic,branch_fields,17,95.332000,89.433000,1.065960,2794,2842
+memory-basic,branch_state,17,56.275000,56.343000,0.998793,2570,2566
