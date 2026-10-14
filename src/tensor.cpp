@@ -88,6 +88,7 @@ class TensorExpansion : NodeBuilder {
     if (count == 0) return outer;
     if (count == 1) { outer->children.push_back(body(index)); return outer; }
     auto w = program.statements->make(Stmt::Kind::While, Location{});
+    w->scheduled = true;
     w->expression = binary("<", reference(index), integer(count));
     auto inner = block(); inner->children.push_back(body(index));
     inner->children.push_back(assign(reference(index), binary("+", reference(index), integer(1))));

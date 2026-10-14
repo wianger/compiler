@@ -16,7 +16,7 @@ build/compiler -S -O3 test/functional/00_main.sy -o build/main.s
 
 ```
 Source → source-slice Token IR → arena Program IR → resolved HIR
-       → tensor analysis / schedule IR → expanded HIR → CFG/SSA
+       → tensor analysis / schedule IR → expanded HIR → polyhedral region IR → CFG/SSA
        → MemorySSA / affine summaries / bounded EGraph → target MIR → local combine / compact
        → interval bundles / split / allocation → RV64 assembly
 ```
@@ -24,6 +24,7 @@ Source → source-slice Token IR → arena Program IR → resolved HIR
 - `frontend.cpp` 使用源码切片 Token 和稳定索引 arena，产生结构化 Program IR。
 - `semantic.cpp` 绑定符号、检查类型和数组形状、计算常量，并将嵌套初始化转为稀疏的行优先初始化。
 - `tensor.cpp` 保留并分析数组形状和生产者，推导行、列一致性，再选择矩阵算法。调度 IR 明确记录迭代域、列分块和尾块；一般矩阵使用四列或八列微内核，保持每个元素的浮点累加顺序；符合证明条件的矩阵使用二重循环。逐元素表达式融合，标量广播只求值一次；临时结果保证别名安全，返回值使用调用方提供的缓冲区。`-O3` 还分析无副作用的重复循环与整数加法归约。
+- `polyhedral.cpp` 为普通数组的二重矩形循环建立整数迭代域、仿射访问映射与候选依赖关系。用有预算的整数集合求解证明循环交换或 unroll-and-jam 合法，再按访问步长、公共加载及寄存器预算选择调度；整数条件累加只在贡献可安全求值时转换为掩码。浮点累加顺序保留，未知别名和未证实的关系阻止变换。已选择的 tensor 内核带调度标记，避免重复分块。这是受限多面体优化，尚无一般符号域、skewing、波前或自动搜索框架。
 - `lowering.cpp` 将结构化控制流变成基本块，短路表达式变成分支，访存和调用显式化；提升不逃逸的局部标量，检查 PASS 前后约束。很长的算术表达式以迭代方式降级，减少编译器栈消耗。降低完成后释放语法 arena，保留符号、类型及全局初值。
 - `optimizer.cpp` 缓存支配分析，使用 def-use 工作队列 SCCP、结构化哈希 GVN、按字节区间查询的 MemorySSA；值编号与加载替换在一次支配遍历中即时协作。稀疏 SROA 只为不逃逸数组的观测元素建立 SSA，局部 DSE 删除完整覆盖的死写。`rewrite.cpp` 先用单基仿射摘要归一化单次使用的整数链，再进入有预算的 EGraph 做等价改写和成本提取。计算支配树、活跃变量、支配边界和自然循环，构造带 Phi 的 SSA。通过调用图不动点与指针来源分析推导函数的读写摘要，合并相同纯函数调用，并跨基本块消除冗余加载。实现按循环位置选择的小函数内联、尾递归消除、稀疏条件常量传播、循环不变量外提、范围分析与整数算术简化、指针归纳变量和循环旋转。`-O3` 对合适的固定、动态次数循环展开；动态展开保留标量尾循环，浮点运算顺序保持一致。
 - `selection.cpp` 将 Phi 降为边上复制，选择布局和 RV64 目标指令；常量除法、地址计算及比较序列在寄存器分配前展开。目标 MIR 暴露临时值、bank、early/late 使用时刻及调用 clobber。展开后进行局部值编号和复制传播，以定义版本保护可多次写入的值，保留常量重物化配方，再用 def-use 工作队列删除无用临时值并压缩 ID。
@@ -43,6 +44,8 @@ build/compiler --emit-mir -O3 input.sy
 build/compiler --emit-effects -O3 input.sy
 build/compiler --emit-memory-ir -O3 input.sy
 build/compiler --emit-tensor-plan -O3 input.sy
+build/compiler --emit-poly-ir -O3 input.sy
+build/compiler --no-polyhedral -O3 input.sy -o baseline.s
 build/compiler --emit-allocated-mir --check-alloc -O3 input.sy
 build/compiler --stats --check-alloc -O3 input.sy -o output.s
 build/compiler --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce input.sy

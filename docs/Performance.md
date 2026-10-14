@@ -1,5 +1,47 @@
 # 性能优化与测量
 
+## 多面体循环调度与安全整数掩码（2026-10-14）
+
+基线为预先保存的当前分支 `03c6afb`，未读取其他分支。新增自有 `PolyRegion`、仿射访存关系、有限整数集合求解、循环交换与 unroll-and-jam；合法性证明、资源预算与调度选择分别处理。条件整数累加仅在贡献可安全求值时转换为掩码，浮点归约顺序保留。实现与近期论文的准确对应见 [Architecture-Research.md](Architecture-Research.md)。
+
+| 指标 | 基线 | 本轮 | 结果 |
+|---|---:|---:|---|
+| 原有 210 个输入的编译 wall 中位数总计 | 0.81787 s | 0.82617 s | 增加 **1.0%** |
+| 同组编译 CPU 时间总计 | 0.78729 s | 0.79464 s | 增加 **0.9%** |
+| 平均峰值 RSS | 5616 KiB | 5735 KiB | 增加 **2.1%**，每版本各采样一次 |
+| 原有 60 个 performance 的 QEMU wall 几何平均 | — | — | **1.023×** |
+| 基线区间至少 10ms 的 44 个程序 | — | — | 区间几何平均 **1.070×** |
+| 同组链接后 `.text` 总计 | 200604 B | 202748 B | 增加 **1.07%** |
+| matmul1 计时区间 | 38.425 ms | 14.291 ms | **2.689×** |
+| matmul2 计时区间 | 126.434 ms | 44.011 ms | **2.873×** |
+| matmul3 计时区间 | 73.870 ms | 28.483 ms | **2.593×** |
+| 普通数组列访问递推实验 | 19.539 ms | 14.943 ms | **1.308×** |
+| 普通数组严格浮点矩阵实验 | 28.937 ms | 24.020 ms | **1.205×** |
+| 普通数组整数矩阵实验 | 25.813 ms | 13.181 ms | **1.958×** |
+
+原有 60 个程序中只有三个矩阵程序改变汇编，其余 **57 个逐字节相同**；这些程序的小幅时间差属于执行测量波动。三个新实验使用运行时输入 seed，预期值分别由模 2³² 递推、逐步 binary32 模型及模 2³² 点积生成。列访问实验使用 257×257 数组执行 160 次有状态更新，交换后按行连续访问；两组普通数组矩阵使用 43×71 与 71×67 的非方阵，浮点重复 20 次、整数重复 80 次，覆盖主循环和三列尾部。没有使用 tensor 语法、已知一致矩阵专化或外部 SysY 编译器。
+
+仅关闭新 PASS 的对照：列访问 **1.315×**、严格浮点矩阵 **1.168×**、整数矩阵 **1.897×**；三个原有矩阵程序区间几何平均 **2.756×**。关闭项使用最终编译器加 `--no-polyhedral`，其汇编与相同程序的 `03c6afb` 基线一致。独立实验与原有负载的均值分别记录。
+
+调度消融发现，首版只做四列 jam、保留条件分支，让三个原有矩阵程序慢约 2–4%。安全整数掩码与 jam 组合使公共加载能够被 GVN 复用，也使下游 O3 展开能够处理直线循环；相对于首版 jam，最终版本在三个程序上再加速 **2.841×**。这项对照测量整个组合，不将收益全部归因于一条掩码指令。最终四列相对两列在三个程序的区间几何平均 **1.125×**，相对八列 **1.047×**；普通整数矩阵相对两列 **1.292×**、相对八列 **1.133×**。严格浮点矩阵中更宽展开没有稳定收益，因此保留默认四列和预算缩小机制，没有按用例名称设置参数。
+
+原生编译与全部原有 QEMU 程序预热一次、交替七次取中位数；新实验和消融对照各十一次。固定同一 CPU 串行执行，构建、验证和计时分开。RSS 使用小型 exec 启动器独立采样，PASS 统计另行采样。[performance-polyhedral.csv](performance-polyhedral.csv)保留全部 60 个原有程序、三个实验和消融结果；原始样本、候选二进制及报告保留在忽略目录 `build/research-round5`。测量针对本机 QEMU，缓存 tiling 与真实芯片延迟仍需硬件验证。
+
+验证：`-O2`、`-O3` 各 **210/210**；197 个额外程序在 `-O0/-O2/-O3` 共 **591 次执行**及 **20 个诊断**通过，包含新增 51 个独立模型案例；ASan/UBSan 在默认 8MiB 原生栈下编译 **416/416** 个输入，均运行分配符号检查。新增案例覆盖合法／非法依赖方向、非单位和不同系数访问、偶奇格点、非单射写入、参数别名、全局边界被调用修改、私有变量初始化、尾部、索引环绕、严格浮点与负零，以及受条件保护的负下标、动态除数和非布尔条件。
+
+复现：先保存当前分支基线二进制，再构建候选；两份都用 `-O3`，先执行验证，再串行计时。
+
+```sh
+python3 tools/regression.py
+python3 tools/regression.py --benchmark
+python3 tools/test.py build/polyhedral-fixture/performance --compiler /path/to/baseline-compiler --opt 3 --check-alloc --output build/poly-before
+python3 tools/test.py build/polyhedral-fixture/performance --opt 3 --check-alloc --output build/poly-after
+python3 tools/bench.py build/poly-before build/poly-after --tests build/polyhedral-fixture/performance --repeats 11
+build/compiler -O3 --emit-poly-ir input.sy
+build/compiler -O3 --no-polyhedral input.sy -o without-poly.s
+build/compiler -O3 --poly-tile=2 input.sy -o tile2.s
+```
+
 ## 内存位置与协作优化（2026-10-14）
 
 本轮基线为预先保存的当前分支 `0fa1c67`。新增字节区间别名分析、稀疏 SROA 和块内 DSE；GVN、复制传播及 MemorySSA 加载替换改为一次支配树遍历中的即时协作，删除三个相邻的独立 GVN。算法与边界见 [Architecture-Research.md](Architecture-Research.md)。

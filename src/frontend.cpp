@@ -320,6 +320,7 @@ void ProgramIR::releaseSyntax() {
   }
   for (auto &f : runtime) function(*f);
   std::vector<TensorSchedule>().swap(schedules);
+  std::vector<PolyRegion>().swap(polyRegions);
   statements.reset(); expressions.reset();
 }
 } // namespace sysy

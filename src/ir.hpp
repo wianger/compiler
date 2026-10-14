@@ -2,6 +2,8 @@
 #include "arena.hpp"
 
 #include <cstdint>
+#include <array>
+#include <map>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -124,6 +126,7 @@ struct Stmt {
   std::vector<StmtRef> children;
   std::vector<Variable> variables;
   ExprRef expression, target;
+  bool scheduled = false;
   Stmt(Kind kind, Location loc) : kind(kind), location(loc) {}
 };
 
@@ -158,10 +161,43 @@ struct TensorSchedule {
   bool uniform;
   Base base;
 };
+struct PolyAffine {
+  std::array<int64_t,2> dimensions{};
+  std::map<const Symbol *,int64_t> parameters;
+  int64_t constant = 0;
+  bool known = true;
+};
+struct PolyAccess {
+  const Symbol *object = nullptr;
+  bool write = false, logical = false;
+  std::vector<PolyAffine> subscripts;
+  PolyAffine offset;
+};
+struct PolyDependence {
+  int source, target;
+  bool difference = false;
+  std::vector<std::array<int64_t,2>> bounds;
+  std::vector<std::vector<int64_t>> equalities;
+  // 0 = disproved conflict, 1 = witness/possible conflict, 2 = unknown.
+  int parallel = 2, interchange = 2;
+};
+struct PolyRegion {
+  uint32_t statement;
+  std::string function, decision = "unchanged";
+  std::array<const Symbol *,2> induction{};
+  std::array<int64_t,2> lower{}, upper{};
+  std::vector<const Symbol *> parameters;
+  std::vector<PolyAccess> accesses;
+  std::vector<PolyDependence> dependences;
+  int tile = 1;
+  int predicated = 0;
+  size_t queries = 0;
+};
 struct ProgramIR {
   std::unique_ptr<NodeArena<Expr>> expressions = std::make_unique<NodeArena<Expr>>();
   std::unique_ptr<NodeArena<Stmt>> statements = std::make_unique<NodeArena<Stmt>>();
   std::vector<TensorSchedule> schedules;
+  std::vector<PolyRegion> polyRegions;
   std::vector<Item> items;
   std::vector<std::unique_ptr<Symbol>> symbols;
   std::vector<std::unique_ptr<Function>> runtime;
@@ -178,6 +214,8 @@ void printTensorPlan(const ProgramIR &program, std::ostream &out);
 void expandTensors(ProgramIR &program);
 void analyzeTensors(ProgramIR &program);
 void optimizeHighIR(ProgramIR &program, int level);
+void optimizePolyhedral(ProgramIR &program, int level, int tile = 0);
+void printPolyhedralIR(const ProgramIR &program, std::ostream &out);
 void printIR(const ProgramIR &program, std::ostream &out);
 
 } // namespace sysy

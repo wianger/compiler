@@ -160,7 +160,7 @@ INVALID = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--benchmark", action="store_true", help="write timed pressure, division and memory fixtures")
+    parser.add_argument("--benchmark", action="store_true", help="write timed pressure, division, memory and loop fixtures")
     parser.add_argument("--compiler", type=Path, default=ROOT / "build/compiler")
     opts = parser.parse_args()
     directory = ROOT / "build/regressions"
@@ -355,7 +355,6 @@ def main():
             (fixture / "chain.sy").write_text(chain_source.replace("START","starttime();").replace("STOP","stoptime();"))
             (fixture / "chain.in").write_text(f"{count}\n")
             (fixture / "chain.out").write_text(f"{total} {last}\n0\n")
-            return
         name = f"pressure_generated_{k:02d}"
         cases[name] = (source,f"{wrap(sum(model))}\n0\n")
         (directory / f"{name}.in").write_text(" ".join(map(str,data+[iterations]))+"\n")
@@ -411,6 +410,219 @@ def main():
         name = f"memory_generated_{k:02d}"
         cases[name] = (source,f"{total} 16: {' '.join(map(str,model))}\n0\n")
         (directory / f"{name}.in").write_text(" ".join(map(str,values+[n,row,same]))+"\n")
+    # Independently execute the original loop order. These cover legal and
+    # forbidden permutations, modular indices, parameter aliases and jam tails.
+    poly_rng = random.Random(20261016)
+    for k in range(18):
+        height,width = poly_rng.randrange(4,12),poly_rng.randrange(5,14)
+        seed = poly_rng.randrange(-1000000000,1000000000)
+        mode = k%6
+        data = [[wrap(seed+i*31+j) for j in range(width+2)] for i in range(height+2)]
+        if mode == 0:
+            statement = "a[i][j]=a[i][j]*(i+1)+j;if(j%3==0)a[i][j]=a[i][j]+11;"
+            for j in range(1,width+1):
+                for i in range(1,height+1):
+                    data[i][j] = wrap(wrap(data[i][j]*(i+1))+j)
+                    if j%3 == 0: data[i][j] = wrap(data[i][j]+11)
+        elif mode == 1:
+            statement = "a[i][j]=a[i-1][j]+a[i][j-1];"
+            for j in range(1,width+1):
+                for i in range(1,height+1): data[i][j] = wrap(data[i-1][j]+data[i][j-1])
+        elif mode == 2:
+            statement = "a[i][j]=a[i-1][j+1]+1;"
+            for j in range(1,width+1):
+                for i in range(1,height+1): data[i][j] = wrap(data[i-1][j+1]+1)
+        elif mode == 3:
+            statement = "a[i][j]=a[j%H][i%W]+5;"
+            for j in range(1,width+1):
+                for i in range(1,height+1): data[i][j] = wrap(data[j%(height+2)][i%(width+2)]+5)
+        elif mode == 4:
+            statement = "a[i][j]=a[i][j-1]+3;a[i][j-1]=a[i][j];"
+            for j in range(1,width+1):
+                for i in range(1,height+1):
+                    data[i][j] = wrap(data[i][j-1]+3); data[i][j-1] = data[i][j]
+        else:
+            statement = "int t=i*2147483647+i+2;int x=(t%H+H)%H;a[x][j]=a[i][j]+1;"
+            for j in range(1,width+1):
+                for i in range(1,height+1):
+                    t = wrap(wrap(i*2147483647)+i+2)
+                    data[t%(height+2)][j] = wrap(data[i][j]+1)
+        source = f'''const int H={height+2};const int W={width+2};int a[H][W];
+          int main(){{int seed=getint();int i=0;while(i<H){{int j=0;while(j<W){{
+            a[i][j]=seed+i*31+j;j=j+1;}}i=i+1;}}
+          int j=1;while(j<{width+1}){{i=1;while(i<{height+1}){{{statement}i=i+1;}}j=j+1;}}
+          putf("%d %d\\n",i,j);putarray(H*W,a[0]);return 0;}}'''
+        name = f"poly_order_{k:02d}"
+        cases[name] = (source,f"{height+1} {width+1}\n{(height+2)*(width+2)}: "+
+                       " ".join(str(x) for row in data for x in row)+"\n0\n")
+        (directory / f"{name}.in").write_text(f"{seed}\n")
+    # The bases can alias even though the formal parameter Symbols differ.
+    data = [[i*17+j-100 for j in range(17)] for i in range(17)]
+    for j in range(17):
+        for i in range(13): data[i][j] = data[j][i]+5
+    cases["poly_parameter_alias"] = ('''void calc(int a[][17],int b[][17]){
+      int j=0;while(j<17){int i=0;while(i<13){b[i][j]=a[j][i]+5;i=i+1;}j=j+1;}}
+      int data[17][17];int main(){int i=0;while(i<17){int j=0;
+        while(j<17){data[i][j]=i*17+j-100;j=j+1;}i=i+1;}
+      calc(data,data);putarray(289,data[0]);return 0;}''',
+      "289: "+" ".join(str(x) for row in data for x in row)+"\n0\n")
+    cases["poly_call_clobber"] = ('''int n;int a[8][8];int tick(){n=7;return 1;}
+      int main(){n=4;int x=tick();int j=0;
+        while(j<n){int i=0;while(i<4){a[i][j]=i+j;i=i+1;}j=j+1;}
+        putint(j);putch(32);n=4;if(tick()){j=0;
+          while(j<n){int i=0;while(i<4){a[i][j]=i-j;i=i+1;}j=j+1;}}
+        putf("%d %d\\n",j,a[3][6]);return 0;}''', "7 7 -3\n0\n")
+    for k in range(8):
+        rows,columns,reduction = 3+k%2,5+k,7+k
+        seed = poly_rng.randrange(-100000000,100000000)
+        a = [[wrap(seed+i*31-q*7) for q in range(reduction)] for i in range(rows)]
+        b = [[wrap(q*11+j*17-9) for j in range(columns)] for q in range(reduction)]
+        c = []
+        for i in range(rows):
+            for j in range(columns):
+                total = 0
+                for q in range(reduction):
+                    if wrap(a[i][q]+b[q][j])%3: total = wrap(total+wrap(a[i][q]*b[q][j]))
+                    else: total = wrap(total-a[i][q])
+                c.append(total)
+        source = f'''int a[{rows}][{reduction}];int b[{reduction}][{columns}];int c[{rows}][{columns}];
+          int main(){{int seed=getint();int i=0;while(i<{rows}){{int k=0;
+            while(k<{reduction}){{a[i][k]=seed+i*31-k*7;k=k+1;}}i=i+1;}}
+          i=0;while(i<{reduction}){{int j=0;while(j<{columns}){{b[i][j]=i*11+j*17-9;j=j+1;}}i=i+1;}}
+          i=0;while(i<{rows}){{int j=0;while(j<{columns}){{int k=0;int sum=0;
+            while(k<{reduction}){{if((a[i][k]+b[k][j])%3)sum=sum+a[i][k]*b[k][j];
+              else sum=sum-a[i][k];k=k+1;}}c[i][j]=sum;j=j+1;}}i=i+1;}}
+          putarray({rows*columns},c[0]);return 0;}}'''
+        name = f"poly_jam_{k:02d}"
+        cases[name] = (source,f"{rows*columns}: {' '.join(map(str,c))}\n0\n")
+        (directory / f"{name}.in").write_text(f"{seed}\n")
+    f32 = lambda x: struct.unpack('f',struct.pack('f',x))[0]
+    expected = []
+    for i in range(3):
+        for j in range(9):
+            total = 0.0
+            for q in range(17):
+                x,y = f32((i-q)*f32(.1)),f32((q+j-7)*f32(.3))
+                total = f32(total+f32(x*y))
+            expected.append(total.hex())
+    cases["poly_float_order"] = (f'''float a[3][17];float b[17][9];float c[3][9];
+      float expected[3][9]={{{','.join(expected)}}};
+      int main(){{int i=0;while(i<3){{int k=0;while(k<17){{a[i][k]=(i-k)*0.1;k=k+1;}}i=i+1;}}
+        i=0;while(i<17){{int j=0;while(j<9){{b[i][j]=(i+j-7)*0.3;j=j+1;}}i=i+1;}}
+        i=0;while(i<3){{int j=0;while(j<9){{float sum=0;int k=0;while(k<17){{
+          sum=sum+a[i][k]*b[k][j];k=k+1;}}c[i][j]=sum;j=j+1;}}i=i+1;}}
+        int bad=0;i=0;while(i<3){{int j=0;while(j<9){{if(c[i][j]!=expected[i][j])bad=bad+1;
+          j=j+1;}}i=i+1;}}putint(bad);return 0;}}''',"0\n0\n")
+    cases["poly_signed_zero"] = ('''float a[2][3];float b[3][5];float c[2][5];
+      int main(){float z=getfloat();int i=0;while(i<2){int k=0;while(k<3){
+        if(i==0)a[i][k]=-z;else a[i][k]=z;k=k+1;}i=i+1;}
+      i=0;while(i<3){int j=0;while(j<5){b[i][j]=1.0;j=j+1;}i=i+1;}
+      i=0;while(i<2){int j=0;while(j<5){float sum=-0.0;int k=0;
+        while(k<3){sum=sum+a[i][k]*b[k][j];k=k+1;}c[i][j]=sum;j=j+1;}i=i+1;}
+      putf("a=%f b=%f\\n",c[0][0],c[1][0]);return 0;}''',"a=-0.000000 b=0.000000\n0\n")
+    (directory / "poly_signed_zero.in").write_text("0\n")
+    data = [[i*17+j for j in range(17)] for i in range(17)]
+    for j in range(7):
+        for i in range(5): data[2*i][2*j] = data[2*i+1][2*j+1]+1
+    cases["poly_congruence"] = ('''int a[17][17];int main(){int i=0;
+      while(i<17){int j=0;while(j<17){a[i][j]=i*17+j;j=j+1;}i=i+1;}
+      int j=0;while(j<7){i=0;while(i<5){a[2*i][2*j]=a[2*i+1][2*j+1]+1;i=i+1;}j=j+1;}
+      putarray(289,a[0]);return 0;}''',"289: "+" ".join(str(x) for row in data for x in row)+"\n0\n")
+    # Masking must normalize arbitrary integer conditions and retain guards
+    # for out-of-domain accesses and variable divisors.
+    for mode in ("previous", "division", "truth"):
+        a = [[i*10+k+1 for k in range(7)] for i in range(3)]
+        b = [[k*9+j-10 for j in range(9)] for k in range(7)]
+        output = []
+        for i in range(3):
+            for j in range(9):
+                total = 0
+                for k in range(7):
+                    if mode == "previous" and k > 0: total += a[i][k-1]*b[k][j]
+                    if mode == "division" and k != 2:
+                        total += abs(a[i][k])//abs(k-2)*(-1 if k < 2 else 1)+b[k][j]
+                    if mode == "truth" and (i-k)*47: total += a[i][k]*b[k][j]
+                output.append(wrap(total))
+        update = {"previous":"if(k>0)sum=sum+a[i][k-1]*b[k][j];",
+                  "division":"if(k!=2)sum=sum+a[i][k]/(k-2)+b[k][j];",
+                  "truth":"if((i-k)*47)sum=sum+a[i][k]*b[k][j];"}[mode]
+        cases[f"poly_predicate_{mode}"] = (f'''int a[3][7];int b[7][9];int c[3][9];
+          int main(){{int i=0;while(i<3){{int k=0;while(k<7){{a[i][k]=i*10+k+1;k=k+1;}}i=i+1;}}
+            i=0;while(i<7){{int j=0;while(j<9){{b[i][j]=i*9+j-10;j=j+1;}}i=i+1;}}
+            i=0;while(i<3){{int j=0;while(j<9){{int sum=0;int k=0;
+              while(k<7){{{update}k=k+1;}}c[i][j]=sum;j=j+1;}}i=i+1;}}
+            putarray(27,c[0]);return 0;}}''',"27: "+" ".join(map(str,output))+"\n0\n")
+    cases["poly_private_initializer"] = ('''int a[7];int b[7][9];int c[9];
+      int main(){int k=0;while(k<7){a[k]=k+1;int j=0;
+        while(j<9){b[k][j]=k+j;j=j+1;}k=k+1;}
+      int j=0;while(j<9){int first=1;int q=first;int sum=0;
+        while(q<7){sum=sum+a[q]*b[q][j];q=q+1;}c[j]=sum;j=j+1;}
+      putarray(9,c);return 0;}''',"9: "+" ".join(str(sum((k+1)*(k+j) for k in range(1,7))) for j in range(9))+"\n0\n")
+    # Unequal, non-unit affine maps exercise full source/destination relations,
+    # integer projection and congruence, including non-injective writes.
+    relation_rng = random.Random(20261017)
+    for n in range(16):
+        height,width = relation_rng.randrange(4,10),relation_rng.randrange(5,11)
+        wi,wj,ri,rj = [relation_rng.randrange(1,6) for _ in range(4)]
+        wo,ro = relation_rng.randrange(10,71),relation_rng.randrange(10,71)
+        seed = relation_rng.randrange(-1000000,1000000)
+        data = [wrap(seed+k*31) for k in range(192)]
+        for j in range(width):
+            for i in range(height):
+                data[wi*i+wj*j+wo] = wrap(data[ri*i+rj*j+ro]*3+seed+i*7+j)
+        name = f"poly_relation_{n:02d}"
+        cases[name] = (f'''int a[192];int main(){{int seed=getint();int k=0;
+          while(k<192){{a[k]=seed+k*31;k=k+1;}}int j=0;
+          while(j<{width}){{int i=0;while(i<{height}){{
+            a[{wi}*i+{wj}*j+{wo}]=a[{ri}*i+{rj}*j+{ro}]*3+seed+i*7+j;i=i+1;}}j=j+1;}}
+          putarray(192,a);return 0;}}''',"192: "+" ".join(map(str,data))+"\n0\n")
+        (directory / f"{name}.in").write_text(f"{seed}\n")
+    if opts.benchmark:
+        fixture = ROOT / "build/polyhedral-fixture/performance"
+        fixture.mkdir(parents=True,exist_ok=True)
+        size,count,seed = 257,160,-731
+        source = f'''int a[{size}][{size}];int main(){{int seed=getint();int r=0;starttime();
+          while(r<{count}){{int j=0;while(j<{size}){{int i=0;while(i<{size}){{
+            a[i][j]=a[i][j]*3+seed+i*31+j;i=i+1;}}j=j+1;}}r=r+1;}}stoptime();
+          int sum=0;int i=0;while(i<{size}){{int j=0;while(j<{size}){{sum=sum+a[i][j];j=j+1;}}i=i+1;}}
+          putint(sum);return 0;}}'''
+        factor = 0
+        for _ in range(count): factor = wrap(factor*3+1)
+        expected = wrap(factor*sum(seed+i*31+j for i in range(size) for j in range(size)))
+        (fixture / "column_recurrence.sy").write_text(source)
+        (fixture / "column_recurrence.in").write_text(f"{seed}\n")
+        (fixture / "column_recurrence.out").write_text(f"{expected}\n0\n")
+        # Ordinary array GEMM: runtime seed prevents value specialization,
+        # independent modular / binary32 models preserve each reduction step.
+        for floating in (False,True):
+            rows,columns,reduction,repeats = 43,67,71,20 if floating else 80
+            kind = "float" if floating else "int"
+            seed = -13 if floating else -731
+            name = f"{kind}_dot"
+            ax = "(seed+i-k)*0.1" if floating else "seed+i*31-k*7"
+            bx = "(k+j-7)*0.3" if floating else "k*11+j*17-9"
+            source = f'''{kind} a[{rows}][{reduction}];{kind} b[{reduction}][{columns}];{kind} c[{rows}][{columns}];
+              int main(){{int seed=getint();int i=0;while(i<{rows}){{int k=0;while(k<{reduction}){{
+                a[i][k]={ax};k=k+1;}}i=i+1;}}int k=0;while(k<{reduction}){{int j=0;
+                while(j<{columns}){{b[k][j]={bx};j=j+1;}}k=k+1;}}
+              int r=0;starttime();while(r<{repeats}){{i=0;while(i<{rows}){{int j=0;
+                while(j<{columns}){{{kind} sum=0;k=0;while(k<{reduction}){{sum=sum+a[i][k]*b[k][j];k=k+1;}}
+                  c[i][j]=sum;j=j+1;}}i=i+1;}}r=r+1;}}stoptime();
+              put{ 'farray' if floating else 'array' }({rows*columns},c[0]);return 0;}}'''
+            expected = []
+            for i in range(rows):
+                for j in range(columns):
+                    total = 0.0 if floating else 0
+                    for k in range(reduction):
+                        x = f32((seed+i-k)*f32(.1)) if floating else seed+i*31-k*7
+                        y = f32((k+j-7)*f32(.3)) if floating else k*11+j*17-9
+                        total = f32(total+f32(x*y)) if floating else wrap(total+wrap(x*y))
+                    expected.append(total.hex() if floating else str(total))
+            (fixture / f"{name}.sy").write_text(source)
+            (fixture / f"{name}.in").write_text(f"{seed}\n")
+            (fixture / f"{name}.out").write_text(f"{rows*columns}: "+" ".join(expected)+"\n0\n")
+        print(f"Wrote column recurrence and ordered integer/float dot fixtures to {fixture}")
+        return
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)

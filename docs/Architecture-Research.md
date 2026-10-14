@@ -12,22 +12,22 @@
 | 常量 / 值编号 | def-use 工作队列 SCCP、结构化 hash-cons 键、支配树作用域撤销表 | 只重新处理受变化影响的用户；GVN 避免字符串序列化和逐子树复制整个表达式表 |
 | 内存 | 字节区间别名分析、MemorySSA、协作 GVN、稀疏 SROA、局部 DSE | 区分同一对象的不同元素；值编号与加载替换即时传播。仅标量化不逃逸且访问位置固定的数组；DSE 保留所有可能观察旧值的读与调用。参数间仍可能别名 |
 | 等价改写 | 单基 SSA 仿射摘要、共享感知归一化、有预算的整数 EGraph | 仿射 PASS 跨区域保留模 2³² 的系数与偏移，只吸收单次使用的整数算术；EGraph 做 hash-cons、congruence rebuild 和成本提取。尚非跨 CFG 的完整 AEGraph |
-| tensor / 循环 | 独立 TensorSchedule IR，显式迭代域、列分块、尾块及归约顺序 | 语义和调度分开；一般内核使用四列，较宽浮点矩阵使用八列；已证明一致性的矩阵保留专用算法。没有通用 polyhedral 搜索或自动调参框架 |
+| tensor / 循环 | 独立 TensorSchedule IR；普通数组的 PolyRegion、仿射映射、整数依赖集合及调度 | tensor 保留专用算法；二重矩形循环以空集证明保护交换与 unroll-and-jam，按访存及寄存器预算选择。尚无一般符号域、skewing、波前或通用调度搜索 |
 | 指令选择 | 独立目标 MIR、RV opcode、bank、early / late、clobber；展开后局部值编号、复制传播和工作队列 DCE | 消除除法与取余等展开的重复子式；定义版本保护降 Phi 后的可变值，常量仍为独立重物化配方。压缩有效 Value ID；尚无跨块目标 GVN |
 | 寄存器分配 | 稀疏 64 位活跃块、有序占用区间、复制 bundle、优先队列、驱逐、热溢出拆分 | Briggs 合并保留热 bundle 的寄存器选择；较高压力下使用短重载簇，调用及块边界终止共享。尚无 min-cut 全局区域拆分或 regalloc2 全部约束模型 |
 | 验证 / 输出 | 独立冲突图与 ABI 检查、分配后符号 must-dataflow、活跃压力生成测试 | 符号检查跟踪物理位置包含哪些当前虚拟值，汇合取交集，检查复制、调用破坏及溢出。不是完整机器语义的形式证明 |
 
-代码分别位于 [arena.hpp](../src/arena.hpp)、[ir.hpp](../src/ir.hpp)、[optimizer.cpp](../src/optimizer.cpp)、[rewrite.cpp](../src/rewrite.cpp)、[tensor.cpp](../src/tensor.cpp)、[target_ir.hpp](../src/target_ir.hpp)、[selection.cpp](../src/selection.cpp)、[backend.cpp](../src/backend.cpp)。`--stats` 记录每个 PASS、验证、选择、分配的耗时及计数；指标与复现见 [Performance.md](Performance.md)。
+代码分别位于 [arena.hpp](../src/arena.hpp)、[ir.hpp](../src/ir.hpp)、[optimizer.cpp](../src/optimizer.cpp)、[rewrite.cpp](../src/rewrite.cpp)、[tensor.cpp](../src/tensor.cpp)、[polyhedral.cpp](../src/polyhedral.cpp)、[target_ir.hpp](../src/target_ir.hpp)、[selection.cpp](../src/selection.cpp)、[backend.cpp](../src/backend.cpp)。`--stats` 记录每个 PASS、验证、选择、分配的耗时及计数；指标与复现见 [Performance.md](Performance.md)。
 
 ```text
 Source → Token IR → arena Program IR → resolved HIR
-       → tensor facts → TensorSchedule IR → expanded HIR
+       → tensor facts → TensorSchedule IR → expanded HIR → PolyRegion / dependence sets
        → CFG/SSA → MemorySSA / affine summaries / bounded EGraph → optimized CFG
        → phi edge copies → target MIR → local combine / compact → split / allocate
        → allocated locations → frame / ABI expansion → assembly
 ```
 
-`--emit-mir` 已打印目标机器指令，而非此前复用的通用寄存器 IR。`--emit-allocated-mir` 打印物理位置、重物化及拆分栈槽；`--check-alloc` 运行符号检查器。`--emit-memory-ir` 和 `--emit-tensor-plan` 分别查看内存版本及调度。
+`--emit-mir` 已打印目标机器指令，而非此前复用的通用寄存器 IR。`--emit-allocated-mir` 打印物理位置、重物化及拆分栈槽；`--check-alloc` 运行符号检查器。`--emit-memory-ir`、`--emit-tensor-plan`、`--emit-poly-ir` 分别查看内存版本、tensor 调度、普通循环域与依赖约束。
 
 ## 前端选择：arena 与红绿树
 
@@ -74,6 +74,44 @@ Source → Token IR → arena Program IR → resolved HIR
 [SROA 的访问分区与 SSA 提升](https://llvm.org/doxygen/SROA_8cpp_source.html)提供另一条避免循环访存的路径。自有 `sroa` 在 SSA 前将不逃逸、固定位置的局部数组提升为标量，只为实际读取的元素建立 home；未读元素的 store 删除，初始化表达式中的调用继续执行。Zero 按原位置重置观测元素，支持循环内重复声明、分支与多维数组。每对象最多 256 个 home、每函数总预算 1024；动态访问、未知 Phi 地址和传出地址拒绝整对象。它是稀疏标量替换，尚不处理逃逸数组的部分分区或向量提升，也不等同于 LICM 的出口 store 下沉。
 
 这些资料用于研究设计；没有使用 LLVM 库、其 PASS 或外部 SysY 编译器。定向实验分别关闭 SROA、DSE，以及对比分开的 GVN / MemorySSA；四个内存实验使用 Python 整数模型或独立递推矩阵生成预期值。性能和限制见 [Performance.md](Performance.md)。
+
+## 普通循环的多面体 IR 与合法性证明（2026-10-14）
+
+此前只有 tensor 专用调度和标量仿射摘要，缺少普通数组循环的迭代级依赖表示。这确实遗漏了重要优化层。新增 `polyhedral` 在 tensor 展开、HIR 重复归约之后，CFG 降低之前运行；`-O2`、`-O3` 启用。这里的表示与标量 `affine` PASS 分开：前者研究不同迭代的访存与顺序，后者仅归一化 int32 计算。
+
+[MLIR Affine](https://mlir.llvm.org/docs/Dialects/Affine/)说明迭代维度、共享符号参数、访问映射和整数集合；其[依赖分析源码](https://mlir.llvm.org/doxygen/AffineAnalysis_8cpp_source.html)展示源／目的访问关系与执行顺序约束的组合。本项目自行实现一个有限子集，没有调用 MLIR、Polly、isl、Pluto 或 SMT 库：
+
+- `PolyRegion` 保留两维矩形迭代域、Symbol 身份、共享不变参数、读写访问映射、候选依赖及调度决定；`--emit-poly-ir` 输出这些对象及求解结果。循环必须是已知常量起止、正次数、步长一的 int32 循环；内层可以含条件、私有标量、前置初始化和结束存储。
+- 访问抽象检查每一步整数索引计算的范围，不能证明不溢出便拒绝仿射映射。内侧下标范围保证行优先映射单射时按逻辑坐标比较，否则使用精确的线性元素偏移。不同局部对象不相交；参数间及参数／全局之间可能别名，未知相对地址阻止变换。
+- 对潜在 RAW、WAR、WAW 建立访存地址相等的整数关系，条件按可能执行保守近似。源／目的使用同一组符号参数；相同系数可投影到迭代差空间。外层并行性查询禁止任何跨外层冲突；交换查询禁止两个维度方向相反的冲突。只有禁止集合被证明为空才允许调度，保留各点内语句顺序。
+- 整数集合求解使用单位系数等式消元、整除／GCD 检查、区间收缩及分支定界。每个查询最多 96 个搜索节点、深度 24，每轮区间传播最多 32 次；溢出、不支持或预算耗尽返回 `unknown`。非空结果只说明保守模型存在冲突，未必是实际执行的冲突。
+- 完美循环按读写步长成本选择交换，写入权重高于读取。没有外层冲突且存在公共内层加载时考虑 unroll-and-jam，默认四列，依据私有整数／浮点临时量和表达式预算缩小；保留标量尾循环。所有私有声明按列重命名，外部循环变量保留最终值。TensorSchedule 产生的循环带 `scheduled` 标记，避免覆盖已有内核决定。
+- 对整数私有累加器，单分支 `sum=sum+term` 可变为 `sum=sum+bool(cond)*term`；贡献必须无调用、类型为整数，所有加载的各维下标都已证明有效，除数必须为非零常量。原条件仍按原短路语义求值。浮点累加、带 else 的更新、动态除数和受条件保护的越界加载保留分支，每个浮点输出的归约顺序完全保留。
+
+例如，`A[i][j]=A[i-1][j]+A[i][j-1]` 有跨迭代依赖，但交换不反转方向，能够通过证明；`A[i-1][j+1]` 的依赖方向阻止交换。原地转置也被拒绝。行内偶数位置写入、奇数位置读取的实验则需要整数整除性质，不能只用实数线性松弛判断。这些例子的预期值按原循环顺序由 Python 独立计算。
+
+性能筛选发现：单独四列 jam 让原有三个条件矩阵程序慢约 2–4%，该候选未作为最终实现。安全整数掩码让协作 GVN 复用加载，并使下游展开预算能接纳直线循环，组合效果再实测。不会将“变换合法”当作“必定更快”；完整结果、代码大小和编译开销见 [Performance.md](Performance.md)。`--no-polyhedral` 提供整个 PASS 的对照，`--poly-tile=1|2|4|8` 设置 jam 宽度上限，仍受合法性与资源预算约束。
+
+当前不是完整多面体编译器：尚无运行时符号上下界、三角域、floor/mod 访问关系、一般调度树、skewing／波前、跨循环融合、缓存多级 tiling、运行时别名版本化或自动成本模型训练。普通源代码三重循环可分析其中满足条件的二重子区域；不能进行一般三维重调度。没有把受限整数求解称为完整 Presburger 决策过程。
+
+## 最新研究的覆盖与取舍（2026-10-14）
+
+调研按表示、合法性、成本、降低和验证分别评估。发表年份与算法基础区分开；多面体分析、图着色等基础技术较早，近期工作的价值通常在组合、可扩展性、自动选择和证明。以下资料是原论文或作者仓库，明确区分已采用与待研究部分。
+
+| 方向与原始资料 | 对本项目的实际价值 | 本轮状态与限制 |
+|---|---|---|
+| [LOOPer，PACT 2025，2025-12 修订](https://arxiv.org/abs/2403.11522)；[LOOPerSet，2025-12 修订](https://arxiv.org/abs/2510.10209) | 组合循环变换与学习型成本模型，需要丰富的调度／程序样本 | 引入可观测域、关系、决定及独立模型生成测试；尚未实现论文的调度搜索、数据集或训练模型 |
+| [参数调优与结构优化分离，2026-09](https://arxiv.org/abs/2609.03114) | 先证明并选择循环结构，再搜索 tile 等数值参数，便于区分合法性与性能 | jam 宽度独立于证明，可用 CLI 做对照；目前是预算启发式，尚无坐标爬山或自动调优器 |
+| [Loom，2026-09](https://arxiv.org/abs/2609.29219) | 显式硬件描述导出合法性、资源与延迟约束，将调度参数保持为符号 | 资源预算与合法性分别处理；Loom 针对空间数据流加速器，其 DMA／多核延迟模型不适用于当前 RV64GC，未照搬 CP-SAT 管线 |
+| [Scalable Packed Layouts，2026-05](https://arxiv.org/abs/2605.12445) | 向量长度、布局、tiling 与 vectorization 共同决定收益 | 当前 ISA 无向量扩展，不能应用 SVE 代码。RVV 后端需要独立的目标约束、MIR、分配和硬件测量，尚未实现 |
+| [稀疏结构专化，IMPACT 2025](https://www.impact-workshop.org/impact2025/papers/asppss.pdf) | 输入稀疏结构已知时传播非零迭代域，避免无效工作 | SysY 没有稀疏布局契约，严格浮点还涉及 NaN／零乘法，不能按整数模型跳过所有零项；尚未实现稀疏专化 |
+| [Protean，TACO 2026，2026-06 修订](https://arxiv.org/abs/2602.06142) | 细粒度程序特征、PASS 顺序与外部模型协作 | 现有 `--passes`、统计、候选保存和单项对照支持实验；它们不是 Protean 的特征库或学习型 phase-ordering |
+| [ISA 规范合成指令选择，CGO 2026](https://db.in.tum.de/~drescher/paper-isel-syn.pdf) | 位向量规范化索引筛选匹配，用 SMT 验证其余候选；减少手写规则维护成本 | 本项目已有结构键与独立整数模型，但没有 ISA 形式语义、SMT 或规则合成器。论文系统生成 LLVM 规则，本项目未使用该系统 |
+| [regalloc3 作者仓库](https://github.com/Amanieu/regalloc3) | 分块频率、重物化、工作区复用，以及复杂 bank／组合寄存器约束 | 已有循环权重、常量重物化和两种 bank；未实现真实块频率、通用组合寄存器、跨函数分配工作区或完整 regalloc3。当前标量目标暂不需要复杂寄存器组 |
+
+前端也按负载重新评估：一次性批量 SysY 输入仍没有红绿树的编辑复用场景；已有 arena 与长表达式测试针对当前需求。更紧凑节点索引／操作数池、函数级内存复用，需先测编译 RSS 和耗时；不会仅因其他编译器采用某种结构就增加一套重复表示。
+
+后续优先级是补足可证明的符号域与别名版本化，再扩展 skewing／tiling 的调度候选和成本测量；向量化需要先确定 RVV 目标。每项都要有独立语义模型、关闭该项的对照、编译时间／RSS、代码大小和运行测量。QEMU 只能评估当前执行器，不能作为真实芯片缓存及延迟的完整成本模型。
 
 ## 调度与验证的后续边界
 

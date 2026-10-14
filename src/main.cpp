@@ -6,14 +6,16 @@
 #include <sstream>
 
 namespace {
-enum class Output { Assembly, Tokens, HighIR, ExpandedIR, ControlIR, MachineIR, AllocatedIR, TensorPlan, MemoryIR, Effects };
+enum class Output { Assembly, Tokens, HighIR, ExpandedIR, ControlIR, MachineIR, AllocatedIR, TensorPlan, MemoryIR, Effects, PolyhedralIR };
 struct Options {
   std::string input, output;
   Output kind = Output::Assembly;
   int optimization = 0;
   int tensorTile = 0;
+  int polyTile = 0;
   std::optional<std::string> passes;
   bool stats = false, checkAllocation = false;
+  bool polyhedral = true;
 };
 void help() {
   std::cout << "Usage: compiler [options] input.sy\n"
@@ -28,6 +30,9 @@ void help() {
       "  --emit-allocated-mir  print physical locations and spill decisions\n"
       "  --check-alloc      run symbolic allocation dataflow checker\n"
       "  --emit-tensor-plan print shaped iteration domains and kernel schedules\n"
+      "  --emit-poly-ir     print domains, affine accesses and dependence constraints\n"
+      "  --no-polyhedral    disable affine loop scheduling for comparison\n"
+      "  --poly-tile=N      cap unroll-and-jam width (1, 2, 4, 8)\n"
       "  --tensor-tile=N    override automatic column tile (1, 2, 4, 8)\n"
       "  --emit-memory-ir   print memory definitions, phis, uses and clobbers\n"
       "  --emit-effects     print function read/write and observable-effect summaries\n"
@@ -52,6 +57,13 @@ Options options(int argc, char **argv) {
     else if (arg == "--emit-allocated-mir") o.kind = Output::AllocatedIR;
     else if (arg == "--check-alloc") o.checkAllocation = true;
     else if (arg == "--emit-tensor-plan") o.kind = Output::TensorPlan;
+    else if (arg == "--emit-poly-ir") o.kind = Output::PolyhedralIR;
+    else if (arg == "--no-polyhedral") o.polyhedral = false;
+    else if (arg.rfind("--poly-tile=",0) == 0) {
+      auto tile = arg.substr(12);
+      if (tile != "1" && tile != "2" && tile != "4" && tile != "8") throw std::runtime_error("poly tile must be 1, 2, 4 or 8");
+      o.polyTile = std::stoi(tile);
+    }
     else if (arg.rfind("--tensor-tile=",0) == 0) {
       auto tile = arg.substr(14);
       if (tile != "1" && tile != "2" && tile != "4" && tile != "8") throw std::runtime_error("tensor tile must be 1, 2, 4 or 8");
@@ -110,7 +122,16 @@ int main(int argc, char **argv) {
         else {
           stats.measure("tensor.expand", [&] { sysy::expandTensors(program); });
           stats.measure("hir.optimize", [&] { sysy::optimizeHighIR(program, o.optimization); });
-          if (o.kind == Output::ExpandedIR) sysy::printIR(program, result);
+          if (o.polyhedral) stats.measure("polyhedral", [&] { sysy::optimizePolyhedral(program,o.optimization,o.polyTile); });
+          stats.count("poly.regions",program.polyRegions.size());
+          for (const auto &r : program.polyRegions) {
+            stats.count("poly.queries",r.queries);
+            if (r.decision == "unroll-and-jam") stats.count("poly.jam",1);
+            if (r.decision == "interchange") stats.count("poly.interchange",1);
+            stats.count("poly.predicated",r.predicated);
+          }
+          if (o.kind == Output::PolyhedralIR) sysy::printPolyhedralIR(program,result);
+          else if (o.kind == Output::ExpandedIR) sysy::printIR(program, result);
           else {
             auto module = stats.measure("lower", [&] { return sysy::lower(program); });
             stats.count("expr.nodes", program.expressions->size());
