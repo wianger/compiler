@@ -208,14 +208,16 @@ void printTarget(const ModuleIR &module, std::ostream &out) {
         if (i.op == Op::Target) out << rvName(i.opcode);
         else {
           static const char *pseudo[] = {"constant","frame.address","string.address","abi.parameter","copy","load","store","offset","zero"};
-          if (i.op <= Op::Zero) out << pseudo[static_cast<size_t>(i.op)];
+          if (i.op == Op::Address && i.symbol->global) out << "global.address";
+          else if (i.op <= Op::Zero) out << pseudo[static_cast<size_t>(i.op)];
           else out << (i.op == Op::Call ? "abi.call" : i.op == Op::Return ? "abi.return" : i.op == Op::Jump ? "jump" : "branch");
         }
         for (int a : i.args) out << " %" << a << (floating(f.values[a]) ? ":fp:early" : ":gp:early");
         out << " imm=" << i.immediate;
         if (i.target >= 0) out << " b" << i.target;
         if (i.otherwise >= 0) out << " b" << i.otherwise;
-        if (i.callee) out << " @" << i.callee->linkageName << " clobber=gp:" << i.integerClobbers << ",fp:" << i.floatClobbers;
+        if (i.symbol) out << " object=" << i.symbol->name;
+        if (i.op == Op::Call && i.callee) out << " @" << i.callee->linkageName << " clobber=gp:" << i.integerClobbers << ",fp:" << i.floatClobbers;
         out << '\n';
       }
     }
