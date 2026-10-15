@@ -90,14 +90,22 @@ class Selector {
         else copy(dst,a);
         return true;
       }
-      int bias = emit(RV::Sraiw,{a},31);
-      bias = emit(RV::Srliw,{bias},32-shift);
-      quotient = emit(RV::Addw,{a,bias});
-      quotient = emit(RV::Sraiw,{quotient},shift);
-      if (i.op == Op::Rem) {
-        int product = emit(RV::Slliw,{quotient},shift); emit(RV::Subw,{a,product},0,dst);
-      } else if (d < 0) emit(RV::Negw,{quotient},0,dst);
-      else copy(dst,quotient);
+      int bias = shift == 1 ? emit(RV::Srliw,{a},31) : emit(RV::Sraiw,{a},31);
+      if (shift != 1) bias = emit(RV::Srliw,{bias},32-shift);
+      int adjusted = emit(RV::Addw,{a,bias});
+      if (i.op == Op::Rem && small(int64_t(magnitude-1))) {
+        // Bias corrects truncation towards zero. Mask before removing it:
+        // ((x+bias)&(2^k-1))-bias also preserves negative remainders.
+        int residue = emit(RV::Andi,{adjusted},magnitude-1);
+        emit(RV::Subw,{residue,bias},0,dst);
+      } else {
+        quotient = emit(RV::Sraiw,{adjusted},shift);
+        // Large masks require materialization. Keep the cheaper shifted
+        // quotient reconstruction, also sharing it with an existing division.
+        if (i.op == Op::Rem) {
+          int product = emit(RV::Slliw,{quotient},shift); emit(RV::Subw,{a,product},0,dst);
+        } else if (d < 0) emit(RV::Negw,{quotient},0,dst); else copy(dst,quotient);
+      }
       return true;
     }
     uint64_t half = uint64_t{1} << 31, t = half+(d<0), anchor = t-1-t%magnitude;

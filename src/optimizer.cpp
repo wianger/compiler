@@ -1974,7 +1974,7 @@ void strength(FunctionIR &f) {
     struct IV { int phi, initial, step, preheader, latch; int64_t low, high; };
     std::vector<IV> induction;
     const auto &branch = f.blocks[loop.header].instructions.back();
-    if (branch.op != Op::Branch || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise)) continue;
+    if (branch.op != Op::Branch || branch.target == loop.header || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise)) continue;
     auto compare = defs[branch.args[0]];
     if (!compare || compare->op != Op::Lt) continue;
     for (const auto &phi : f.blocks[loop.header].instructions) {
@@ -1982,13 +1982,16 @@ void strength(FunctionIR &f) {
       int outside = loop.blocks.count(phi.edges[0]) ? 1 : 0, inside = 1 - outside;
       if (loop.blocks.count(phi.edges[outside]) || !loop.blocks.count(phi.edges[inside])) continue;
       auto init = defs[phi.args[outside]], update = defs[phi.args[inside]];
-      if (!init || init->op != Op::Constant || init->immediate < 0 || !update || update->op != Op::Add) continue;
+      if (!init || !update || update->op != Op::Add) continue;
       int step = update->args[0] == phi.result ? update->args[1] : update->args[1] == phi.result ? update->args[0] : -1;
       if (step < 0 || !defs[step] || defs[step]->op != Op::Constant || defs[step]->immediate != 1) continue;
       auto bound = defs[compare->args[1]];
       int64_t high = bound && bound->op == Op::Constant ? bound->immediate - 1 : INT32_MAX - 1;
-      if (high <= init->immediate || graph.succ[phi.edges[outside]].size() != 1) continue;
-      induction.push_back({phi.result, phi.args[outside], step, phi.edges[outside], phi.edges[inside], init->immediate, high});
+      // The signed < true edge proves +1 cannot wrap, even for dynamic or
+      // negative initial values. Only accesses dominated by this edge use it.
+      int64_t low = init->op == Op::Constant ? init->immediate : INT32_MIN;
+      if (high <= low || graph.succ[phi.edges[outside]].size() != 1) continue;
+      induction.push_back({phi.result, phi.args[outside], step, phi.edges[outside], phi.edges[inside], low, high});
     }
     for (const auto &iv : induction) {
       using Range = std::optional<std::pair<int64_t, int64_t>>;
@@ -2017,7 +2020,7 @@ void strength(FunctionIR &f) {
           const auto &last = f.blocks[site[v]].instructions.back();
           if (last.op == Op::Branch && defs[last.args[0]] && defs[last.args[0]]->op == Op::Lt && defs[last.args[0]]->args[0] == v) {
             auto limit = defs[defs[last.args[0]]->args[1]];
-            bool canonical = limit && limit->op == Op::Constant && limit->immediate > 0;
+            bool canonical = limit && limit->op == Op::Constant && limit->immediate > 0 && last.target != site[v] && graph.dominates(last.target,iv.preheader);
             bool initial = false, increment = false;
             for (int a : i.args) if (defs[a]) {
               if (defs[a]->op == Op::Constant && defs[a]->immediate == 0) initial = true;
@@ -2046,10 +2049,15 @@ void strength(FunctionIR &f) {
         return {};
       };
       std::vector<int> candidates;
-      for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) if (i.op == Op::Offset && !loop.blocks.count(site[i.args[0]])) {
+      for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions) if (i.op == Op::Offset && !loop.blocks.count(site[i.args[0]]) && graph.dominates(branch.target,b)) {
         if (!range(i.args[1])) continue;
         auto c = coefficient(i.args[1]);
         if (c && *c > 0 && i.immediate > 0 && *c <= INT64_MAX / i.immediate) candidates.push_back(i.result);
+      }
+      if (defs[iv.initial]->op != Op::Constant || defs[iv.initial]->immediate < 0) {
+        std::set<int> bases;
+        for (int v : candidates) bases.insert(defs[v]->args[0]);
+        if (bases.size() < 2) continue; // Amortize setup and extra live pointer state.
       }
       for (int candidate : candidates) {
         const auto source = *defs[candidate]; auto scale = *coefficient(source.args[1]);

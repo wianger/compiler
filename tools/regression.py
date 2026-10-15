@@ -629,6 +629,59 @@ def main():
         (directory / f"loop_memory_float_{trip}.in").write_text(f"{trip}\n")
     def quotient(x,d): return wrap(abs(x)//abs(d)*(-1 if (x<0)!=(d<0) else 1))
     def remainder(x,d): return wrap(x-quotient(x,d)*d)
+    for scale in (1,2):
+        for alias in (False,True):
+            for case,(initial,limit) in enumerate(((0,0),(0,1),(3,11),(11,3),(2147483647,2147483646),(-2147483647,-2147483648))):
+                name=f"dynamic_induction_{scale}_{int(alias)}_{case}"
+                data=[[j*3+17 for j in range(32)],[j*-5+31 for j in range(32)]]
+                a,b=data[0],data[0 if alias else 1];total=0
+                for i in range(initial,limit):
+                    index=i*scale;a[index]=wrap(a[index]+b[index]-7);b[index]=wrap(a[index]+13)
+                    total=wrap(total+b[index])
+                final=max(initial,limit)
+                cases[name]=(f'''int run(int a[],int b[],int first,int end){{int i=first;int sum=0;
+                  while(i<end){{a[i*{scale}]=a[i*{scale}]+b[i*{scale}]-7;
+                    b[i*{scale}]=a[i*{scale}]+13;sum=sum+b[i*{scale}];i=i+1;}}return i+sum;}}
+                  int main(){{int data[2][32];int j=0;while(j<32){{data[0][j]=j*3+17;data[1][j]=j*(-5)+31;j=j+1;}}
+                    int first=getint();int end=getint();putint(run(data[0],data[{0 if alias else 1}],first,end));
+                    putch(10);putarray(32,data[0]);putarray(32,data[1]);return 0;}}''',
+                  f"{wrap(final+total)}\n"+"".join("32: "+" ".join(map(str,row))+"\n" for row in data)+"0\n")
+                (directory/f"{name}.in").write_text(f"{initial} {limit}\n")
+    for alias in (False,True):
+        for first in (-7,-1):
+            name=f"negative_induction_{int(alias)}_{-first}"
+            data=[[i+1 for i in range(16)],[i+17 for i in range(16)]]
+            a,b=data[0],data[0 if alias else 1]
+            for i in range(12):a[i]=wrap(a[i]+b[i]);b[i]=wrap(a[i]-7)
+            cases[name]=(f'''int main(){{int data[2][16];int i=0;while(i<16){{data[0][i]=i+1;data[1][i]=i+17;i=i+1;}}
+              i=getint();while(i<12){{if(i>=0){{data[0][i]=data[0][i]+data[{0 if alias else 1}][i];
+                data[{0 if alias else 1}][i]=data[0][i]-7;}}i=i+1;}}putint(i);putch(10);
+              putarray(16,data[0]);putarray(16,data[1]);return 0;}}''',
+              "12\n"+"".join("16: "+" ".join(map(str,row))+"\n" for row in data)+"0\n")
+            (directory/f"{name}.in").write_text(f"{first}\n")
+    for first,limit in ((0,4),(2147483647,2147483647)):
+        name=f"guarded_induction_load_{first}"
+        cases[name]=('''int main(){int a[8]={1,2,3,4,5,6,7,8};int i=getint();int n=getint();
+          int sum=0;while(i<n && a[i]){sum=sum+a[i];i=i+1;}putint(sum);putch(32);putint(i);return 0;}''',
+          f"{10 if first==0 else 0} {limit}\n0\n")
+        (directory/f"{name}.in").write_text(f"{first} {limit}\n")
+    power_rng=random.Random(20261016)
+    for group,shifts in enumerate((range(1,12),range(12,22),range(22,32))):
+        divisors=[sign*(1<<k) for k in shifts for sign in (1,-1) if sign*(1<<k)<=2147483647]
+        inputs=[-2147483648,-2147483647,-1,0,1,2147483646,2147483647]
+        inputs += [wrap(sign*(1<<k)+delta) for k in shifts for sign in (1,-1) for delta in (-1,0,1)]
+        inputs += [power_rng.randrange(-2147483648,2147483648) for _ in range(16)]
+        for paired in (False,True):
+            name=f"power_divrem_{group}_{int(paired)}"
+            expressions=[e for d in divisors for e in ([f"x/({d})",f"x%({d})"] if paired else [f"x%({d})"])]
+            fmt=" ".join(["%d"]*len(expressions))+"\\n"
+            expected=[]
+            for x in inputs:
+                row=[str(v) for d in divisors for v in ([quotient(x,d),remainder(x,d)] if paired else [remainder(x,d)])]
+                expected.append(" ".join(row))
+            cases[name]=(f'''int main(){{int i=0;while(i<{len(inputs)}){{int x=getint();
+              putf("{fmt}",{','.join(expressions)});i=i+1;}}return 0;}}''',"\n".join(expected)+"\n0\n")
+            (directory/f"{name}.in").write_text("\n".join(map(str,inputs))+"\n")
     guard_rng = random.Random(20261019)
     for n in range(24):
         x = ([-2**31,-2**31+1,-65537,-1,0,1,65537,2**31-18,2**31-1]+[guard_rng.randrange(-2**31,2**31) for _ in range(15)])[n]

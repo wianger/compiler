@@ -133,6 +133,13 @@ def check_smt():
             prove(f"nonnegative division/{divisor}", x/d, q if sign > 0 else -q, x >= 0)
             prove(f"nonnegative remainder/{divisor}", z3.SRem(x,d), x & mask, x >= 0)
             prove(f"zero remainder/{divisor}", z3.SRem(x,d)==0, (x & mask)==0)
+            if shift:
+                bias=z3.LShR(x,31) if shift==1 else z3.LShR(x>>31,32-shift)
+                adjusted=x+bias
+                quotient=adjusted>>shift
+                prove(f"signed biased division/{divisor}",x/d,quotient if sign>0 else -quotient)
+                rem=(adjusted & mask)-bias if (1<<shift)-1<=2047 else x-((adjusted>>shift)<<shift)
+                prove(f"signed biased remainder/{divisor}",z3.SRem(x,d),rem)
     prove("conditional integer accumulation", z3.If(condition,accumulator+term,accumulator),
           accumulator+z3.If(condition,z3.BitVecVal(1,32),z3.BitVecVal(0,32))*term)
     # Repeated positive power-of-two division truncates towards zero, even
@@ -194,6 +201,17 @@ def check_smt():
           initial>=0,iv>=initial,iv<limit)
     prove("signed +1 induction preserves upper bound",iv+1<=limit,z3.BoolVal(True),
           initial>=0,iv>=initial,iv<limit)
+    prove("signed dynamic induction increment does not wrap",iv+1>iv,z3.BoolVal(True),iv<limit)
+    extended=z3.SignExt(32,iv)
+    prove("signed index extension step",z3.SignExt(32,iv+1),extended+1,iv<2147483647)
+    # Compose the extension lemma with ring arithmetic. Normalize polynomials
+    # before bit-blasting; expanded wide constant multiplies can time out.
+    for byte_stride in (4,8,404,516):
+        prove(f"signed pointer induction/{byte_stride}",
+              z3.simplify(pointer+(extended+1)*byte_stride,som=True),
+              z3.simplify(pointer+extended*byte_stride+byte_stride,som=True))
+    solver=z3.Solver();solver.add(iv==2147483647,z3.SignExt(32,iv+1)!=extended+1)
+    if solver.check()!=z3.sat:raise AssertionError("index extension guard counterexample missing")
     prove("zero-trip header included",initial<=z3.If(initial>limit,initial,limit),z3.BoolVal(True))
     prove("canonical false-edge exact exit",iv,limit,limit>=0,iv>=0,iv<=limit,z3.Not(iv<limit))
     for j in range(4):
@@ -217,6 +235,9 @@ def check_smt():
                                ("subtract self",x-x,z3.BitVecVal(0,32))):
         prove(name,before,after)
     # A mutation must produce a counterexample: dropping the sign guard is unsound.
+    solver=z3.Solver();solver.add(z3.SRem(x,8)!=(x & 7))
+    if solver.check()!=z3.sat:
+        raise AssertionError("SMT check failed to detect a missing remainder bias")
     solver=z3.Solver();solver.add(x/8 != z3.LShR(x,3))
     if solver.check() != z3.sat:
         raise AssertionError("SMT check failed to detect a missing sign guard")
