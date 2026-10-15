@@ -201,7 +201,7 @@ struct PointerLocation {
   }
 };
 uint64_t accessSize(ValueType type) {
-  return type == ValueType::Pointer || type == ValueType::Double ? 8 : 4;
+  return type == ValueType::Pointer || type == ValueType::Double || type == ValueType::WideInt ? 8 : 4;
 }
 // Unknown arithmetic and phis retain their own SSA identity. Constant offsets
 // may still distinguish fields relative to that identity, without assuming
@@ -527,6 +527,7 @@ std::optional<int64_t> fold(const Instruction &i, const FunctionIR &f, const std
   if (i.args.empty()) return {};
   auto type = f.values[i.args[0]], to = i.result >= 0 ? f.values[i.result] : ValueType::Int;
   int64_t x = defs[i.args[0]]->immediate, y = i.args.size() > 1 ? defs[i.args[1]]->immediate : 0;
+  if (i.op == Op::ModMul) return (int64_t(static_cast<int32_t>(x))*static_cast<int32_t>(y))%i.immediate;
   if (i.op == Op::Neg) return type == ValueType::Float ? bits(-fromBits(x)) : static_cast<int32_t>(0u - static_cast<uint32_t>(x));
   if (i.op == Op::Convert) {
     if (type == ValueType::Int && to == ValueType::Float) return bits(static_cast<float>(static_cast<int32_t>(x)));
@@ -2173,6 +2174,8 @@ void printEffects(const ModuleIR &module, std::ostream &out) {
     };
     out << "function " << f.source->name << " reads="; regions(e.reads);
     out << " writes="; regions(e.writes); out << " observable=" << (e.observable ? "yes" : "no") << '\n';
+    if (auto p = f.source->modularProduct)
+      out << "  modular-product a=" << p->a << " b=" << p->b << " modulus=" << p->modulus << " guard=0<=a<modulus,b>=0\n";
   }
 }
 

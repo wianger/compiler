@@ -140,6 +140,7 @@ struct Symbol {
 
 struct Function {
   struct AffineReturn { uint32_t offset = 0; std::vector<uint32_t> coefficients; };
+  struct ModularProduct { int a = 0, b = 1; int32_t modulus = 0; };
   struct ReplayRegion {
     struct Bound { int32_t lower = 0, upper = INT32_MAX - 1; };
     const Symbol *output = nullptr;
@@ -156,6 +157,8 @@ struct Function {
   std::vector<int64_t> resultShape;
   // Pure scalar transfer function over the int32 ring, independent of names.
   std::optional<AffineReturn> affineReturn;
+  // A complete divide-by-two recurrence certificate, under 0<=a<M, b>=0.
+  std::optional<ModularProduct> modularProduct;
   // Under parameter guards, a complete region kill makes the return and final
   // output independent of the incoming output. Other objects are read-only.
   std::optional<ReplayRegion> replayRegion;
@@ -225,7 +228,7 @@ void planTensors(ProgramIR &program, int tile = 0);
 void printTensorPlan(const ProgramIR &program, std::ostream &out);
 void expandTensors(ProgramIR &program);
 void analyzeTensors(ProgramIR &program);
-struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true, regionSummaries = true, loopPartition = true, smallUnroll = true, constantLoops = true; };
+struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true, regionSummaries = true, loopPartition = true, smallUnroll = true, constantLoops = true, modularProducts = true; };
 void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options = {});
 void optimizePolyhedral(ProgramIR &program, int level, int tile = 0);
 void printPolyhedralIR(const ProgramIR &program, std::ostream &out);

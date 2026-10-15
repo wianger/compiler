@@ -34,6 +34,8 @@ Source → source-slice Token IR → arena Program IR → resolved HIR
 
 HIR 的有界整数求值和小循环完整展开进一步暴露常量索引与有序初始化；`arg-specialize` 传播一致的全局指针实参，`global-constants` 用调用前 MemorySSA 传播精确常量单元。作用域归纳区间使后续循环能折叠私有表的一致区间，并删除已无读取的初始化。各项有工作／增长预算和独立消融开关，细节见技术调研文档。
 
+HIR 还为完整的二分递归模乘建立语义证书，以入口范围守卫选择精确的宽乘积与余数，其他输入保留原递推。CIR `ModMul` 与目标 MIR `WideInt` 明确区分 int32 环绕和 int64 中间计算，避免在拓宽前丢失乘积；`--no-modular-products` 可单独关闭，`--emit-effects` 可查看证书。
+
 标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。Token、Program、SSA 和降 Phi 后的 IR 可单独打印，各 PASS 可以重新组合。
 
 采用的现代设计及准确实现边界见 [Architecture-Research.md](docs/Architecture-Research.md)，全阶段调研、取舍与下一批实验见 [Compiler-Research.md](docs/Compiler-Research.md)。红绿 CST、完整 SoA、跨 CFG AEGraph、ISLE DSL 和完整 regalloc3 尚未实现；当前批量编译使用源码切片、块状 arena、自有目标 MIR 和区间分配器。
@@ -57,7 +59,7 @@ build/compiler --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce in
 
 默认 `-O0`。`-O1` 使用标量 SSA 优化，`-O2` 增加调用、内存、循环和 tensor 结构优化，`-O3` 增加循环展开与经过数据流检查的重复循环归约。追求执行性能时使用 `-O3`。`-o -` 输出到标准输出，`-` 输入从标准输入读取。错误带文件、行、列；失败不会覆盖已有输出文件。
 
-`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。`memory` 在同一分析快照中先将可证明的内存 Phi 转成值 Phi，再协作执行 GVN 与加载前向；`memory-basic` 关闭 Phi 前向，`memory-phi` 可单独检查该步骤。EGraph 只提取区域外使用的结果，并按共同依赖的 DAG 对共享子式计费，搜索超预算保留已验证的候选。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数规则，编译器本身无需此依赖。
+`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。`memory` 在同一分析快照中先将可证明的内存 Phi 转成值 Phi，再协作执行 GVN 与加载前向；`memory-basic` 关闭 Phi 前向，`memory-phi` 可单独检查该步骤。EGraph 只提取区域外使用的结果，并按共同依赖的 DAG 对共享子式计费，搜索超预算保留已验证的候选。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR 和模乘 CIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数规则，编译器本身无需此依赖。
 
 优化保留浮点运算顺序，不启用 fast-math 或 FMA 重结合。浮点矩阵算法变换要求证明每一步乘积和部分和都能精确表示；未知浮点值走普通内核。常量求值采用目标的 [NaN 规则](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)。
 
@@ -86,4 +88,4 @@ python3 tools/regression.py
 
 根据额外测试支持 `tensor int/float` 数组、逐元素 `+ - * / %`、一元 `+ -`、标量广播、`@` 二维矩阵乘法、tensor 参数和返回值。逐元素操作要求相同形状；矩阵乘法要求内部维度匹配；`%` 只接受整数。返回形状从函数体推导，各个 return 必须形状一致。tensor 运算和返回需要静态已知的维度；省略首维的 tensor 参数可按普通数组索引访问。
 
-性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 各 **210/210**；831 个额外程序在 `-O0`、`-O2`、`-O3` 共 **2493 次执行**及 **20 个诊断**通过。另有 **1068 次 ASan/UBSan 编译**、**56 个 MIR 破坏性变异**和 **248 条离线规则证明**。QEMU 共同输入对照的 wall 几何平均为 **1.205×**，固定较长计时区间为 **1.639×**；原生编译总耗时约为 sysy-competition 的 **1/29.5**。相比本轮基线，全部输入编译总耗时增加 **3.63%**，平均 **4.64 ms／输入**。卷积三项已反超，全面领先仍未完成；单项消融、剩余差距与测量范围见性能文档。
+性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 各 **210/210**；859 个额外程序在 `-O0`、`-O2`、`-O3` 共 **2577 次执行**及 **20 个诊断**通过。另有 **1096 次 ASan/UBSan 编译**、**77 个 MIR／19 个 CIR 破坏性变异**和 **263 条离线规则证明**。QEMU 共同输入对照的 wall 几何平均为 **1.255×**，固定较长计时区间为 **1.986×**；FFT 三项区间相对 sysy-competition 快 **7.58×～22.32×**。全部输入平均编译 **4.66 ms／输入**，本轮未观察到总编译成本增加。Gaussian 等单项仍有差距，全面领先尚未完成；独立消融和测量范围见性能文档。

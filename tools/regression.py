@@ -1057,6 +1057,60 @@ def main():
                        " ".join(str(values[i]) for i in selected[:-3])+"\n"+
                        " ".join(str(values[i]) for i in selected[-3:])+"\n0\n")
         (directory / f"{name}.in").write_text(" ".join(map(str,inputs))+"\n")
+    # Model the original recursive int32 operations, including overflow at each
+    # addition. This deliberately differs from widened multiplication outside
+    # the proven guard or when the doubling modulus exceeds 2^30.
+    def modular_model(a,b,m,mode="",trace=None):
+        if b==0:return 1 if mode=="zero" else 0
+        if b==1:return remainder(a,m+1 if mode=="unit" else m)
+        half=abs(b)//(3 if mode=="half" else 2)*(1 if b>=0 else -1)
+        cur=modular_model(wrap(a+1) if mode=="argument" else a,half,m,mode,trace)
+        if mode=="effect":trace.append("X")
+        cur=wrap(cur*2)
+        if mode!="double":cur=remainder(cur,m)
+        if remainder(b,2)==(0 if mode=="parity" else 1):cur=remainder(wrap(cur+a),m)
+        return cur
+    def modular_source(m,mode="",swapped=False):
+        params="int b,int a" if swapped else "int a,int b"
+        recur=f"{'b/3' if mode=='half' else 'b/2'},a" if swapped else f"{'a+1' if mode=='argument' else 'a'},b/{3 if mode=='half' else 2}"
+        zero="1" if mode=="zero" else "0";unit="(M+1)" if mode=="unit" else "M"
+        double="(c+c)" if mode=="double" else "(c+c)%M"
+        prefix='putch(88);' if mode=="effect" else ''
+        final="if(1==b%2)return (a+c)%M;return c;" if swapped else f"if(b%2=={0 if mode=='parity' else 1})return (c+a)%M;else return c;"
+        return f'''const int M={m};int ring({params}){{if({'0==b' if swapped else 'b==0'})return {zero};
+          if(b==1)return a%{unit};int c=ring({recur});{prefix}c={double};{final}}}'''
+    mod_rng=random.Random(20261015)
+    for m in (1,2,3,97,998244353,1073741824,1073741825,2147483647,-97):
+        for swapped in (False,True):
+            pairs=[(0,0),(0,2147483647),(1,1),(1,2),(m-1,2),(m-1,31),
+                   (m-1,2147483647),(m,3),(wrap(m+1),2147483647),(-1,2),(-1,3),
+                   (-2147483648,-2147483648),(-2147483648,2147483647),(2147483647,3),(2147483647,2147483647)]
+            pairs += [(mod_rng.randrange(-2147483648,2147483648),mod_rng.randrange(-2147483648,2147483648)) for _ in range(16)]
+            name=f"modular_product_{m}_{int(swapped)}"
+            args="b,a" if swapped else "a,b"
+            cases[name]=(modular_source(m,swapped=swapped)+f'''int main(){{int i=0;
+              while(i<{len(pairs)}){{int a=getint();int b=getint();putint(ring({args}));putch(10);i=i+1;}}return 0;}}''',
+              "\n".join(str(modular_model(a,b,m)) for a,b in pairs)+"\n0\n")
+            (directory / f"{name}.in").write_text("".join(f"{a} {b}\n" for a,b in pairs))
+    for mode in ("zero","unit","half","argument","double","parity","effect"):
+        pairs=[(0,0),(13,1),(-17,3),(96,2147483647),(2147483647,31),(-2147483648,-1)]
+        output=[]
+        for a,b in pairs:
+            trace=[];result=modular_model(a,b,97,mode,trace);output.append("".join(trace)+str(result))
+        name="modular_product_reject_"+mode
+        cases[name]=(modular_source(97,mode)+f'''int main(){{int i=0;while(i<{len(pairs)}){{
+          int a=getint();int b=getint();putint(ring(a,b));putch(10);i=i+1;}}return 0;}}''',"\n".join(output)+"\n0\n")
+        (directory / f"{name}.in").write_text("".join(f"{a} {b}\n" for a,b in pairs))
+    for a,b in ((96,2147483647),(-17,31)):
+        name=f"modular_product_arguments_{a}"
+        cases[name]=(modular_source(97)+'''int main(){putint(ring(getint(),getint()));
+          putch(32);putint(getint());return 0;}''',f"{modular_model(a,b,97)} 731\n0\n")
+        (directory / f"{name}.in").write_text(f"{a} {b} 731\n")
+    source=modular_source(97).replace('const int M=97;','int M=97;')
+    cases["modular_product_mutable_modulus"]=(source+'''int main(){int a=getint();int b=getint();
+      putint(ring(a,b));putch(32);M=1073741825;putint(ring(a,b));return 0;}''',
+      f"{modular_model(1073741824,3,97)} {modular_model(1073741824,3,1073741825)}\n0\n")
+    (directory / "modular_product_mutable_modulus.in").write_text("1073741824 3\n")
     for changed in (False,True):
         for unknown_read in (False,True):
             name=f"table_sequential_{int(changed)}_{int(unknown_read)}"

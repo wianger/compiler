@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation-test the MIR verifier and optionally prove int32 rewrite rules."""
+"""Mutation-test IR verifiers and optionally prove integer rewrite rules."""
 import argparse
 import os
 from pathlib import Path
@@ -34,13 +34,16 @@ int main() {
     specimen(RV::FcvtDS,ValueType::Double,{ValueType::Float}),
     specimen(RV::FmvDX,ValueType::Double,{ValueType::Pointer}),
     specimen(RV::Addi,ValueType::Pointer,{ValueType::Pointer}),
-    specimen(RV::Mul,ValueType::Pointer,{ValueType::Int,ValueType::Int})};
+    specimen(RV::Mul,ValueType::Pointer,{ValueType::Int,ValueType::Int}),
+    specimen(RV::Mul,ValueType::WideInt,{ValueType::Int,ValueType::Int}),
+    specimen(RV::Rem,ValueType::WideInt,{ValueType::WideInt,ValueType::WideInt}),
+    specimen(RV::Addiw,ValueType::Int,{ValueType::WideInt})};
   for(const auto &f:examples) {
     verifyTarget(f);++valid;
     for(size_t a=1;a<f.values.size();++a) {
       auto bad=f; bad.values[a]=f.values[a]==ValueType::Float ? ValueType::Int : ValueType::Float;reject(bad);
     }
-    auto bad=f;bad.values[0]=f.values[0]==ValueType::Int||f.values[0]==ValueType::Pointer ? ValueType::Float : ValueType::Int;reject(bad);
+    auto bad=f;bad.values[0]=f.values[0]==ValueType::Int||f.values[0]==ValueType::Pointer||f.values[0]==ValueType::WideInt ? ValueType::Float : ValueType::Int;reject(bad);
     bad=f;bad.blocks[0].instructions[0].result=-2;reject(bad);
     bad=f;bad.blocks[0].instructions[0].args={99};reject(bad);
     bad=f;bad.blocks[0].instructions[0].opcode=static_cast<RV>(999);reject(bad);
@@ -54,6 +57,7 @@ int main() {
   bad=examples[0];bad.blocks[0].instructions[0]=MachineInstruction{Op::SpillLoad};bad.blocks[0].instructions[0].result=0;bad.slots={ValueType::Float};reject(bad);
   bad=examples[0];bad.values[0]=static_cast<ValueType>(99);reject(bad);
   bad=examples[0];bad.blocks[0].instructions[0].integerClobbers=uint32_t{1}<<31;reject(bad);
+  bad=examples[0];bad.blocks[0].instructions[0].op=Op::ModMul;bad.blocks[0].instructions[0].opcode=RV::Pseudo;reject(bad);
   for(int displacement:{-2048,2047}) {
     auto memory=examples[0];memory.values[1]=ValueType::Pointer;
     auto &load=memory.blocks[0].instructions[0];load=MachineInstruction{Op::Load};
@@ -61,6 +65,28 @@ int main() {
     load.immediate=displacement<0 ? -2049 : 2048;reject(memory);
   }
   std::cout<<valid<<" valid MIR examples; "<<rejected<<" malformed mutations rejected\n";
+  Function scalar;scalar.result=Base::Int;
+  ModuleIR module{};FunctionIR f{&scalar,{ValueType::Int,ValueType::Int,ValueType::Int},{},{},{},false};
+  Instruction x{Op::Constant};x.result=1;x.immediate=31;
+  Instruction y{Op::Constant};y.result=2;y.immediate=17;
+  Instruction product{Op::ModMul};product.result=0;product.args={1,2};product.immediate=97;
+  Instruction ret{Op::Return};ret.args={0};f.blocks={{"entry",{x,y,product,ret}}};
+  module.functions={f};verify(module);int cirRejected=0;
+  auto rejectCIR=[&](FunctionIR mutation) {
+    module.functions={mutation};
+    try {verify(module);}catch(const std::logic_error &){++cirRejected;return;}
+    throw std::runtime_error("verifier accepted a malformed modular product");
+  };
+  for(int64_t modulus:{INT64_C(-1),INT64_C(0),INT64_C(1),INT64_C(1073741825),INT64_C(2147483647)}) {
+    auto mutation=f;mutation.blocks[0].instructions[2].immediate=modulus;rejectCIR(mutation);
+  }
+  for(auto args:{std::vector<int>{1},std::vector<int>{1,2,1}}) {
+    auto mutation=f;mutation.blocks[0].instructions[2].args=args;rejectCIR(mutation);
+  }
+  for(int value:{0,1,2})for(auto type:{ValueType::Float,ValueType::Double,ValueType::Pointer,ValueType::WideInt}) {
+    auto mutation=f;mutation.values[value]=type;rejectCIR(mutation);
+  }
+  std::cout<<"1 valid CIR example; "<<cirRejected<<" malformed modular products rejected\n";
 }
 '''
 
@@ -127,6 +153,25 @@ def check_smt():
               (integer+delta)%modulus,integer>=0)
     y=z3.BitVec('summary_arg',32)
     prove('composed affine return summary',x-(x+y)+y,z3.BitVecVal(0,32))
+    # Exact mathematical recurrence under the range certificate. Separately
+    # prove representability of source additions and the widened product.
+    ma,mb,mr,mm,mt=z3.Ints('ma mb mr mm mt')
+    prove('modular product source doubling fits',mr+mr<=2147483647,z3.BoolVal(True),
+          mm>=2,mm<=1073741824,mr>=0,mr<mm)
+    prove('modular product source addition fits',mr+ma<=2147483647,z3.BoolVal(True),
+          mm>=2,mm<=1073741824,mr>=0,mr<mm,ma>=0,ma<mm)
+    prove('modular product fits signed64',ma*mb<=9223372036854775807,z3.BoolVal(True),
+          ma>=0,ma<1073741824,mb>=0,mb<=2147483647)
+    prove('modular product base zero',ma*0,z3.IntVal(0))
+    prove('modular product base one',ma%mm,ma,ma>=0,ma<mm,mm>=2)
+    for modulus in (2,3,97,998244353,1073741824):
+        for bit in (0,1):
+            prove(f'modular product recurrence/{modulus}/{bit}',
+                  ((2*(mt%modulus))%modulus+ma*bit)%modulus,
+                  (2*mt+ma*bit)%modulus,mt>=0,ma>=0,ma<modulus)
+    # The modulus guard is necessary: 2*(M-1) otherwise overflows int32.
+    solver=z3.Solver();solver.add(mm==1073741825,mr==mm-1,mr+mr>2147483647)
+    if solver.check()!=z3.sat:raise AssertionError('modulus overflow counterexample missing')
     pointer,displacement,stride=z3.BitVecs('pointer displacement stride',64)
     alpha,beta=z3.BitVecs('seed_alpha seed_beta',64)
     prove('congruent pointer recurrence seeds',pointer+alpha,(pointer+beta)+(alpha-beta))

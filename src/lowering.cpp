@@ -233,11 +233,28 @@ public:
       module.functions.push_back({item.function.get(), {}, {}, {}, {}, false}); function = &module.functions.back();
       parameters.clear(); current = block("entry");
       int index = 0;
+      std::vector<int> arguments;
       for (const auto &v : item.function->parameters) {
         auto &s = *v.symbol;
         int arg = value(Op::Parameter, s.type.array() ? ValueType::Pointer : valueType(s.type.base), {}, index++);
+        arguments.push_back(arg);
         if (s.type.array()) parameters[&s] = arg;
         else { function->objects.push_back(&s); store(address(&s), arg); }
+      }
+      if (auto fact = item.function->modularProduct) {
+        int a = arguments.at(fact->a), b = arguments.at(fact->b), zero = constant(Number::fromInt(0));
+        int modulus = constant(Number::fromInt(fact->modulus));
+        int nonnegative = value(Op::Ge,ValueType::Int,{a,zero});
+        int bounded = value(Op::Lt,ValueType::Int,{a,modulus});
+        int positiveCount = value(Op::Ge,ValueType::Int,{b,zero});
+        int within = value(Op::And,ValueType::Int,{nonnegative,bounded});
+        int guard = value(Op::And,ValueType::Int,{within,positiveCount});
+        int fast = block("modular.product"), fallback = block("modular.fallback");
+        Instruction branch{Op::Branch}; branch.args = {guard}; branch.target = fast; branch.otherwise = fallback; emit(branch);
+        current = fast;
+        int result = value(Op::ModMul,ValueType::Int,{a,b},fact->modulus);
+        Instruction finish{Op::Return}; finish.args = {result}; emit(finish);
+        current = fallback;
       }
       statement(*item.function->body);
       if (live()) {
@@ -360,7 +377,7 @@ void verify(const ModuleIR &module) {
         size_t arity = 0;
         switch (i.op) {
         case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Convert: case Op::Branch: arity = 1; break;
-        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem: case Op::And: case Op::Shr:
+        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem: case Op::And: case Op::Shr: case Op::ModMul:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::BranchCompare: arity = 2; break;
         case Op::Call:
           require(i.callee != nullptr, "IR call has no callee");
@@ -407,6 +424,8 @@ void verify(const ModuleIR &module) {
           if (i.op == Op::Rem) require(a(0) == ValueType::Int, "IR remainder requires int values");
         }
         if (i.op == Op::And || i.op == Op::Shr) require(a(0) == ValueType::Int && a(1) == ValueType::Int && f.values[i.result] == ValueType::Int, "IR bit operation requires int values");
+        if (i.op == Op::ModMul) require(a(0) == ValueType::Int && a(1) == ValueType::Int && f.values[i.result] == ValueType::Int &&
+            i.immediate >= 2 && i.immediate <= (1<<30), "IR modular product requires int operands and a bounded modulus");
         if (i.op >= Op::Eq && i.op <= Op::Ge)
           require(a(0) == a(1) && f.values[i.result] == ValueType::Int, "IR comparison type mismatch");
         bool terminal = i.op == Op::Jump || i.op == Op::Branch || i.op == Op::BranchCompare || i.op == Op::Return;
@@ -422,8 +441,8 @@ void verify(const ModuleIR &module) {
 }
 void printIR(const ModuleIR &module, std::ostream &out) {
   static const char *ops[] = {"constant", "address", "string", "parameter", "move", "load", "store", "offset", "zero",
-      "add", "sub", "mul", "div", "rem", "and", "shr", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare"};
-  static const char *types[] = {"i32", "f32", "ptr", "f64"};
+      "add", "sub", "mul", "div", "rem", "and", "shr", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare", "modmul"};
+  static const char *types[] = {"i32", "f32", "ptr", "f64", "i64"};
   for (const auto &f : module.functions) {
     out << "function " << f.source->name << " {\n";
     for (size_t b = 0; b < f.blocks.size(); ++b) {
@@ -436,7 +455,7 @@ void printIR(const ModuleIR &module, std::ostream &out) {
         if (i.callee) out << ' ' << i.callee->linkageName;
         for (int arg : i.args) out << " %" << arg;
         for (int edge : i.edges) out << " from b" << edge;
-        if (i.op == Op::Constant || i.op == Op::Parameter || i.op == Op::Offset || i.op == Op::Zero || i.op == Op::Address) out << ' ' << i.immediate;
+        if (i.op == Op::Constant || i.op == Op::Parameter || i.op == Op::Offset || i.op == Op::Zero || i.op == Op::Address || i.op == Op::ModMul) out << ' ' << i.immediate;
         if (i.op == Op::String) out << ' ' << std::quoted(i.text);
         if (i.target >= 0) out << " b" << i.target;
         if (i.otherwise >= 0) out << " b" << i.otherwise;

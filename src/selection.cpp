@@ -6,7 +6,7 @@
 
 namespace sysy {
 const char *rvName(RV op) {
-  static const char *names[] = {"pseudo","add","addi","addw","addiw","subw","mul","mulw","divw","remw","and","andi",
+  static const char *names[] = {"pseudo","add","addi","addw","addiw","subw","mul","mulw","divw","remw","rem","and","andi",
     "slli","slliw","srlw","srliw","srai","sraiw","negw","xor","xori","slt","seqz","snez",
     "fadd.s","fsub.s","fmul.s","fdiv.s","fneg.s","feq.s","flt.s","fle.s",
     "fcvt.w.s","fcvt.s.w","fcvt.d.s","fmv.w.x","fmv.d.x"};
@@ -140,6 +140,11 @@ class Selector {
     }
     int dst = i.result; auto type = input.values[dst]; bool fp = floating(type);
     int a = i.args[0];
+    if (i.op == Op::ModMul) {
+      int product = emit(RV::Mul,{a,i.args[1]},0,-1,ValueType::WideInt);
+      int remainder = emit(RV::Rem,{product,constant(i.immediate,ValueType::WideInt)},0,-1,ValueType::WideInt);
+      emit(RV::Addiw,{remainder},0,dst); return;
+    }
     if (i.op == Op::Convert) { emit(type == ValueType::Int ? RV::FcvtWS : type == ValueType::Double ? RV::FcvtDS : RV::FcvtSW,{a},0,dst,type); return; }
     if (i.op == Op::Neg) { emit(fp ? RV::FnegS : RV::Negw,{a},0,dst,type); return; }
     if (immediate(i)) return;
@@ -295,7 +300,7 @@ MachineFunction selectTarget(FunctionIR f, Stats *stats) {
   verifyTarget(result); return result;
 }
 void verifyTarget(const MachineFunction &f) {
-  for (auto type : f.values) if (type < ValueType::Int || type > ValueType::Double) throw std::logic_error("invalid machine value type");
+  for (auto type : f.values) if (type < ValueType::Int || type > ValueType::WideInt) throw std::logic_error("invalid machine value type");
   for (const auto &b : f.blocks) {
     if (b.instructions.empty()) throw std::logic_error("empty machine block");
     auto terminal = b.instructions.back().op;
@@ -325,7 +330,8 @@ void verifyTarget(const MachineFunction &f) {
           if (result != output || std::any_of(i.args.begin(),i.args.end(),[&](int a) { return f.values[a] != input; }))
             throw std::logic_error("invalid target operand type");
         };
-        if (i.opcode >= RV::FaddS && i.opcode <= RV::FnegS) require(ValueType::Float,ValueType::Float);
+        if (i.opcode == RV::Rem) require(ValueType::WideInt,ValueType::WideInt);
+        else if (i.opcode >= RV::FaddS && i.opcode <= RV::FnegS) require(ValueType::Float,ValueType::Float);
         else if (i.opcode >= RV::FeqS && i.opcode <= RV::FcvtWS) require(ValueType::Int,ValueType::Float);
         else if (i.opcode == RV::FcvtSW) require(ValueType::Float,ValueType::Int);
         else if (i.opcode == RV::FcvtDS) require(ValueType::Double,ValueType::Float);
@@ -334,6 +340,13 @@ void verifyTarget(const MachineFunction &f) {
           if (bits ? result != (i.opcode == RV::FmvWX ? ValueType::Float : ValueType::Double) : floating(result))
             throw std::logic_error("invalid target register bank");
           for (int a : i.args) if (floating(f.values[a])) throw std::logic_error("invalid target operand bank");
+          bool wide = result == ValueType::WideInt || std::any_of(i.args.begin(),i.args.end(),[&](int a) { return f.values[a] == ValueType::WideInt; });
+          if (wide) {
+            bool product = i.opcode == RV::Mul && result == ValueType::WideInt &&
+                std::all_of(i.args.begin(),i.args.end(),[&](int a) { return f.values[a] == ValueType::Int; });
+            bool truncate = i.opcode == RV::Addiw && result == ValueType::Int && f.values[i.args[0]] == ValueType::WideInt;
+            if (!product && !truncate) throw std::logic_error("invalid wide integer operation");
+          }
           bool word = (i.opcode >= RV::Addw && i.opcode <= RV::Remw && i.opcode != RV::Mul) ||
               (i.opcode >= RV::Slliw && i.opcode <= RV::Negw && i.opcode != RV::Srai) ||
               i.opcode == RV::Slt || i.opcode == RV::Seqz || i.opcode == RV::Snez;
@@ -363,7 +376,7 @@ void verifyTarget(const MachineFunction &f) {
         if (f.values[i.op == Op::SpillLoad ? i.result : i.args[0]] != f.slots[i.immediate]) throw std::logic_error("invalid split spill type");
       }
 
-      if (i.op == Op::Phi || (i.op > Op::Zero && i.op < Op::Call)) throw std::logic_error("generic operation in target IR");
+      if (i.op == Op::Phi || i.op == Op::ModMul || (i.op > Op::Zero && i.op < Op::Call)) throw std::logic_error("generic operation in target IR");
     }
   }
 }

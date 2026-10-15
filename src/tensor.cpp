@@ -483,6 +483,81 @@ public:
   static void run(ProgramIR &program) { for (auto &item : program.items) if (item.function) { State state; walk(*item.function->body, state); } }
 };
 
+// Recognize a complete modular doubling recurrence, independently of names.
+// With 0<=a<M<=2^30 and b>=0, all int32 additions are exact and induction on
+// floor(b/2) establishes f(a,b)=(int64(a)*b)%M. Other inputs keep the source.
+// Check the complete recurrence, including every effect and base case. With
+// 0<=a<M, b>=0 and 2<=M<=2^30, additions stay in int32 and induction on b/2
+// yields (int64(a)*b)%M. Lowering retains the original body behind a guard.
+class ModularProducts {
+  static const Stmt &strip(const Stmt &s) {
+    const Stmt *p = &s; int depth = 0;
+    while (p->kind == Stmt::Kind::Block && p->children.size() == 1 && depth++ < 16) p = p->children[0].get();
+    return *p;
+  }
+  static bool flatten(const Stmt &s,std::vector<const Stmt *> &out,size_t &budget) {
+    if (!budget) return false;
+    --budget;
+    if (s.kind == Stmt::Kind::Block) {
+      for (auto child : s.children) if (!flatten(*child,out,budget)) return false;
+    } else out.push_back(&s);
+    return true;
+  }
+  static bool number(const Expr &e,int32_t n) { return e.constant && e.constant->base == Base::Int && e.constant->integer == n; }
+  static bool variable(const Expr &e,const Symbol *s) { return e.kind == Expr::Kind::Variable && e.operands.empty() && e.symbol == s; }
+  static bool binary(const Expr &e,const char *op) { return e.kind == Expr::Kind::Binary && e.text == op && e.operands.size() == 2; }
+  static const Expr *returned(const Stmt &s) { const auto &p = strip(s); return p.kind == Stmt::Kind::Return ? p.expression.get() : nullptr; }
+  static bool test(const Expr &e,const Symbol *s,int32_t n) {
+    return binary(e,"==") && ((variable(*e.operands[0],s) && number(*e.operands[1],n)) ||
+                             (variable(*e.operands[1],s) && number(*e.operands[0],n)));
+  }
+  static bool remainder(const Expr &e,int32_t m) { return binary(e,"%") && number(*e.operands[1],m); }
+  static bool sum(const Expr &e,const Symbol *a,const Symbol *b) {
+    return binary(e,"+") && ((variable(*e.operands[0],a) && variable(*e.operands[1],b)) ||
+                            (variable(*e.operands[0],b) && variable(*e.operands[1],a)));
+  }
+  static std::optional<Function::ModularProduct> check(Function &f,int aIndex) {
+    const auto *a = f.parameters[aIndex].symbol, *b = f.parameters[1-aIndex].symbol;
+    std::vector<const Stmt *> code; size_t budget = 32;
+    if (!flatten(*f.body,code,budget) || (code.size() != 5 && code.size() != 6)) return {};
+    const auto &zero = *code[0], &one = *code[1], &declaration = *code[2], &update = *code[3], &odd = *code[4];
+    if (zero.kind != Stmt::Kind::If || zero.children.size() != 1 || !test(*zero.expression,b,0)) return {};
+    auto z = returned(*zero.children[0]); if (!z || !number(*z,0)) return {};
+    if (one.kind != Stmt::Kind::If || one.children.size() != 1 || !test(*one.expression,b,1)) return {};
+    auto unit = returned(*one.children[0]);
+    if (!unit || !binary(*unit,"%") || !variable(*unit->operands[0],a) || !unit->operands[1]->constant || unit->operands[1]->constant->base != Base::Int) return {};
+    int32_t m = unit->operands[1]->constant->integer;
+    if (m < 2 || m > (1<<30)) return {};
+    if (declaration.kind != Stmt::Kind::Declaration || declaration.variables.size() != 1) return {};
+    const auto &v = declaration.variables[0];
+    if (!v.symbol->type.numeric() || v.base != Base::Int || v.initializers.size() != 1 || v.symbol->global || v.symbol->parameter) return {};
+    const auto &call = *v.initializers[0].second;
+    if (call.kind != Expr::Kind::Call || call.callee != &f || call.operands.size() != 2 || !variable(*call.operands[aIndex],a)) return {};
+    const auto &half = *call.operands[1-aIndex];
+    if (!binary(half,"/") || !variable(*half.operands[0],b) || !number(*half.operands[1],2)) return {};
+    if (update.kind != Stmt::Kind::Assignment || !variable(*update.target,v.symbol) || !remainder(*update.expression,m) ||
+        !sum(*update.expression->operands[0],v.symbol,v.symbol)) return {};
+    if (odd.kind != Stmt::Kind::If || odd.children.empty() || !binary(*odd.expression,"==")) return {};
+    auto parity = odd.expression->operands[0], bit = odd.expression->operands[1];
+    if (number(*parity,1)) std::swap(parity,bit);
+    if (!number(*bit,1) || !remainder(*parity,2) || !variable(*parity->operands[0],b)) return {};
+    const Expr *add = returned(*odd.children[0]), *plain = nullptr;
+    if (code.size() == 5 && odd.children.size() == 2) plain = returned(*odd.children[1]);
+    if (code.size() == 6 && odd.children.size() == 1) plain = returned(*code[5]);
+    if (!add || !plain || !remainder(*add,m) || !sum(*add->operands[0],v.symbol,a) || !variable(*plain,v.symbol)) return {};
+    return Function::ModularProduct{aIndex,1-aIndex,m};
+  }
+public:
+  static void run(ProgramIR &program,bool enable) {
+    for (auto &item : program.items) if (item.function) {
+      auto &f = *item.function; f.modularProduct.reset();
+      if (!enable || f.result != Base::Int || f.parameters.size() != 2 || f.tensorResult ||
+          std::any_of(f.parameters.begin(),f.parameters.end(),[](const Variable &p) { return !p.symbol->type.numeric() || p.base != Base::Int; })) continue;
+      for (int a : {0,1}) if (auto fact = check(f,a)) { f.modularProduct = fact; break; }
+    }
+  }
+};
+
 // Bottom-up abstract interpretation of small, effect-free scalar functions.
 // Compose callees' transfer functions over Z/(2^32), including unused operands
 // in the purity check. Lowering preserves argument evaluation before replacing
@@ -1632,6 +1707,7 @@ void printTensorPlan(const ProgramIR &program, std::ostream &out) {
 void expandTensors(ProgramIR &program) { TensorExpansion(program).run(); }
 void analyzeTensors(ProgramIR &program) { TensorStructure::run(program); }
 void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options) {
+  ModularProducts::run(program,level >= 2 && options.modularProducts);
   if (level >= 2) {
     if (options.scalarSummaries) ScalarFunctions().run(program);
     if (options.modularLoops || options.quotientLoops) IntegerLoops(program,options).run();

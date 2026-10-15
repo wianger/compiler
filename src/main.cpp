@@ -42,6 +42,7 @@ void help() {
       "  --no-loop-partition disable bounded loop domain partitioning\n"
       "  --no-small-unroll disable bounded complete expansion of small loops\n"
       "  --no-constant-loops disable bounded integer loop evaluation\n"
+      "  --no-modular-products disable guarded modular recurrence specialization\n"
       "  --poly-tile=N      cap unroll-and-jam width (1, 2, 4, 8)\n"
       "  --tensor-tile=N    override automatic column tile (1, 2, 4, 8)\n"
       "  --emit-memory-ir   print memory definitions, phis, uses and clobbers\n"
@@ -78,6 +79,7 @@ Options options(int argc, char **argv) {
     else if (arg == "--no-loop-partition") o.highIR.loopPartition = false;
     else if (arg == "--no-small-unroll") o.highIR.smallUnroll = false;
     else if (arg == "--no-constant-loops") o.highIR.constantLoops = false;
+    else if (arg == "--no-modular-products") o.highIR.modularProducts = false;
     else if (arg.rfind("--poly-tile=",0) == 0) {
       auto tile = arg.substr(12);
       if (tile != "1" && tile != "2" && tile != "4" && tile != "8") throw std::runtime_error("poly tile must be 1, 2, 4 or 8");

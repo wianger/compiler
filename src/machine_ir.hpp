@@ -7,11 +7,13 @@
 namespace sysy {
 // All instruction results are virtual registers. Mutable source objects are
 // explicit memory objects; control flow is explicit and every block terminates.
-enum class ValueType { Int, Float, Pointer, Double };
+enum class ValueType { Int, Float, Pointer, Double, WideInt };
+// ModMul is total: widen both signed int32 operands before multiplication,
+// take signed int64 remainder by its bounded positive immediate, then narrow.
 enum class Op {
   Constant, Address, String, Parameter, Move, Load, Store, Offset, Zero,
   Add, Sub, Mul, Div, Rem, And, Shr, Neg, Convert, Eq, Ne, Lt, Le, Gt, Ge,
-  Call, Jump, Branch, Return, Phi, BranchCompare, Target, SpillLoad, SpillStore
+  Call, Jump, Branch, Return, Phi, BranchCompare, ModMul, Target, SpillLoad, SpillStore
 };
 struct Instruction {
   Op op;
