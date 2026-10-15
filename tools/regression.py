@@ -750,6 +750,112 @@ def main():
       int main(){int n=getint();int i=0;while(i<n){putint(walk(getint(),0,17));putch(10);i=i+1;}return 0;}''',
       "\n".join(lines)+"\n0\n")
     (directory/'congruence_tail.in').write_text("\n".join(map(str,[len(inputs),*inputs]))+"\n")
+    import math
+    fp_values=[struct.unpack('<f',struct.pack('<I',bits))[0] for bits in
+      (0,0x80000000,0x3f800000,0xbf800000,0x7f800000,0xff800000,0x7fc00000,0xffc00000,1,0x80000001,0x7f7fffff,0xff7fffff)]
+    fp_pairs=[(x,y) for x in fp_values for y in fp_values]
+    def fp_text(x):return '-nan' if math.isnan(x) and math.copysign(1,x)<0 else 'nan' if math.isnan(x) else x.hex()
+    fp_input='\n'.join(fp_text(x)+' '+fp_text(y) for x,y in fp_pairs)+'\n'
+    for kind,guard in enumerate(('if(x<0.0)a=-x;','if(x<=(-0.0))a=-x;','if(0.0>x)a=-x;',
+      'if((-0.0)>=x)a=-x;','if(x>=0.0){}else a=-x;','if(x>0.0)a=x;else a=-x;',
+      'if(0.0<=x){}else a=-x;','if(0.0<x)a=x;else a=-x;')):
+        lines=[]
+        for x,y in fp_pairs:
+            a=-x if x<0 else x
+            lines.append(' '.join(str(int(v)) for v in (a==y,a!=y,a<y,a<=y,a>y,a>=y)))
+        name=f'fp_comparison_abs_{kind}'
+        cases[name]=(f'''int main(){{int i=0;while(i<{len(fp_pairs)}){{float x=getfloat();float y=getfloat();float a=x;
+          {guard}putf("%d %d %d %d %d %d\\n",a==y,a!=y,a<y,a<=y,a>y,a>=y);i=i+1;}}return 0;}}''',
+          '\n'.join(lines)+'\n0\n')
+        (directory/f'{name}.in').write_text(fp_input)
+    for kind in range(4):
+        lines=[]
+        for x,y in fp_pairs:
+            a=-x if (x>0 if kind==3 else x<0) else x
+            sign=not math.isnan(a) and not math.isinf(a) and math.copysign(1,a)<0
+            lines.append(f'{int(a>y)} {int(sign) if kind==0 else (7 if x<0 else 0) if kind in (1,2) else int(a<y)}')
+        change=('if(x<0.0)a=-x;' if kind==0 else 'if(x<0.0){a=-x;t=7;}' if kind==1 else
+          'if(x<0.0){a=-x;t=tick();}' if kind==2 else 'if(x>0.0)a=-x;')
+        extra='(1.0/a)<0.0' if kind==0 else 't' if kind in (1,2) else 'a<y'
+        name=f'fp_comparison_reject_{kind}'
+        cases[name]=(f'''int count;int tick(){{count=count+7;return count;}}
+          int main(){{int i=0;while(i<{len(fp_pairs)}){{count=0;int t=0;float x=getfloat();float y=getfloat();float a=x;
+          {change}putf("%d %d\\n",a>y,{extra});i=i+1;}}return 0;}}''','\n'.join(lines)+'\n0\n')
+        (directory/f'{name}.in').write_text(fp_input)
+    lookup_rng=random.Random(20261021)
+    for kind in range(5):
+        for n,first in ((0,99),(1,0),(17,3),(32,0)):
+            data=[lookup_rng.randrange(-2147483648,2147483648) for _ in range(32)]
+            data[5]=data[13]=2147483647
+            initial=data[:]
+            idx=first
+            for j in range(first+1,n):
+                if kind==1:data[idx]=wrap(data[idx]+31)
+                if kind==2:data[j]=wrap(data[j]+17)
+                if kind==3 and j==n-1:idx=n
+                elif kind==4:
+                    if j%2==0:
+                        value=data[j]
+                        if value>data[idx]:idx=j
+                    else:idx=j
+                elif data[j]>data[idx]:idx=j
+            effect='a[idx]=a[idx]+31;' if kind==1 else 'tick(a,j);' if kind==2 else ''
+            select='if(j==n-1)idx=n;else if(a[j]>a[idx])idx=j;' if kind==3 else (
+              'if(j%2==0){int x=a[j];if(x>a[idx])idx=j;}else idx=j;' if kind==4 else 'if(a[j]>a[idx])idx=j;')
+            name=f'lookup_recurrence_{kind}_{n}'
+            cases[name]=(f'''void tick(int a[],int j){{a[j]=a[j]+17;}}
+              int run(int a[],int n,int first){{int idx=first;int j=first+1;while(j<n){{{effect}{select}j=j+1;}}return idx;}}
+              int main(){{int a[32];int j=0;while(j<32){{a[j]=getint();j=j+1;}}int n=getint();int first=getint();
+                putint(run(a,n,first));putch(10);putarray(32,a);return 0;}}''',
+              f'{idx}\n32: '+' '.join(map(str,data))+'\n0\n')
+            (directory/f'{name}.in').write_text(' '.join(map(str,[*initial,n,first]))+'\n')
+    for n,first in ((12,0),(12,1),(12,6),(12,7),(12,10),(0,99),(2,0),(2,1)):
+        idx=first
+        for j in range(first+1,n):
+            if abs(fp_values[j])>abs(fp_values[idx]):idx=j
+        value=fp_values[idx] if n>first else 0.0
+        valid=n>first
+        row=[idx,int(not math.isnan(value)),int(value==0),int(not math.isnan(value) and not math.isinf(value) and math.copysign(1,value)<0)] if valid else [idx,-1,-1,-1]
+        name=f'lookup_float_{n}_{first}'
+        cases[name]=('''int main(){float a[12];int j=0;while(j<12){a[j]=getfloat();j=j+1;}
+          int n=getint();int first=getint();int idx=first;j=first+1;
+          while(j<n){float x=a[j];float y=a[idx];if(x<0.0)x=-x;if(y<0.0)y=-y;
+            if(x>y)idx=j;j=j+1;}if(n>first){float v=a[idx];putf("%d %d %d %d\\n",idx,v==v,v==0.0,(1.0/v)<0.0);}
+          else putf("%d -1 -1 -1\\n",idx);return 0;}''',' '.join(map(str,row))+'\n0\n')
+        (directory/f'{name}.in').write_text(' '.join(fp_text(x) for x in fp_values)+f'\n{n} {first}\n')
+    for alias in (False,True):
+        for first,last in ((0,-1),(0,0),(1,7),(7,7),(15,14),(3,15)):
+            data=[[j+3 for j in range(16)],[j*3-7 for j in range(16)]]
+            a,b=data[0],data[0 if alias else 1];total=0
+            for j in range(first,last+1):
+                a[j]=wrap(a[j]+b[j]);b[j]=wrap(a[j]-17);total=wrap(total+b[j])
+            name=f'inclusive_addresses_{int(alias)}_{first}_{last}'
+            cases[name]=(f'''int run(int a[],int b[],int first,int last){{int sum=0;int i=first;
+              while(i<=last){{a[i]=a[i]+b[i];b[i]=a[i]-17;sum=sum+b[i];i=i+1;}}putint(i);putch(32);return sum;}}
+              int main(){{int a[2][16];int j=0;while(j<16){{a[0][j]=j+3;a[1][j]=j*3-7;j=j+1;}}
+              int first=getint();int last=getint();putint(run(a[0],a[{0 if alias else 1}],first,last));putch(10);
+              putarray(16,a[0]);putarray(16,a[1]);return 0;}}''',
+              f'{max(first,last+1)} {total}\n'+''.join('16: '+' '.join(map(str,row))+'\n' for row in data)+'0\n')
+            (directory/f'{name}.in').write_text(f'{first} {last}\n')
+    for first,last in ((-2147483648,-2147483646),(-2,1),(2147483644,2147483646),(2147483647,2147483646)):
+        name=f'inclusive_address_extremes_{first}'
+        cases[name]=('''int a[1][1];int b[1][1];int main(){int i=getint();int n=getint();
+          while(i<=n){putarray(0,a[i]);putarray(0,b[i]);putint(i);putch(10);i=i+1;}putint(i);return 0;}''',
+          ''.join(f'0:\n0:\n{i}\n' for i in range(first,last+1))+f'{max(first,last+1)}\n0\n')
+        (directory/f'{name}.in').write_text(f'{first} {last}\n')
+    for which in (0,1):
+        data=[[j+3 for j in range(16)],[j*3-7 for j in range(16)]]
+        a,b=data[0],data[which];total=0
+        for j in range(3,16):
+            a[j]=wrap(a[j]+b[j]);b[j]=wrap(a[j]-17);total=wrap(total+b[j])
+        name=f'inclusive_runtime_alias_{which}'
+        cases[name]=('''int run(int a[],int b[],int last){int i=3;int sum=0;
+          while(i<=last){a[i]=a[i]+b[i];b[i]=a[i]-17;sum=sum+b[i];i=i+1;}return sum;}
+          int main(){int a[2][16];int j=0;while(j<16){a[0][j]=j+3;a[1][j]=j*3-7;j=j+1;}
+          int which=getint();int last=getint();putint(run(a[0],a[which],last));putch(10);
+          putarray(16,a[0]);putarray(16,a[1]);return 0;}''',
+          f'{total}\n'+''.join('16: '+' '.join(map(str,row))+'\n' for row in data)+'0\n')
+        (directory/f'{name}.in').write_text(f'{which} 15\n')
     guard_rng = random.Random(20261019)
     for n in range(24):
         x = ([-2**31,-2**31+1,-65537,-1,0,1,65537,2**31-18,2**31-1]+[guard_rng.randrange(-2**31,2**31) for _ in range(15)])[n]

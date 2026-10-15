@@ -8,7 +8,7 @@ namespace sysy {
 const char *rvName(RV op) {
   static const char *names[] = {"pseudo","add","addi","addw","addiw","subw","mul","mulw","divw","remw","rem","and","andi",
     "slli","slliw","srlw","sraw","srliw","srai","sraiw","negw","xor","xori","slt","seqz","snez",
-    "fadd.s","fsub.s","fmul.s","fdiv.s","fneg.s","feq.s","flt.s","fle.s",
+    "fadd.s","fsub.s","fmul.s","fdiv.s","fneg.s","fabs.s","feq.s","flt.s","fle.s",
     "fcvt.w.s","fcvt.s.w","fcvt.d.s","fmv.w.x","fmv.d.x"};
   return names[static_cast<size_t>(op)];
 }
@@ -156,6 +156,7 @@ class Selector {
     }
     if (i.op == Op::Convert) { emit(type == ValueType::Int ? RV::FcvtWS : type == ValueType::Double ? RV::FcvtDS : RV::FcvtSW,{a},0,dst,type); return; }
     if (i.op == Op::Neg) { emit(fp ? RV::FnegS : RV::Negw,{a},0,dst,type); return; }
+    if (i.op == Op::Abs) { emit(RV::FabsS,{a},0,dst,type); return; }
     if (immediate(i)) return;
     int b = i.args[1];
     if (i.op == Op::Offset) {
@@ -329,7 +330,7 @@ void verifyTarget(const MachineFunction &f) {
       if (i.op == Op::Target) {
         bool unary = i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi ||
           (i.opcode >= RV::Slli && i.opcode <= RV::Negw && i.opcode != RV::Srlw && i.opcode != RV::Sraw) || i.opcode == RV::Xori ||
-          i.opcode == RV::Seqz || i.opcode == RV::Snez || i.opcode == RV::FnegS || i.opcode >= RV::FcvtWS;
+          i.opcode == RV::Seqz || i.opcode == RV::Snez || i.opcode == RV::FnegS || i.opcode == RV::FabsS || i.opcode >= RV::FcvtWS;
         if (i.args.size() != (unary ? 1u : 2u)) throw std::logic_error("invalid target arity");
         if ((i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi || i.opcode == RV::Xori) && !small(i.immediate)) throw std::logic_error("target immediate out of range");
         if ((i.opcode == RV::Slli || i.opcode == RV::Srai) && (i.immediate < 0 || i.immediate > 63)) throw std::logic_error("invalid 64-bit shift");
@@ -340,7 +341,7 @@ void verifyTarget(const MachineFunction &f) {
             throw std::logic_error("invalid target operand type");
         };
         if (i.opcode == RV::Rem) require(ValueType::WideInt,ValueType::WideInt);
-        else if (i.opcode >= RV::FaddS && i.opcode <= RV::FnegS) require(ValueType::Float,ValueType::Float);
+        else if (i.opcode >= RV::FaddS && i.opcode <= RV::FabsS) require(ValueType::Float,ValueType::Float);
         else if (i.opcode >= RV::FeqS && i.opcode <= RV::FcvtWS) require(ValueType::Int,ValueType::Float);
         else if (i.opcode == RV::FcvtSW) require(ValueType::Float,ValueType::Int);
         else if (i.opcode == RV::FcvtDS) require(ValueType::Double,ValueType::Float);
@@ -377,7 +378,13 @@ void verifyTarget(const MachineFunction &f) {
         arity(i.op == Op::Branch ? 1 : 2,false);
         if (i.target < 0 || i.otherwise < 0) throw std::logic_error("invalid machine branch");
         if (i.op == Op::Branch && f.values[i.args[0]] != ValueType::Int) throw std::logic_error("invalid machine predicate");
-        if (i.op == Op::BranchCompare && f.values[i.args[0]] != f.values[i.args[1]]) throw std::logic_error("invalid machine comparison type");
+        if (i.op == Op::BranchCompare) {
+          auto type = f.values[i.args[0]];
+          if (type != f.values[i.args[1]] ||
+              !((type == ValueType::Int && i.immediate >= static_cast<int>(Op::Eq) && i.immediate <= static_cast<int>(Op::Ge)) ||
+                (type == ValueType::Pointer && (i.immediate == static_cast<int>(Op::Eq) || i.immediate == static_cast<int>(Op::Ne)))))
+            throw std::logic_error("invalid machine comparison type");
+        }
       }
       if (i.op == Op::SpillLoad || i.op == Op::SpillStore) {
         if (i.immediate < 0 || i.immediate >= static_cast<int64_t>(f.slots.size())) throw std::logic_error("invalid split spill slot");

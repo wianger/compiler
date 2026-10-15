@@ -528,6 +528,7 @@ std::optional<int64_t> fold(const Instruction &i, const FunctionIR &f, const std
   auto type = f.values[i.args[0]], to = i.result >= 0 ? f.values[i.result] : ValueType::Int;
   int64_t x = defs[i.args[0]]->immediate, y = i.args.size() > 1 ? defs[i.args[1]]->immediate : 0;
   if (i.op == Op::ModMul) return (int64_t(static_cast<int32_t>(x))*static_cast<int32_t>(y))%i.immediate;
+  if (i.op == Op::Abs) return static_cast<uint32_t>(x) & UINT32_C(0x7fffffff);
   if (i.op == Op::Neg) return type == ValueType::Float ? bits(-fromBits(x)) : static_cast<int32_t>(0u - static_cast<uint32_t>(x));
   if (i.op == Op::Convert) {
     if (type == ValueType::Int && to == ValueType::Float) return bits(static_cast<float>(static_cast<int32_t>(x)));
@@ -1599,6 +1600,60 @@ void tailRecursion(FunctionIR &f) {
   Instruction jump{Op::Jump}; jump.target = header; parameters.push_back(jump); f.blocks[0].instructions = std::move(parameters);
 }
 
+// A comparison observes neither the sign of zero nor a NaN's sign/payload.
+// Only that use context permits replacing guarded negation with bitwise Abs;
+// an arithmetic, return, store or call use keeps the original diamond intact.
+bool compareObservations(FunctionIR &f) {
+  if (!f.ssa) return false;
+  if (std::none_of(f.blocks.begin(),f.blocks.end(),[&](const BasicBlock &b) {
+        return !b.instructions.empty() && b.instructions[0].op == Op::Phi && f.values[b.instructions[0].result] == ValueType::Float;
+      })) return false;
+  bool changed = false;
+  const auto &graph = controlFlow(f); auto defs = definitions(f);
+  std::vector<int> uses(f.values.size()), sites(f.values.size(),-1);
+  std::vector<bool> comparisons(f.values.size(),true);
+  for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions) {
+    if (i.result >= 0) sites[i.result] = b;
+    for (int a : i.args) { ++uses[a]; comparisons[a] = comparisons[a] && i.op >= Op::Eq && i.op <= Op::Ge; }
+  }
+  for (size_t b = 0; b < f.blocks.size(); ++b) {
+    auto &code = f.blocks[b].instructions;
+    if (code.empty() || code[0].op != Op::Phi || f.values[code[0].result] != ValueType::Float ||
+        code[0].args.size() != 2 || !comparisons[code[0].result] ||
+        std::any_of(code.begin()+1,code.end(),[](const Instruction &i) { return i.op == Op::Phi; })) continue;
+    auto &phi = code[0];
+    int source = -1, negative = -1, positive = -1;
+    for (int n = 0; n < 2; ++n) {
+      const auto *neg = defs[phi.args[n]];
+      if (neg && neg->op == Op::Neg && neg->args[0] == phi.args[1-n] && uses[neg->result] == 1) {
+        source = neg->args[0]; negative = phi.edges[n]; positive = phi.edges[1-n];
+      }
+    }
+    if (source < 0 || sites[phi.args[phi.edges[0] == negative ? 0 : 1]] != negative ||
+        graph.pred[negative].size() != 1) continue;
+    const auto &negCode = f.blocks[negative].instructions;
+    if (negCode.size() != 2 || negCode[0].op != Op::Neg || negCode.back().op != Op::Jump || negCode.back().target != static_cast<int>(b)) continue;
+    int entry = graph.pred[negative][0]; const auto &branch = f.blocks[entry].instructions.back();
+    if (branch.op != Op::Branch) continue;
+    bool trueNeg = branch.target == negative;
+    if ((trueNeg ? branch.otherwise : branch.target) != (positive == entry ? static_cast<int>(b) : positive)) continue;
+    if (positive != entry) {
+      const auto &pass = f.blocks[positive].instructions;
+      if (graph.pred[positive] != std::vector<int>{entry} || pass.size() != 1 || pass[0].op != Op::Jump || pass[0].target != static_cast<int>(b)) continue;
+    }
+    const auto *cmp = defs[branch.args[0]];
+    if (!cmp || cmp->args.size() != 2) continue;
+    int zero = cmp->args[0] == source ? cmp->args[1] : cmp->args[1] == source ? cmp->args[0] : -1;
+    if (zero < 0 || !defs[zero] || defs[zero]->op != Op::Constant ||
+        (static_cast<uint32_t>(defs[zero]->immediate) & UINT32_C(0x7fffffff))) continue;
+    bool less = cmp->op == Op::Lt || cmp->op == Op::Le, greater = cmp->op == Op::Gt || cmp->op == Op::Ge;
+    if (!(trueNeg == (cmp->args[0] == source ? less : greater)) || (!less && !greater)) continue;
+    changed = true; phi.op = Op::Abs; phi.args = {source}; phi.edges.clear();
+    Instruction jump{Op::Jump}; jump.target = b; f.blocks[entry].instructions.back() = jump;
+  }
+  return changed;
+}
+
 void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true) {
   if (!f.ssa) return;
   auto borrowed = definitions(f); std::vector<std::optional<Instruction>> defs(f.values.size());
@@ -2140,6 +2195,227 @@ void strength(FunctionIR &f) {
   }
 }
 
+// Translate a read-only indexed lookup through its index Phi network. Reuse
+// loads already executed on incoming edges; only the first, must-execute load
+// may be inserted in the preheader. No speculative backedge loads are allowed.
+bool lookupRecurrence(FunctionIR &f) {
+  if (!f.ssa) return false;
+  bool changed = false;
+  size_t budget = 65536, instructions = 0; bool loads = false;
+  for (const auto &b : f.blocks) instructions += b.instructions.size();
+  if (f.values.size()+instructions > budget) return false;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.op == Op::Load) { loads = true; break; }
+  if (!loads) return false;
+  auto nests = loops(controlFlow(f));
+  for (const auto &loop : nests) {
+    if (loop.blocks.size() > 16 || f.values.size()+instructions > budget) continue;
+    budget -= f.values.size()+instructions;
+    bool readonly = true;
+    for (int b : loop.blocks) for (const auto &i : f.blocks[b].instructions)
+      readonly &= i.op != Op::Store && i.op != Op::Zero && i.op != Op::Call;
+    if (!readonly) continue;
+    const auto &graph = controlFlow(f); auto defs = definitions(f);
+    std::vector<int> sites(f.values.size(),-1);
+    for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions) if (i.result >= 0) sites[i.result] = b;
+    int pre = -1, latch = -1, h = loop.header;
+    for (int p : graph.pred[h]) (loop.blocks.count(p) ? latch : pre) = p;
+    if (pre < 0 || latch < 0 || graph.pred[h].size() != 2 || graph.succ[pre].size() != 1) continue;
+    struct Address {
+      int base = -1; uint64_t constant = 0; std::map<int,uint64_t> terms;
+      bool operator==(const Address &b) const { return base == b.base && constant == b.constant && terms == b.terms; }
+    };
+    auto term = [&](Address &a,int index,uint64_t stride) {
+      if (defs[index] && defs[index]->op == Op::Constant) a.constant += uint64_t(defs[index]->immediate)*stride;
+      else { a.terms[index] += stride; if (!a.terms[index]) a.terms.erase(index); }
+    };
+    std::function<std::optional<Address>(int,int)> address = [&](int v,int depth) -> std::optional<Address> {
+      if (depth > 16 || sites[v] < 0) return {};
+      if (defs[v] && defs[v]->op == Op::Move) return address(defs[v]->args[0],depth+1);
+      if (defs[v] && defs[v]->op == Op::Offset) {
+        const auto &i = *defs[v]; auto a = address(i.args[0],depth+1);
+        if (a) term(*a,i.args[1],uint64_t(i.immediate));
+        return a;
+      }
+      if (loop.blocks.count(sites[v])) return {};
+      return Address{v,0,{}};
+    };
+    struct Lookup { int value,pointer; Op op; ValueType type; Address key; };
+    std::vector<Lookup> available;
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+      const Instruction *load = &i;
+      if (i.op == Op::Abs) load = defs[i.args[0]];
+      if (!load || load->op != Op::Load || (i.op != Op::Load && i.op != Op::Abs)) continue;
+      auto key = address(load->args[0],0);
+      if (key) available.push_back({i.result,load->args[0],i.op,f.values[i.result],*key});
+    }
+    // Prefer the complete Abs(Load) expression, sharing its already evaluated
+    // incoming value as well as the memory read.
+    std::stable_sort(available.begin(),available.end(),[](const Lookup &a,const Lookup &b) { return a.op == Op::Abs && b.op != Op::Abs; });
+    for (const auto &candidate : available) {
+      if (!budget) break;
+      int loadSite = candidate.op == Op::Abs ? sites[defs[candidate.value]->args[0]] : sites[candidate.value];
+      if (loadSite != h) continue;
+      int index = -1; bool valid = true;
+      for (auto t : candidate.key.terms) if (loop.blocks.count(sites[t.first])) {
+        if (index >= 0) valid = false;
+        index = t.first;
+      }
+      if (!valid || index < 0 || !defs[index] || defs[index]->op != Op::Phi || sites[index] != h || defs[index]->edges.size() != 2) continue;
+      const auto indexPhi = *defs[index];
+      int entry = indexPhi.edges[0] == pre ? 0 : 1;
+      if (indexPhi.edges[entry] != pre || indexPhi.edges[1-entry] != latch) continue;
+      size_t originalValues = f.values.size(); int work = 64;
+      std::map<int,int> translated;
+      std::vector<std::pair<int,Instruction>> phis;
+      std::vector<Instruction> setup;
+      auto fresh = [&] { return newValue(f,candidate.type); };
+      std::function<int(int)> seedPointer = [&](int v) {
+        if (!loop.blocks.count(sites[v])) return graph.dominates(sites[v],pre) ? v : -1;
+        if (!defs[v]) return -1;
+        auto i = *defs[v];
+        if (i.op == Op::Move) return seedPointer(i.args[0]);
+        if (i.op != Op::Offset) return -1;
+        i.args[0] = seedPointer(i.args[0]);
+        if (i.args[1] == index) i.args[1] = indexPhi.args[entry];
+        else if (loop.blocks.count(sites[i.args[1]]) || !graph.dominates(sites[i.args[1]],pre)) return -1;
+        if (i.args[0] < 0) return -1;
+        i.result = newValue(f,ValueType::Pointer); setup.push_back(i); return i.result;
+      };
+      std::function<int(int,int)> translate = [&](int v,int edge) {
+        if (--work < 0) return -1;
+        if (translated.count(v)) return translated.at(v);
+        auto key = candidate.key; uint64_t coefficient = key.terms.at(index); key.terms.erase(index); term(key,v,coefficient);
+        for (const auto &value : available) {
+          if (!budget) return -1;
+          --budget;
+          if (value.value != candidate.value && value.op == candidate.op && value.type == candidate.type &&
+              value.key == key && graph.dominates(sites[value.value],edge)) return value.value;
+        }
+        if (defs[v] && defs[v]->op == Op::Phi && loop.blocks.count(sites[v])) {
+          Instruction p{Op::Phi}; p.result = fresh(); p.edges = defs[v]->edges; translated[v] = p.result;
+          for (size_t n = 0; n < p.edges.size(); ++n) {
+            int a = translate(defs[v]->args[n],p.edges[n]); if (a < 0) return -1; p.args.push_back(a);
+          }
+          phis.push_back({sites[v],p}); return p.result;
+        }
+        if (edge != pre || v != indexPhi.args[entry] || !setup.empty()) return -1;
+        int pointer = seedPointer(candidate.pointer); if (pointer < 0) return -1;
+        Instruction load{Op::Load}; load.result = fresh(); load.args = {pointer}; setup.push_back(load);
+        if (candidate.op == Op::Load) return load.result;
+        Instruction abs{Op::Abs}; abs.result = fresh(); abs.args = {load.result}; setup.push_back(abs); return abs.result;
+      };
+      int carried = fresh(); translated[index] = carried;
+      Instruction phi{Op::Phi}; phi.result = carried; phi.edges = indexPhi.edges;
+      for (size_t n = 0; n < phi.edges.size(); ++n) {
+        int value = translate(indexPhi.args[n],phi.edges[n]); if (value < 0) { valid = false; break; } phi.args.push_back(value);
+      }
+      if (!valid) { f.values.resize(originalValues); continue; }
+      phis.push_back({h,phi});
+      for (auto &i : f.blocks[sites[candidate.value]].instructions) if (i.result == candidate.value) { i.op = Op::Move; i.args = {carried}; }
+      auto &before = f.blocks[pre].instructions; before.insert(before.end()-1,setup.begin(),setup.end());
+      for (auto &p : phis) f.blocks[p.first].instructions.insert(f.blocks[p.first].instructions.begin(),std::move(p.second));
+      changed = true; break; // Refresh definition snapshots for another loop, not another lookup.
+    }
+  }
+  return changed;
+}
+
+// Replace a rotated inclusive loop's test by an address equality. The last
+// INT_MAX iteration takes a cold reset edge instead of assuming signed +1
+// cannot wrap. This keeps one body and preserves even nonterminating loops.
+bool linearTest(FunctionIR &f) {
+  if (!f.ssa) return false;
+  bool inclusive = false;
+  size_t budget = 65536, instructions = 0, offsets = 0;
+  for (const auto &b : f.blocks) instructions += b.instructions.size();
+  if (f.values.size()+f.blocks.size()+instructions > budget) return false;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions)
+    { inclusive |= i.op == Op::Le && f.values[i.args[0]] == ValueType::Int; offsets += i.op == Op::Offset; }
+  if (!inclusive || offsets < 2) return false;
+  bool changed = false;
+  auto nests = loops(controlFlow(f));
+  for (const auto &loop : nests) {
+    if (loop.blocks.size() != 2 || !budget) continue;
+    if (f.values.size()+f.blocks.size()+instructions > budget) break;
+    budget -= f.values.size()+f.blocks.size()+instructions;
+    const auto &graph = controlFlow(f); auto defs = definitions(f);
+    std::vector<int> sites(f.values.size(),-1);
+    for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions)
+      if (i.result >= 0) sites[i.result] = b;
+    int h = loop.header, latch = *std::find_if(loop.blocks.begin(),loop.blocks.end(),[&](int b) { return b != h; });
+    const auto branch = f.blocks[latch].instructions.back();
+    const auto jump = f.blocks[h].instructions.back();
+    if (branch.op != Op::Branch || branch.target != h || loop.blocks.count(branch.otherwise) ||
+        jump.op != Op::Jump || jump.target != latch || graph.pred[h].size() != 2 || graph.pred[latch].size() != 1) continue;
+    const auto *compare = defs[branch.args[0]];
+    if (!compare || compare->op != Op::Le || f.values[compare->args[0]] != ValueType::Int) continue;
+    int nextIV = compare->args[0], bound = compare->args[1], iv = -1, one = -1;
+    const auto *step = defs[nextIV];
+    if (!step || step->op != Op::Add || sites[nextIV] != h) continue;
+    for (int n = 0; n < 2; ++n) if (defs[step->args[n]] && defs[step->args[n]]->op == Op::Constant && defs[step->args[n]]->immediate == 1) {
+      one = step->args[n]; iv = step->args[1-n];
+    }
+    if (iv < 0 || !defs[iv] || defs[iv]->op != Op::Phi || sites[iv] != h ||
+        sites[bound] < 0 || loop.blocks.count(sites[bound])) continue;
+    int pre = graph.pred[h][graph.pred[h][0] == latch ? 1 : 0], exit = branch.otherwise;
+    if (graph.succ[pre].size() != 1 || graph.pred[pre].size() != 1 || !graph.dominates(sites[bound],pre)) continue;
+    const auto phi = *defs[iv];
+    if (phi.edges.size() != 2) continue;
+    int incoming = phi.edges[0] == pre ? 0 : 1;
+    if (phi.edges[incoming] != pre || phi.edges[1-incoming] != latch || phi.args[1-incoming] != nextIV) continue;
+    int initial = phi.args[incoming], entry = graph.pred[pre][0];
+    const auto &guard = f.blocks[entry].instructions.back();
+    if (guard.op != Op::Branch || guard.target != pre || guard.otherwise != exit) continue;
+    const auto *first = defs[guard.args[0]];
+    if (!first || first->op != Op::Le || first->args != std::vector<int>{initial,bound}) continue;
+    bool valid = true;
+    for (const auto &i : f.blocks[h].instructions) if (i.op == Op::Phi)
+      valid &= i.edges.size() == 2 && std::find(i.edges.begin(),i.edges.end(),pre) != i.edges.end() &&
+          std::find(i.edges.begin(),i.edges.end(),latch) != i.edges.end();
+    struct Candidate { int value,base; int64_t stride; };
+    std::vector<Candidate> candidates; std::set<int> bases;
+    for (const auto &i : f.blocks[h].instructions) if (i.op == Op::Offset && i.args[1] == iv &&
+        i.immediate > 0 && i.immediate <= INT32_MAX && sites[i.args[0]] >= 0 &&
+        graph.dominates(sites[i.args[0]],pre) && !loop.blocks.count(sites[i.args[0]])) {
+      candidates.push_back({i.result,i.args[0],i.immediate}); bases.insert(i.args[0]);
+    }
+    if (!valid || bases.size() < 2 || candidates.size() > 8) continue;
+    changed = true; int gate = f.blocks.size(), reset = gate+1;
+    std::vector<Instruction> setup, resetCode, phis, updates;
+    auto constant = [&](int32_t value) {
+      Instruction c{Op::Constant}; c.result = newValue(f,ValueType::Int); c.immediate = value;
+      setup.push_back(c); return c.result;
+    };
+    int minimum = constant(INT32_MIN), maximum = constant(INT32_MAX), end = -1, advance = -1;
+    auto offset = [&](std::vector<Instruction> &code,int base,int index,int64_t stride) {
+      Instruction i{Op::Offset}; i.result = newValue(f,ValueType::Pointer); i.args = {base,index}; i.immediate = stride;
+      code.push_back(i); return i.result;
+    };
+    for (auto c : candidates) {
+      int seed = offset(setup,c.base,initial,c.stride), restart = offset(resetCode,c.base,minimum,c.stride);
+      int carried = newValue(f,ValueType::Pointer), next = offset(updates,carried,one,c.stride);
+      Instruction p{Op::Phi}; p.result = carried; p.edges = {pre,latch,reset}; p.args = {seed,next,restart}; phis.push_back(p);
+      if (end < 0) { end = offset(setup,c.base,bound,c.stride); end = offset(setup,end,one,c.stride); advance = next; }
+      for (auto &i : f.blocks[h].instructions) if (i.result == c.value) { i.op = Op::Move; i.args = {carried}; i.immediate = 0; }
+    }
+    for (auto &i : f.blocks[h].instructions) if (i.op == Op::Phi) {
+      int edge = i.edges[0] == latch ? 0 : 1;
+      i.edges.push_back(reset); i.args.push_back(i.args[edge]);
+    }
+    auto &body = f.blocks[h].instructions; body.insert(body.begin(),phis.begin(),phis.end());
+    auto &prepare = f.blocks[pre].instructions; prepare.insert(prepare.end()-1,setup.begin(),setup.end());
+    Instruction test{Op::Ne}; test.result = newValue(f,ValueType::Int); test.args = {advance,end}; updates.push_back(test);
+    auto &tail = f.blocks[latch].instructions; tail.insert(tail.end()-1,updates.begin(),updates.end()); tail.back().args = {test.result}; tail.back().otherwise = gate;
+    for (auto &i : f.blocks[exit].instructions) if (i.op == Op::Phi)
+      for (int &edge : i.edges) if (edge == latch) edge = gate;
+    Instruction wrap{Op::Eq}; wrap.result = newValue(f,ValueType::Int); wrap.args = {bound,maximum};
+    Instruction check{Op::Branch}; check.args = {wrap.result}; check.target = reset; check.otherwise = exit;
+    f.blocks.push_back({"lftr.exit",{wrap,check}});
+    Instruction back{Op::Jump}; back.target = h; resetCode.push_back(back); f.blocks.push_back({"lftr.wrap",std::move(resetCode)});
+  }
+  return changed;
+}
+
 // Congruent pointer recurrences need one induction value, with the remaining
 // differences carried by the target's signed 12-bit memory displacement. This
 // is an exact uint64 recurrence identity, independent of int32 range guesses.
@@ -2264,7 +2540,8 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out) {
   }
 }
 
-bool runAdvancedPass(ModuleIR &module, const std::string &name) {
+bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
+  if (changed) *changed = name != "fp-compare" && name != "lookup" && name != "lftr";
   if (name == "global-constants") { globalConstants(module); return true; }
   if (name == "arg-specialize") { specializeArguments(module); return true; }
   if (name == "global-memory") {
@@ -2307,7 +2584,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
   if (name == "inline" || name == "inline-early") {
     inlineCalls(module,name == "inline-early"); return true;
   }
-  if (name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "lookup" || name == "fp-compare" || name == "lftr" || name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
     if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse" || name == "dse-basic") summaries = summarize(module);
     for (auto &f : module.functions) {
@@ -2327,6 +2604,9 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       else if (name == "memory-basic") memoryForward(f, summaries,false);
       else if (name == "memory-phi" && f.ssa) { AliasAnalysis alias(f); MemorySSA memory(f,summaries,alias); forwardMemoryPhis(f,alias,memory); }
       else if (name == "memory-phi") {}
+      else if (name == "lookup") { if (lookupRecurrence(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
+      else if (name == "fp-compare") { if (compareObservations(f)) { if (changed) *changed = true; pruneBlocks(f); simplify(f); deadSSA(f); } }
+      else if (name == "lftr") { if (linearTest(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
       else if (name == "rotate") rotate(f);
       else if (name == "unroll") unroll(f);
       else if (name == "tail") tailRecursion(f);

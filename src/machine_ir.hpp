@@ -11,9 +11,10 @@ enum class ValueType { Int, Float, Pointer, Double, WideInt };
 // ModMul is total: widen both signed int32 operands before multiplication,
 // take signed int64 remainder by its bounded positive immediate, then narrow.
 // Shr/Sar shift unsigned/signed int32 respectively; counts are masked to 0..31.
+// Abs clears the f32 sign bit, preserving every other bit including NaN payloads.
 enum class Op {
   Constant, Address, String, Parameter, Move, Load, Store, Offset, Zero,
-  Add, Sub, Mul, Div, Rem, And, Shr, Sar, Neg, Convert, Eq, Ne, Lt, Le, Gt, Ge,
+  Add, Sub, Mul, Div, Rem, And, Shr, Sar, Neg, Abs, Convert, Eq, Ne, Lt, Le, Gt, Ge,
   Call, Jump, Branch, Return, Phi, BranchCompare, ModMul, Target, SpillLoad, SpillStore
 };
 struct Instruction {
@@ -67,11 +68,12 @@ void printEffects(const ModuleIR &module, std::ostream &out);
 void emitAssembly(const ModuleIR &module, std::ostream &out, Stats *stats = nullptr, bool checkAllocation = false);
 void rewriteEqualities(FunctionIR &function);
 void normalizeAffine(FunctionIR &function);
-bool runAdvancedPass(ModuleIR &module, const std::string &name);
+bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed = nullptr);
 void destroySSA(FunctionIR &function);
 std::vector<int> loopDepth(const FunctionIR &function);
 void layoutBlocks(FunctionIR &function);
 void selectInstructions(FunctionIR &function);
 void verifySSA(const FunctionIR &function);
 void repairPhi(FunctionIR &function);
+void pruneBlocks(FunctionIR &function);
 } // namespace sysy

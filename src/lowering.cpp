@@ -332,12 +332,14 @@ void eliminateDead(FunctionIR &f) {
 }
 } // namespace
 
+void pruneBlocks(FunctionIR &f) { prune(f); }
+
 ModuleIR lower(const ProgramIR &program) { return Lowering().run(program); }
 void optimize(ModuleIR &module, int level, Stats *stats) {
   if (level == 0) runPasses(module, "prune", stats);
   else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact", stats);
   else {
-    runPasses(module, "prune,globaldce,arg-specialize,inline-early,globaldce,sroa,promote,dce,inline-early,globaldce,sroa,promote,dce,global-memory,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,inline,globaldce,global-constants,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,repeat-store,gvn,simplify,dce,affine,dce,egraph,simplify,dce,arith,strength,gvn,simplify,dce,rotate,iv-coalesce,licm,memory,dse,simplify,dce", stats);
+    runPasses(module, "prune,globaldce,arg-specialize,inline-early,globaldce,sroa,promote,dce,inline-early,globaldce,sroa,promote,dce,global-memory,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,inline,globaldce,global-constants,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,repeat-store,gvn,simplify,dce,affine,dce,egraph,simplify,dce,fp-compare,arith,strength,gvn,simplify,dce,rotate,lookup,iv-coalesce,licm,memory,dse,simplify,dce,lftr", stats);
     if (level >= 3) runPasses(module, "unroll,memory,dse,simplify,dce", stats);
     runPasses(module, "sccp,prune,dce,compact", stats);
   }
@@ -347,8 +349,9 @@ void runPasses(ModuleIR &module, const std::string &pipeline, Stats *stats) {
   while (start < pipeline.size()) {
     size_t comma = pipeline.find(',', start);
     auto name = pipeline.substr(start, comma == std::string::npos ? comma : comma - start);
+    bool changed = true;
     auto work = [&] {
-      if (!runAdvancedPass(module, name)) for (auto &f : module.functions) {
+      if (!runAdvancedPass(module, name, &changed)) for (auto &f : module.functions) {
         if (name == "prune") prune(f);
         else if (name == "promote") {
           if (f.ssa) throw std::runtime_error("promote must precede SSA construction");
@@ -359,7 +362,9 @@ void runPasses(ModuleIR &module, const std::string &pipeline, Stats *stats) {
     };
     if (stats) stats->measure("pass."+name, work); else work();
     auto check = [&] { verify(module); };
-    if (stats) stats->measure("verify", check); else check();
+    // A preserved IR has already passed the preceding verification. Always
+    // verify the first result, including a custom pipeline containing no-ops.
+    if (!start || changed) { if (stats) stats->measure("verify", check); else check(); }
     if (comma == std::string::npos) break;
     start = comma + 1;
   }
@@ -376,7 +381,7 @@ void verify(const ModuleIR &module) {
         for (int arg : i.args) if (arg < 0 || arg >= static_cast<int>(f.values.size())) throw std::logic_error("IR operand is out of range");
         size_t arity = 0;
         switch (i.op) {
-        case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Convert: case Op::Branch: arity = 1; break;
+        case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Abs: case Op::Convert: case Op::Branch: arity = 1; break;
         case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem: case Op::And: case Op::Shr: case Op::Sar: case Op::ModMul:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::BranchCompare: arity = 2; break;
         case Op::Call:
@@ -408,6 +413,7 @@ void verify(const ModuleIR &module) {
         if (i.op == Op::Load || i.op == Op::Store || i.op == Op::Zero || i.op == Op::Offset)
           require(a(0) == ValueType::Pointer, "IR memory operand is not a pointer");
         if (i.op == Op::Move) require(a(0) == f.values[i.result], "IR move type mismatch");
+        if (i.op == Op::Abs) require(a(0) == ValueType::Float && f.values[i.result] == ValueType::Float, "IR absolute value requires f32");
         if (i.op == Op::Convert) {
           auto to = f.values[i.result];
           require((a(0) == ValueType::Int && to == ValueType::Float) ||
@@ -415,8 +421,9 @@ void verify(const ModuleIR &module) {
         }
         if (i.op == Op::Offset) require(a(1) == ValueType::Int && f.values[i.result] == ValueType::Pointer, "IR offset type mismatch");
         if (i.op == Op::Branch) require(a(0) == ValueType::Int, "IR branch condition must be int");
-        if (i.op == Op::BranchCompare) require(a(0) == ValueType::Int && a(1) == ValueType::Int &&
-            i.immediate >= static_cast<int>(Op::Eq) && i.immediate <= static_cast<int>(Op::Ge), "IR branch comparison type mismatch");
+        if (i.op == Op::BranchCompare) require(a(0) == a(1) &&
+            ((a(0) == ValueType::Int && i.immediate >= static_cast<int>(Op::Eq) && i.immediate <= static_cast<int>(Op::Ge)) ||
+             (a(0) == ValueType::Pointer && (i.immediate == static_cast<int>(Op::Eq) || i.immediate == static_cast<int>(Op::Ne)))), "IR branch comparison type mismatch");
         if (i.op == Op::Return && arity) require(a(0) == valueType(f.source->result), "IR return type mismatch");
         if (i.op >= Op::Add && i.op <= Op::Rem) {
           require(a(0) == a(1) && a(0) == f.values[i.result], "IR arithmetic type mismatch");
@@ -441,7 +448,7 @@ void verify(const ModuleIR &module) {
 }
 void printIR(const ModuleIR &module, std::ostream &out) {
   static const char *ops[] = {"constant", "address", "string", "parameter", "move", "load", "store", "offset", "zero",
-      "add", "sub", "mul", "div", "rem", "and", "shr", "sar", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare", "modmul"};
+      "add", "sub", "mul", "div", "rem", "and", "shr", "sar", "neg", "abs", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare", "modmul"};
   static const char *types[] = {"i32", "f32", "ptr", "f64", "i64"};
   for (const auto &f : module.functions) {
     out << "function " << f.source->name << " {\n";

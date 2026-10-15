@@ -13,7 +13,7 @@ inline constexpr int integerArgumentStart = 13, floatArgumentStart = 21;
 enum class RV {
   Pseudo, Add, Addi, Addw, Addiw, Subw, Mul, Mulw, Divw, Remw, Rem, And, Andi,
   Slli, Slliw, Srlw, Sraw, Srliw, Srai, Sraiw, Negw, Xor, Xori, Slt, Seqz, Snez,
-  FaddS, FsubS, FmulS, FdivS, FnegS, FeqS, FltS, FleS,
+  FaddS, FsubS, FmulS, FdivS, FnegS, FabsS, FeqS, FltS, FleS,
   FcvtWS, FcvtSW, FcvtDS, FmvWX, FmvDX
 };
 const char *rvName(RV opcode);

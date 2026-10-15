@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation-test IR verifiers and optionally prove integer rewrite rules."""
+"""Mutation-test IR contracts; optionally prove rewrites and check QEMU traces."""
 import argparse
 import os
 from pathlib import Path
@@ -39,7 +39,8 @@ int main() {
     specimen(RV::Rem,ValueType::WideInt,{ValueType::WideInt,ValueType::WideInt}),
     specimen(RV::Addiw,ValueType::Int,{ValueType::WideInt}),
     specimen(RV::Sraw,ValueType::Int,{ValueType::Int,ValueType::Int}),
-    specimen(RV::Sraiw,ValueType::Int,{ValueType::Int})};
+    specimen(RV::Sraiw,ValueType::Int,{ValueType::Int}),
+    specimen(RV::FabsS,ValueType::Float,{ValueType::Float})};
   for(const auto &f:examples) {
     verifyTarget(f);++valid;
     for(size_t a=1;a<f.values.size();++a) {
@@ -75,6 +76,19 @@ int main() {
     load.result=0;load.args={1};load.immediate=displacement;verifyTarget(memory);++valid;
     load.immediate=displacement<0 ? -2049 : 2048;reject(memory);
   }
+  for(auto type:{ValueType::Int,ValueType::Pointer})for(auto predicate:{Op::Eq,Op::Ne,Op::Lt}) {
+    auto f=examples[0];f.values[1]=f.values[2]=type;
+    MachineInstruction branch{Op::BranchCompare};branch.args={1,2};branch.immediate=static_cast<int>(predicate);branch.target=branch.otherwise=0;
+    f.blocks[0].instructions={branch};
+    if(type==ValueType::Pointer && predicate==Op::Lt){reject(f);continue;}
+    verifyTarget(f);++valid;
+    auto bad=f;bad.values[2]=ValueType::Float;reject(bad);
+    bad=f;bad.blocks[0].instructions[0].immediate=999;reject(bad);
+    bad=f;bad.blocks[0].instructions[0].result=0;reject(bad);
+    for(auto wrong:{ValueType::Float,ValueType::Double,ValueType::WideInt}) {
+      bad=f;bad.values[1]=bad.values[2]=wrong;reject(bad);
+    }
+  }
   std::cout<<valid<<" valid MIR examples; "<<rejected<<" malformed mutations rejected\n";
   Function scalar;scalar.result=Base::Int;
   ModuleIR module{};FunctionIR f{&scalar,{ValueType::Int,ValueType::Int,ValueType::Int},{},{},{},false};
@@ -107,6 +121,34 @@ int main() {
     auto mutation=f;mutation.values[value]=type;rejectCIR(mutation);
   }
   std::cout<<"1 valid CIR shift; "<<cirRejected<<" malformed shifts rejected\n";
+  cirRejected=0;Function fp;fp.result=Base::Float;f.source=&fp;f.values.assign(3,ValueType::Float);
+  f.blocks[0].instructions[2].op=Op::Abs;f.blocks[0].instructions[2].args={1};module.functions={f};verify(module);
+  for(auto args:{std::vector<int>{},std::vector<int>{1,2}}) {
+    auto mutation=f;mutation.blocks[0].instructions[2].args=args;rejectCIR(mutation);
+  }
+  for(int value:{0,1})for(auto type:{ValueType::Int,ValueType::Double,ValueType::Pointer,ValueType::WideInt}) {
+    auto mutation=f;mutation.values[value]=type;rejectCIR(mutation);
+  }
+  std::cout<<"1 valid CIR absolute value; "<<cirRejected<<" malformed absolute values rejected\n";
+  cirRejected=0;f.source=&scalar;f.values.assign(2,ValueType::Pointer);
+  x.result=0;y.result=1;
+  for(auto predicate:{Op::Eq,Op::Ne}) {
+    Instruction branch{Op::BranchCompare};branch.args={0,1};branch.target=branch.otherwise=0;branch.immediate=static_cast<int>(predicate);
+    f.blocks={{"entry",{x,y,branch}}};module.functions={f};verify(module);
+    auto bad=f;bad.blocks[0].instructions[2].immediate=static_cast<int>(Op::Lt);rejectCIR(bad);
+    bad=f;bad.blocks[0].instructions[2].immediate=999;rejectCIR(bad);
+    bad=f;bad.blocks[0].instructions[2].args={0};rejectCIR(bad);
+    bad=f;bad.blocks[0].instructions[2].result=0;rejectCIR(bad);
+    bad=f;bad.values[1]=ValueType::Float;rejectCIR(bad);
+    bad=f;bad.values.assign(2,ValueType::Float);rejectCIR(bad);
+  }
+  std::cout<<"2 valid CIR pointer comparisons; "<<cirRejected<<" malformed comparisons rejected\n";
+  for(const char *pass:{"fp-compare","lookup","lftr"}) {
+    auto bad=f;bad.blocks[0].instructions[2].args={0};module.functions={bad};bool rejected=false;
+    try {runPasses(module,pass);}catch(const std::logic_error &){rejected=true;}
+    if(!rejected)throw std::runtime_error("custom pipeline skipped its first IR verification");
+  }
+  std::cout<<"3 custom-pipeline initial verification guards passed\n";
 }
 '''
 
@@ -281,16 +323,168 @@ def check_smt():
     solver=z3.Solver();solver.add(x/8 != z3.LShR(x,3))
     if solver.check() != z3.sat:
         raise AssertionError("SMT check failed to detect a missing sign guard")
-    print(f"{count} integer rule obligations proved; missing-guard mutation rejected; Z3 {z3.get_version_string()}")
+    # Comparisons cannot observe the changed zero/NaN sign. Do not generalize
+    # this relation to storing, returning or using the value in arithmetic.
+    fx,fy=z3.fpBVToFP(x,z3.Float32()),z3.fpBVToFP(term,z3.Float32())
+    zero=z3.FPVal(0,z3.Float32())
+    for name,guard,negate_true in [('lt',z3.fpLT(fx,zero),True),('le',z3.fpLEQ(fx,zero),True),
+                                  ('gt',z3.fpGT(fx,zero),False),('ge',z3.fpGEQ(fx,zero),False)]:
+        before=z3.If(guard,z3.fpNeg(fx) if negate_true else fx,fx if negate_true else z3.fpNeg(fx))
+        after=z3.fpAbs(fx)
+        for label,compare in [('eq',z3.fpEQ),('ne',lambda a,b:z3.Not(z3.fpEQ(a,b))),
+                              ('lt',z3.fpLT),('le',z3.fpLEQ),('gt',z3.fpGT),('ge',z3.fpGEQ)]:
+            prove(f'FP comparison observation/{name}/{label}',compare(before,fy),compare(after,fy))
+    solver=z3.Solver();solver.add(x==0x80000000,z3.fpIsNegative(fx)!=z3.fpIsNegative(z3.fpAbs(fx)))
+    if solver.check()!=z3.sat:raise AssertionError('signed-zero observation counterexample missing')
+    k,n=z3.BitVecs('lftr_k lftr_n',32);dk=z3.SignExt(32,k);dn=z3.SignExt(32,n)
+    delta=z3.BitVec('lftr_delta',64)
+    for stride in (1,4,8,404,516,2147483647):
+        low=(stride & -stride).bit_length()-1;odd=stride>>low;inverse=pow(odd,-1,1<<64)
+        assert (odd*inverse)%(1<<64)==1
+        prove(f'address equality odd inverse/{stride}',z3.simplify(delta*stride*inverse,som=True),delta*(1<<low))
+        prove(f'address equality sign extension/{stride}',z3.Extract(63-low,0,dk)==z3.Extract(63-low,0,dn),k==n)
+        prove(f'inclusive pointer wrap reset/{stride}',pointer+z3.SignExt(32,k+1)*stride,
+              pointer+dk*stride+stride-(1<<32)*stride,k==2147483647)
+    prove('inclusive normal exit',k+1<=n,k!=n,k<=n,n<2147483647)
+    prove('inclusive MAX retains continuation',k<=n,z3.BoolVal(True),n==2147483647)
+    memory=z3.Array('lookup_memory',z3.BitVecSort(64),z3.BitVecSort(32))
+    row_stride,column=z3.BitVecs('lookup_stride lookup_column',64)
+    addr=lambda i:pointer+z3.SignExt(32,i)*row_stride+column
+    before=z3.Select(memory,addr(z3.If(condition,x,term)))
+    after=z3.If(condition,z3.Select(memory,addr(x)),z3.Select(memory,addr(term)))
+    # Split the two incoming edges before bit-blasting variable 64-bit products.
+    for edge in (False,True):
+        specialize=lambda v:z3.simplify(z3.substitute(v,(condition,z3.BoolVal(edge))))
+        prove(f'lookup Phi translation/{edge}',specialize(before),specialize(after))
+    prove('absolute-value Phi translation',z3.If(condition,x,term)&0x7fffffff,
+          z3.If(condition,x&0x7fffffff,term&0x7fffffff))
+    solver=z3.Solver();solver.add(z3.Select(z3.Store(memory,addr(x),term),addr(x))!=z3.Select(memory,addr(x)))
+    if solver.check()!=z3.sat:raise AssertionError('lookup clobber counterexample missing')
+    print(f"{count} rewrite rule obligations proved; missing-guard mutations rejected; Z3 {z3.get_version_string()}")
+
+
+def check_traces(build):
+    """Bound nonterminating MAX-bound loops through an observing test runtime."""
+    import struct
+    from test import CACHE,tool
+    source='''int a[1][1];int b[1][1];int main(){int i=getint();int n=getint();
+      while(i<=n){putarray(0,a[i]);putarray(0,b[i]);putint(i);i=i+1;}return 0;}'''
+    # putarray checks the computed address without dereferencing it. putint
+    # records the counter and exits after four observations. This executes the
+    # real wrap edge without huge allocations or billions of iterations.
+    runtime=r'''
+.text
+.globl _start, getint, putarray, putint
+_start:
+ .option push
+ .option norelax
+ la gp, __global_pointer$
+ .option pop
+ call main
+ li a7, 93
+ ecall
+getint:
+ li a0, 0
+ la a1, trace_input
+ li a2, 4
+ li a7, 63
+ ecall
+ li t0, 4
+ bne a0, t0, trace_fail
+ la t0, trace_input
+ lw a0, 0(t0)
+ la t0, trace_reads
+ lw t1, 0(t0)
+ bnez t1, 1f
+ la t2, trace_current
+ sw a0, 0(t2)
+1:
+ addiw t1, t1, 1
+ sw t1, 0(t0)
+ ret
+putarray:
+ bnez a0, trace_fail
+ la t0, trace_argument
+ lw t1, 0(t0)
+ la t2, a
+ beqz t1, 2f
+ la t2, b
+2:
+ xori t1, t1, 1
+ sw t1, 0(t0)
+ la t0, trace_current
+ lw t1, 0(t0)
+ slli t1, t1, 2
+ add t2, t2, t1
+ bne t2, a1, trace_fail
+ ret
+putint:
+ la t0, trace_current
+ lw t1, 0(t0)
+ bne a0, t1, trace_fail
+ addiw t1, t1, 1
+ sw t1, 0(t0)
+ la t0, trace_input
+ sw a0, 0(t0)
+ li a0, 1
+ mv a1, t0
+ li a2, 4
+ li a7, 64
+ ecall
+ la t0, trace_left
+ lw t1, 0(t0)
+ addiw t1, t1, -1
+ sw t1, 0(t0)
+ bnez t1, 3f
+ li a0, 0
+ li a7, 93
+ ecall
+3:
+ ret
+trace_fail:
+ li a0, 77
+ li a7, 93
+ ecall
+.data
+trace_left: .word 4
+.bss
+.p2align 2
+trace_reads: .zero 4
+trace_current: .zero 4
+trace_argument: .zero 4
+trace_input: .zero 4
+'''
+    env=os.environ.copy();hostlibs=CACHE/'usr/lib/x86_64-linux-gnu'
+    if hostlibs.exists():env['LD_LIBRARY_PATH']=str(hostlibs)+':'+env.get('LD_LIBRARY_PATH','')
+    count=0
+    with tempfile.TemporaryDirectory(prefix='sysy-trace-') as directory:
+        d=Path(directory);(d/'input.sy').write_text(source);(d/'runtime.s').write_text(runtime)
+        assembler,linker,qemu=(tool(name,None) for name in ('riscv64-linux-gnu-as','riscv64-linux-gnu-ld','qemu-riscv64'))
+        def assemble(name):subprocess.run([assembler,'-march=rv64gc','-mabi=lp64d',str(d/(name+'.s')),'-o',str(d/(name+'.o'))],check=True,env=env)
+        assemble('runtime')
+        for opt in (0,2,3):
+            subprocess.run([str(build/'compiler'),f'-O{opt}','--check-alloc',str(d/'input.sy'),'-o',str(d/'program.s')],check=True,env=env)
+            assemble('program');subprocess.run([linker,'-e','_start',str(d/'runtime.o'),str(d/'program.o'),'-o',str(d/'program')],check=True,env=env)
+            for first,last in ((2147483646,2147483647),(2147483647,2147483647),(-2147483648,-2147483646),(-2,1),(2147483646,2147483646),(1,0)):
+                expected=[];i=first
+                while i<=last and len(expected)<4:
+                    expected.append(i);i=(i+1+2**31)%2**32-2**31
+                run=subprocess.run([qemu,str(d/'program')],input=struct.pack('<ii',first,last),capture_output=True,timeout=10,env=env)
+                if run.returncode or run.stdout!=b''.join(struct.pack('<i',v) for v in expected):
+                    raise AssertionError(f'boundary trace O{opt}/{first}/{last}: {run.returncode} {run.stdout.hex()} {run.stderr!r}')
+                count+=1
+    print(f'{count} bounded QEMU boundary traces passed')
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build",type=Path,default=ROOT/"build")
     parser.add_argument("--smt",action="store_true",help="also prove rules with optional z3-solver")
+    parser.add_argument("--traces",action="store_true",help="also check bounded QEMU traces across signed wrap")
     opts=parser.parse_args()
     check_mir(opts.build.resolve())
     if opts.smt: check_smt()
+    if opts.traces: check_traces(opts.build.resolve())
 
 
 if __name__ == "__main__":
