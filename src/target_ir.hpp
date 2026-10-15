@@ -12,7 +12,7 @@ inline constexpr int integerArgumentStart = 13, floatArgumentStart = 21;
 // and rematerializable operations remain typed pseudos until frame layout.
 enum class RV {
   Pseudo, Add, Addi, Addw, Addiw, Subw, Mul, Mulw, Divw, Remw, Rem, And, Andi,
-  Slli, Slliw, Srlw, Srliw, Srai, Sraiw, Negw, Xor, Xori, Slt, Seqz, Snez,
+  Slli, Slliw, Srlw, Sraw, Srliw, Srai, Sraiw, Negw, Xor, Xori, Slt, Seqz, Snez,
   FaddS, FsubS, FmulS, FdivS, FnegS, FeqS, FltS, FleS,
   FcvtWS, FcvtSW, FcvtDS, FmvWX, FmvDX
 };

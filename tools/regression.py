@@ -682,6 +682,74 @@ def main():
             cases[name]=(f'''int main(){{int i=0;while(i<{len(inputs)}){{int x=getint();
               putf("{fmt}",{','.join(expressions)});i=i+1;}}return 0;}}''',"\n".join(expected)+"\n0\n")
             (directory/f"{name}.in").write_text("\n".join(map(str,inputs))+"\n")
+    congruence_rng=random.Random(20261020)
+    for shift in (1,2,3,7,11,16,30,31):
+        for sign in (1,-1):
+            d=sign*(1<<shift)
+            if d>2147483647:continue
+            inputs=[-2147483648,-2147483647,-1,0,1,2147483646,2147483647]
+            inputs += [wrap(m*(1<<shift)+delta) for m in (-3,-2,-1,1,2,3) for delta in (-1,0,1)]
+            inputs += [congruence_rng.randrange(-2147483648,2147483648) for _ in range(12)]
+            lines=[]
+            for x in inputs:
+                row=[]
+                if remainder(x,d)==0:
+                    row=[quotient(x,d),remainder(x,d),quotient(wrap(x*3),d),
+                         quotient(wrap(x+d),d),quotient(wrap(-x),d),quotient(wrap(x+1),d)]
+                else:row=[quotient(x,d),remainder(x,d)]
+                row += [quotient(x,d),remainder(x,d)]
+                lines.append(" ".join(map(str,row)))
+            name=f"congruence_divrem_{shift}_{int(sign<0)}"
+            cases[name]=(f'''int main(){{int i=0;while(i<{len(inputs)}){{int x=getint();
+              if(x%({d})==0)putf("%d %d %d %d %d %d ",x/({d}),x%({d}),
+                (x*3)/({d}),(x+({d}))/({d}),(-x)/({d}),(x+1)/({d}));
+              else putf("%d %d ",x/({d}),x%({d}));
+              putf("%d %d\\n",x/({d}),x%({d}));i=i+1;}}return 0;}}''',"\n".join(lines)+"\n0\n")
+            (directory/f"{name}.in").write_text("\n".join(map(str,inputs))+"\n")
+    for tag in (0,1):
+        inputs=[-2147483648,-2147483647,-129,-128,-17,-16,-8,-1,0,1,8,16,17,128,2147483647]
+        lines=[]
+        for x in inputs:
+            row=[]
+            if remainder(x,8)==0:
+                y=wrap(x+1) if tag else x
+                row += [quotient(y,8)]
+                if remainder(x,16)==0:row += [quotient(x,16)]
+                else:row += [quotient(x,-8)]
+                row += [quotient(x,16)]
+            if remainder(x,8)!=0:row += [quotient(x,8)]
+            else:row += [quotient(x,-8)]
+            row += [quotient(x,8),quotient(x,16)]
+            lines.append(" ".join(map(str,row)))
+        name=f"congruence_scope_{tag}"
+        cases[name]=(f'''int main(){{int tag=getint();int i=0;while(i<{len(inputs)}){{int x=getint();
+          if(x%8==0){{int y=x;if(tag)y=x+1;putf("%d ",y/8);
+            if(x%16==0)putf("%d ",x/16);else putf("%d ",x/(-8));putf("%d ",x/16);}}
+          if(x%8!=0)putf("%d ",x/8);else putf("%d ",x/(-8));
+          putf("%d %d\\n",x/8,x/16);i=i+1;}}return 0;}}''',"\n".join(lines)+"\n0\n")
+        (directory/f"{name}.in").write_text("\n".join(map(str,[tag,*inputs]))+"\n")
+    inputs=[-2147483648,-2147483647,-1,0,1,2147483647]+[congruence_rng.randrange(-2147483648,2147483648) for _ in range(16)]
+    lines=[]
+    for x in inputs:
+        a,b=wrap(x*16),wrap(wrap(x+3)*8)
+        lines.append(" ".join(map(str,[quotient(wrap(a+b),8),quotient(wrap(a-b),8),
+          quotient(wrap(a*b),128),remainder(wrap(a*b),128),quotient(wrap(-a),-16)])))
+    cases['congruence_wrapping']=('''int main(){int n=getint();int i=0;while(i<n){int x=getint();
+      int a=x*16;int b=(x+3)*8;putf("%d %d %d %d %d\\n",(a+b)/8,(a-b)/8,(a*b)/128,(a*b)%128,(-a)/(-16));i=i+1;}return 0;}''',
+      "\n".join(lines)+"\n0\n")
+    (directory/'congruence_wrapping.in').write_text("\n".join(map(str,[len(inputs),*inputs]))+"\n")
+    lines=[]
+    for original in inputs:
+        x,total=original,0
+        for _ in range(17):
+            total=wrap(total+x)
+            x=quotient(x,2) if remainder(x,2)==0 else wrap(x*3+1)
+        lines.append(str(wrap(total+x)))
+    cases['congruence_tail']=('''int walk(int x,int sum,int n){if(n==0)return sum+x;
+      if(x%2==0)return walk(x/2,sum+x,n-1);else return walk(x*3+1,sum+x,n-1);}
+      int main(){int n=getint();int i=0;while(i<n){putint(walk(getint(),0,17));putch(10);i=i+1;}return 0;}''',
+      "\n".join(lines)+"\n0\n")
+    (directory/'congruence_tail.in').write_text("\n".join(map(str,[len(inputs),*inputs]))+"\n")
     guard_rng = random.Random(20261019)
     for n in range(24):
         x = ([-2**31,-2**31+1,-65537,-1,0,1,65537,2**31-18,2**31-1]+[guard_rng.randrange(-2**31,2**31) for _ in range(15)])[n]

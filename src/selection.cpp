@@ -7,7 +7,7 @@
 namespace sysy {
 const char *rvName(RV op) {
   static const char *names[] = {"pseudo","add","addi","addw","addiw","subw","mul","mulw","divw","remw","rem","and","andi",
-    "slli","slliw","srlw","srliw","srai","sraiw","negw","xor","xori","slt","seqz","snez",
+    "slli","slliw","srlw","sraw","srliw","srai","sraiw","negw","xor","xori","slt","seqz","snez",
     "fadd.s","fsub.s","fmul.s","fdiv.s","fneg.s","feq.s","flt.s","fle.s",
     "fcvt.w.s","fcvt.s.w","fcvt.d.s","fmv.w.x","fmv.d.x"};
   return names[static_cast<size_t>(op)];
@@ -53,6 +53,7 @@ class Selector {
     int a = i.args[0], dst = i.result; int32_t d = *c;
     if (i.op == Op::And && small(d)) { emit(RV::Andi,{a},d,dst); return true; }
     if (i.op == Op::Shr) { emit(RV::Srliw,{a},d&31,dst); return true; }
+    if (i.op == Op::Sar) { emit(RV::Sraiw,{a},d&31,dst); return true; }
     if (i.op == Op::Add || i.op == Op::Sub) {
       // Word additions compose modulo 2^32, including overflow and subtraction.
       // defs excludes multiply-defined Phi/edge-copy values after SSA lowering.
@@ -193,7 +194,7 @@ class Selector {
       }
       return;
     }
-    RV op = i.op == Op::And ? RV::And : i.op == Op::Shr ? RV::Srlw :
+    RV op = i.op == Op::And ? RV::And : i.op == Op::Shr ? RV::Srlw : i.op == Op::Sar ? RV::Sraw :
       fp ? (i.op == Op::Add ? RV::FaddS : i.op == Op::Sub ? RV::FsubS : i.op == Op::Mul ? RV::FmulS : RV::FdivS) :
       i.op == Op::Add ? RV::Addw : i.op == Op::Sub ? RV::Subw : i.op == Op::Mul ? RV::Mulw : i.op == Op::Div ? RV::Divw : RV::Remw;
     emit(op,{a,b},0,dst,type);
@@ -327,7 +328,7 @@ void verifyTarget(const MachineFunction &f) {
       if (i.op == Op::Target && (i.result < 0 || i.opcode == RV::Pseudo)) throw std::logic_error("unselected instruction");
       if (i.op == Op::Target) {
         bool unary = i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi ||
-          (i.opcode >= RV::Slli && i.opcode <= RV::Negw && i.opcode != RV::Srlw) || i.opcode == RV::Xori ||
+          (i.opcode >= RV::Slli && i.opcode <= RV::Negw && i.opcode != RV::Srlw && i.opcode != RV::Sraw) || i.opcode == RV::Xori ||
           i.opcode == RV::Seqz || i.opcode == RV::Snez || i.opcode == RV::FnegS || i.opcode >= RV::FcvtWS;
         if (i.args.size() != (unary ? 1u : 2u)) throw std::logic_error("invalid target arity");
         if ((i.opcode == RV::Addi || i.opcode == RV::Addiw || i.opcode == RV::Andi || i.opcode == RV::Xori) && !small(i.immediate)) throw std::logic_error("target immediate out of range");

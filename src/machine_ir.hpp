@@ -10,9 +10,10 @@ namespace sysy {
 enum class ValueType { Int, Float, Pointer, Double, WideInt };
 // ModMul is total: widen both signed int32 operands before multiplication,
 // take signed int64 remainder by its bounded positive immediate, then narrow.
+// Shr/Sar shift unsigned/signed int32 respectively; counts are masked to 0..31.
 enum class Op {
   Constant, Address, String, Parameter, Move, Load, Store, Offset, Zero,
-  Add, Sub, Mul, Div, Rem, And, Shr, Neg, Convert, Eq, Ne, Lt, Le, Gt, Ge,
+  Add, Sub, Mul, Div, Rem, And, Shr, Sar, Neg, Convert, Eq, Ne, Lt, Le, Gt, Ge,
   Call, Jump, Branch, Return, Phi, BranchCompare, ModMul, Target, SpillLoad, SpillStore
 };
 struct Instruction {

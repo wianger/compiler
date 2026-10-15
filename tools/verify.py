@@ -37,7 +37,9 @@ int main() {
     specimen(RV::Mul,ValueType::Pointer,{ValueType::Int,ValueType::Int}),
     specimen(RV::Mul,ValueType::WideInt,{ValueType::Int,ValueType::Int}),
     specimen(RV::Rem,ValueType::WideInt,{ValueType::WideInt,ValueType::WideInt}),
-    specimen(RV::Addiw,ValueType::Int,{ValueType::WideInt})};
+    specimen(RV::Addiw,ValueType::Int,{ValueType::WideInt}),
+    specimen(RV::Sraw,ValueType::Int,{ValueType::Int,ValueType::Int}),
+    specimen(RV::Sraiw,ValueType::Int,{ValueType::Int})};
   for(const auto &f:examples) {
     verifyTarget(f);++valid;
     for(size_t a=1;a<f.values.size();++a) {
@@ -58,6 +60,15 @@ int main() {
   bad=examples[0];bad.values[0]=static_cast<ValueType>(99);reject(bad);
   bad=examples[0];bad.blocks[0].instructions[0].integerClobbers=uint32_t{1}<<31;reject(bad);
   bad=examples[0];bad.blocks[0].instructions[0].op=Op::ModMul;bad.blocks[0].instructions[0].opcode=RV::Pseudo;reject(bad);
+  for(auto opcode:{RV::Sraw,RV::Sraiw}) {
+    auto shift=specimen(opcode,ValueType::Int,{ValueType::Int});
+    if(opcode==RV::Sraw)shift.blocks[0].instructions[0].args={1,1};
+    shift.values[0]=ValueType::Pointer;reject(shift);
+  }
+  for(int count:{-1,32}) {
+    auto shift=specimen(RV::Sraiw,ValueType::Int,{ValueType::Int});
+    shift.blocks[0].instructions[0].immediate=count;reject(shift);
+  }
   for(int displacement:{-2048,2047}) {
     auto memory=examples[0];memory.values[1]=ValueType::Pointer;
     auto &load=memory.blocks[0].instructions[0];load=MachineInstruction{Op::Load};
@@ -75,7 +86,7 @@ int main() {
   auto rejectCIR=[&](FunctionIR mutation) {
     module.functions={mutation};
     try {verify(module);}catch(const std::logic_error &){++cirRejected;return;}
-    throw std::runtime_error("verifier accepted a malformed modular product");
+    throw std::runtime_error("verifier accepted a malformed CIR mutation");
   };
   for(int64_t modulus:{INT64_C(-1),INT64_C(0),INT64_C(1),INT64_C(1073741825),INT64_C(2147483647)}) {
     auto mutation=f;mutation.blocks[0].instructions[2].immediate=modulus;rejectCIR(mutation);
@@ -87,6 +98,15 @@ int main() {
     auto mutation=f;mutation.values[value]=type;rejectCIR(mutation);
   }
   std::cout<<"1 valid CIR example; "<<cirRejected<<" malformed modular products rejected\n";
+  cirRejected=0;f.blocks[0].instructions[2].op=Op::Sar;f.blocks[0].instructions[2].immediate=0;
+  module.functions={f};verify(module);
+  for(auto args:{std::vector<int>{1},std::vector<int>{1,2,1}}) {
+    auto mutation=f;mutation.blocks[0].instructions[2].args=args;rejectCIR(mutation);
+  }
+  for(int value:{0,1,2})for(auto type:{ValueType::Float,ValueType::Double,ValueType::Pointer,ValueType::WideInt}) {
+    auto mutation=f;mutation.values[value]=type;rejectCIR(mutation);
+  }
+  std::cout<<"1 valid CIR shift; "<<cirRejected<<" malformed shifts rejected\n";
 }
 '''
 
@@ -133,6 +153,9 @@ def check_smt():
             prove(f"nonnegative division/{divisor}", x/d, q if sign > 0 else -q, x >= 0)
             prove(f"nonnegative remainder/{divisor}", z3.SRem(x,d), x & mask, x >= 0)
             prove(f"zero remainder/{divisor}", z3.SRem(x,d)==0, (x & mask)==0)
+            prove(f"exact signed division/{divisor}",x/d,(x>>shift) if sign>0 else -(x>>shift),
+                  (x & mask)==0)
+            prove(f"exact signed remainder/{divisor}",z3.SRem(x,d),z3.BitVecVal(0,32),(x & mask)==0)
             if shift:
                 bias=z3.LShR(x,31) if shift==1 else z3.LShR(x>>31,32-shift)
                 adjusted=x+bias
@@ -140,6 +163,23 @@ def check_smt():
                 prove(f"signed biased division/{divisor}",x/d,quotient if sign>0 else -quotient)
                 rem=(adjusted & mask)-bias if (1<<shift)-1<=2047 else x-((adjusted>>shift)<<shift)
                 prove(f"signed biased remainder/{divisor}",z3.SRem(x,d),rem)
+    for shift in range(32):
+        # CIR Sar's constant evaluator uses unsigned operations, including count
+        # zero; prove its sign fill agrees with the target word arithmetic shift.
+        fill=z3.If(x<0,~z3.LShR(z3.BitVecVal(-1,32),shift),z3.BitVecVal(0,32))
+        prove(f"arithmetic shift sign fill/{shift}",z3.LShR(x,shift)|fill,x>>shift)
+    for shift in (1,2,8,16,31):
+        mask=z3.BitVecVal((1<<shift)-1,32)
+        even=(x & mask)==0; other=(term & mask)==0
+        for name,value in (("add",x+term),("sub",x-term)):
+            prove(f"congruence {name}/{shift}",value & mask,z3.BitVecVal(0,32),even,other)
+        prove(f"congruence neg/{shift}",(-x)&mask,z3.BitVecVal(0,32),even)
+        prove(f"congruence and/{shift}",(x & term)&mask,z3.BitVecVal(0,32),even)
+    for a,b in ((1,1),(2,3),(16,16),(31,1)):
+        prove(f"congruence product/{a}/{b}",(x*term)&z3.BitVecVal((1<<min(32,a+b))-1,32),
+              z3.BitVecVal(0,32),(x & ((1<<a)-1))==0,(term & ((1<<b)-1))==0)
+    solver=z3.Solver();solver.add(x<0,(x & 1)!=0,x/2!=(x>>1))
+    if solver.check()!=z3.sat:raise AssertionError("exact division guard counterexample missing")
     prove("conditional integer accumulation", z3.If(condition,accumulator+term,accumulator),
           accumulator+z3.If(condition,z3.BitVecVal(1,32),z3.BitVecVal(0,32))*term)
     # Repeated positive power-of-two division truncates towards zero, even

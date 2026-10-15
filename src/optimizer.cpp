@@ -558,6 +558,11 @@ std::optional<int64_t> fold(const Instruction &i, const FunctionIR &f, const std
   case Op::Mul: return static_cast<int32_t>(static_cast<uint32_t>(a) * static_cast<uint32_t>(b));
   case Op::And: return a & b;
   case Op::Shr: return static_cast<int32_t>(static_cast<uint32_t>(a) >> (b & 31));
+  case Op::Sar: {
+    uint32_t shifted = static_cast<uint32_t>(a) >> (b & 31);
+    if (a < 0) shifted |= ~(UINT32_MAX >> (b & 31));
+    return static_cast<int32_t>(shifted);
+  }
   case Op::Div: case Op::Rem:
     if (b == 0) return {};
     if (a == INT32_MIN && b == -1) return i.op == Op::Div ? INT32_MIN : 0;
@@ -1673,6 +1678,27 @@ void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true)
   // Edge predicates are valid only in their dominated subtree. Derived ranges
   // are queried lazily; wrapping arithmetic and cyclic phis stay conservative.
   std::map<int,std::pair<int64_t,int64_t>> facts;
+  // A small congruence domain: v == 0 (mod 2^k). Unlike signed ranges,
+  // these facts survive wrapping add/sub/mul. Never traverse a Phi using
+  // facts from its current outgoing edge: they need not hold on incoming edges.
+  std::map<int,int> zeroBits;
+  auto trailingZeros = [](uint32_t bits) {
+    int count = 0;
+    while (count < 32 && !(bits & 1)) { ++count; bits >>= 1; }
+    return count;
+  };
+  std::function<int(int,int&)> lowZeros = [&](int v,int &budget) {
+    auto known = zeroBits.find(v);
+    if (known != zeroBits.end()) return known->second;
+    if (--budget < 0 || !defs[v] || f.values[v] != ValueType::Int) return 0;
+    const auto &i = *defs[v];
+    if (i.op == Op::Constant) return trailingZeros(static_cast<uint32_t>(i.immediate));
+    if (i.op == Op::Move || i.op == Op::Neg) return lowZeros(i.args[0],budget);
+    if (i.op != Op::Add && i.op != Op::Sub && i.op != Op::Mul && i.op != Op::And) return 0;
+    int a = lowZeros(i.args[0],budget), b = lowZeros(i.args[1],budget);
+    if (i.op == Op::Mul) return std::min(32,a+b);
+    return i.op == Op::And ? std::max(a,b) : std::min(a,b);
+  };
   std::function<Range(int,int&)> query = [&](int v, int &budget) -> Range {
     auto fact = facts.find(v); if (fact != facts.end()) return fact->second;
     if (ranges[v]) return ranges[v];
@@ -1753,6 +1779,7 @@ void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true)
   size_t tableBudget = 65536;
   std::function<void(int)> rewrite = [&](int block) {
     int refined = -1; Range previous;
+    int bitRefined = -1, previousBits = 0;
     if (predicates && graph.pred[block].size() == 1) {
       const auto &branch = f.blocks[graph.pred[block][0]].instructions.back();
       if (branch.op == Op::Branch && branch.target != branch.otherwise) {
@@ -1773,6 +1800,27 @@ void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true)
             }
             int budget = 64; auto bound = query(value,budget).value_or(std::make_pair(int64_t(INT32_MIN),int64_t(INT32_MAX)));
             int64_t c = defs[literal]->immediate;
+            if (op == Op::Eq && c == 0 && defs[value]) {
+              const auto &test = *defs[value];
+              int operand = -1, zeros = 0;
+              if (test.op == Op::Rem && defs[test.args[1]] && defs[test.args[1]]->op == Op::Constant) {
+                int64_t modulus = std::abs(defs[test.args[1]]->immediate);
+                if (modulus && !(modulus & (modulus-1))) {
+                  operand = test.args[0]; zeros = trailingZeros(static_cast<uint32_t>(modulus));
+                }
+              } else if (test.op == Op::And) for (int n = 0; n < 2; ++n) {
+                auto mask = defs[test.args[n]];
+                if (mask && mask->op == Op::Constant) {
+                  operand = test.args[1-n]; zeros = trailingZeros(~static_cast<uint32_t>(mask->immediate));
+                  break;
+                }
+              }
+              if (operand >= 0 && zeros) {
+                auto old = zeroBits.find(operand);
+                previousBits = old == zeroBits.end() ? 0 : old->second;
+                bitRefined = operand; zeroBits[operand] = std::max(previousBits,zeros);
+              }
+            }
             if (op == Op::Eq) { bound.first = std::max(bound.first,c); bound.second = std::min(bound.second,c); }
             if (op == Op::Lt || op == Op::Le) bound.second = std::min(bound.second,c-(op == Op::Lt));
             if (op == Op::Gt || op == Op::Ge) bound.first = std::max(bound.first,c+(op == Op::Gt));
@@ -1849,12 +1897,18 @@ void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true)
         bool power = magnitude && !(magnitude & (magnitude-1));
         int budget = 64; auto range = power ? (predicates ? query(i.args[0],budget) : ranges[i.args[0]]) : Range{};
         bool nonnegative = range && range->first >= 0;
-        if (power && (nonnegative || (i.op == Op::Rem && zeroTest[i.result]))) {
+        int shift = 0;
+        if (power) for (int64_t n = magnitude; n > 1; n >>= 1) ++shift;
+        budget = 64;
+        bool exact = power && !nonnegative && lowZeros(i.args[0],budget) >= shift;
+        if (exact && i.op == Op::Rem) {
+          i.op = Op::Constant; i.immediate = 0; i.args.clear();
+        } else if (power && (nonnegative || exact || (i.op == Op::Rem && zeroTest[i.result]))) {
           Instruction c{Op::Constant}; c.result = newValue(f, ValueType::Int);
           if (i.op == Op::Rem) c.immediate = magnitude-1;
-          else for (int64_t n = magnitude; n > 1; n >>= 1) ++c.immediate;
+          else c.immediate = shift;
           code.push_back(c); bool negative = divisor < 0 && i.op == Op::Div;
-          i.op = i.op == Op::Rem ? Op::And : Op::Shr; i.args[1] = c.result;
+          i.op = i.op == Op::Rem ? Op::And : exact ? Op::Sar : Op::Shr; i.args[1] = c.result;
           if (negative) {
             int result = i.result; i.result = newValue(f, ValueType::Int); code.push_back(i);
             Instruction negate{Op::Neg}; negate.result = result; negate.args = {i.result}; i = negate;
@@ -1869,6 +1923,7 @@ void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true)
       if (it->second) facts[it->first] = *it->second; else facts.erase(it->first);
     }
     if (refined >= 0) { if (previous) facts[refined] = *previous; else facts.erase(refined); }
+    if (bitRefined >= 0) { if (previousBits) zeroBits[bitRefined] = previousBits; else zeroBits.erase(bitRefined); }
   };
   rewrite(0);
   if (!tables.empty()) {

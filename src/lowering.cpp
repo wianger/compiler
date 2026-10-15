@@ -377,7 +377,7 @@ void verify(const ModuleIR &module) {
         size_t arity = 0;
         switch (i.op) {
         case Op::Move: case Op::Load: case Op::Zero: case Op::Neg: case Op::Convert: case Op::Branch: arity = 1; break;
-        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem: case Op::And: case Op::Shr: case Op::ModMul:
+        case Op::Store: case Op::Offset: case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Rem: case Op::And: case Op::Shr: case Op::Sar: case Op::ModMul:
         case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::BranchCompare: arity = 2; break;
         case Op::Call:
           require(i.callee != nullptr, "IR call has no callee");
@@ -423,7 +423,7 @@ void verify(const ModuleIR &module) {
           require(a(0) == ValueType::Int || a(0) == ValueType::Float, "IR arithmetic requires numeric values");
           if (i.op == Op::Rem) require(a(0) == ValueType::Int, "IR remainder requires int values");
         }
-        if (i.op == Op::And || i.op == Op::Shr) require(a(0) == ValueType::Int && a(1) == ValueType::Int && f.values[i.result] == ValueType::Int, "IR bit operation requires int values");
+        if (i.op == Op::And || i.op == Op::Shr || i.op == Op::Sar) require(a(0) == ValueType::Int && a(1) == ValueType::Int && f.values[i.result] == ValueType::Int, "IR bit operation requires int values");
         if (i.op == Op::ModMul) require(a(0) == ValueType::Int && a(1) == ValueType::Int && f.values[i.result] == ValueType::Int &&
             i.immediate >= 2 && i.immediate <= (1<<30), "IR modular product requires int operands and a bounded modulus");
         if (i.op >= Op::Eq && i.op <= Op::Ge)
@@ -441,7 +441,7 @@ void verify(const ModuleIR &module) {
 }
 void printIR(const ModuleIR &module, std::ostream &out) {
   static const char *ops[] = {"constant", "address", "string", "parameter", "move", "load", "store", "offset", "zero",
-      "add", "sub", "mul", "div", "rem", "and", "shr", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare", "modmul"};
+      "add", "sub", "mul", "div", "rem", "and", "shr", "sar", "neg", "convert", "eq", "ne", "lt", "le", "gt", "ge", "call", "jump", "branch", "return", "phi", "branch.compare", "modmul"};
   static const char *types[] = {"i32", "f32", "ptr", "f64", "i64"};
   for (const auto &f : module.functions) {
     out << "function " << f.source->name << " {\n";
