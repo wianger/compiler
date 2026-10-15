@@ -1646,7 +1646,121 @@ def main():
         (fixture / "branch_fields.in").write_text(f"-31 {count}\n")
         (fixture / "branch_fields.out").write_text(f"{wrap(total*2+value)}\n0\n")
         print(f"Wrote path-specific memory fixture to {fixture}")
+        fixture=ROOT/"build/unswitch-fixture/performance";fixture.mkdir(parents=True,exist_ok=True)
+        source='''int a[1024];int b[1024];
+int main(){int seed=getint();int mode=getint();int n=getint();int trips=getint();int i=0;
+ while(i<n){a[i]=seed+i*7919;b[i]=i*3571-seed;i=i+1;}
+ int sum=0;int r=0;starttime();
+ while(r<trips){int flag=mode+r%3;i=0;
+   while(i<n){if(flag)a[i]=a[i]+b[i]*3+i;else a[i]=a[i]-(b[i]*5-i);
+     sum=sum+a[i];i=i+1;}r=r+1;}
+ stoptime();putint(sum);putch(10);putarray(n,a);return 0;}
+'''
+        # Independent modular closed sums: each residue class contributes once
+        # to the final array and (trips-r) times to the observed running sum.
+        for mode in (0,-1):
+            seed,n,trips=-731,1024,10000;total=0;final=[]
+            for i in range(n):
+                initial=wrap(seed+i*7919);other=wrap(i*3571-seed)
+                last=initial;subtotal=trips*initial
+                for residue in range(3):
+                    count=(trips-residue+2)//3
+                    weight=count*(trips-residue)-3*count*(count-1)//2
+                    delta=3*other+i if mode+residue else -(5*other-i)
+                    last+=count*delta;subtotal+=weight*delta
+                final.append(wrap(last));total+=subtotal
+            name='control_mix'+str(-mode)
+            (fixture/(name+'.sy')).write_text(source)
+            (fixture/(name+'.in')).write_text(f'{seed} {mode} {n} {trips}\n')
+            (fixture/(name+'.out')).write_text(str(wrap(total))+'\n1024: '+' '.join(map(str,final))+'\n0\n')
+        print(f"Wrote invariant-control fixture to {fixture}")
         return
+    # Invariant control specialization must preserve aliasing, zero trips,
+    # carried exit values, non-boolean predicates, and every break/continue edge.
+    for case,(n,mode,alias) in enumerate((n,m,a) for n in (-2,0,1,7,16)
+                                       for m in (0,-7) for a in (0,1)):
+        a=[wrap(-2147483648+i*7919) for i in range(20)]
+        b=[wrap(2147483647-i*3571) for i in range(20)]
+        target=a if alias else b
+        total=0;i=0
+        while i<n:
+            if mode:a[i]=wrap(a[i]+target[i])
+            else:a[i]=wrap(a[i]-target[i])
+            target[i]=wrap(target[i]+i+3)
+            if mode:total=wrap(total+a[i])
+            total=wrap(total+target[i]);i+=1
+        name=f'unswitch_alias_{case:02d}'
+        cases[name]=('''int run(int a[],int b[],int n,int flag){int i=0;int sum=0;
+          while(i<n){if(flag)a[i]=a[i]+b[i];else a[i]=a[i]-b[i];
+            b[i]=b[i]+i+3;if(flag)sum=sum+a[i];sum=sum+b[i];i=i+1;}
+          putf("%d %d\\n",i,sum);return sum;}
+          int main(){int n=getint();int flag=getint();int alias=getint();int a[20];int b[20];int i=0;
+            while(i<20){a[i]=-2147483648+i*7919;b[i]=2147483647-i*3571;i=i+1;}
+            if(alias)run(a,a,n,flag);else run(a,b,n,flag);putarray(20,a);putarray(20,b);return 0;}''',
+          f'{i} {total}\n20: '+" ".join(map(str,a))+'\n20: '+" ".join(map(str,b))+'\n0\n')
+        (directory/f'{name}.in').write_text(f'{n} {mode} {alias}\n')
+    for case,(n,mode) in enumerate((n,m) for n in (0,1,8,19) for m in (0,31)):
+        i=total=0
+        while i<n:
+            if mode:
+                if i==7:break
+                if i%3==0:i+=1;continue
+                total=wrap(total+i*7919)
+            else:total=wrap(total-i*3571)
+            i+=1
+        name=f'unswitch_edges_{case:02d}'
+        cases[name]=('''int main(){int n=getint();int flag=getint();int i=0;int total=0;
+          while(i<n){if(flag){if(i==7)break;if(i%3==0){i=i+1;continue;}total=total+i*7919;}
+            else total=total-i*3571;i=i+1;}putf("%d %d\\n",i,total);return 0;}''',f'{i} {total}\n0\n')
+        (directory/f'{name}.in').write_text(f'{n} {mode}\n')
+    for case,mode in enumerate((0,1,-7,2147483647)):
+        state=mode;total=0
+        for i in range(17):
+            total=wrap(total+(i*3 if state else i-11));state=wrap(state*1664525+1013904223)
+        name=f'unswitch_variant_{case}'
+        cases[name]=('''int main(){int state[1];state[0]=getint();int i=0;int sum=0;
+          while(i<17){if(state[0])sum=sum+i*3;else sum=sum+i-11;
+            state[0]=state[0]*1664525+1013904223;i=i+1;}
+          putf("%d %d\\n",sum,state[0]);return 0;}''',f'{total} {state}\n0\n')
+        (directory/f'{name}.in').write_text(f'{mode}\n')
+    for case,mode in enumerate((0,1,-7,2147483647)):
+        total=0
+        for r in range(9):
+            flag=wrap(mode+r)
+            for i in range(r+1):total=wrap(total+(r*17+i if flag else r-i*31))
+        name=f'unswitch_nested_{case}'
+        cases[name]=('''int main(){int mode=getint();int r=0;int total=0;
+          while(r<9){int flag=mode+r;int i=0;while(i<r+1){
+            if(flag)total=total+r*17+i;else total=total+r-i*31;i=i+1;}r=r+1;}
+          putint(total);return 0;}''',f'{total}\n0\n')
+        (directory/f'{name}.in').write_text(f'{mode}\n')
+    for case,(n,mode) in enumerate((n,m) for n in (0,7) for m in (0,-7)):
+        total=sum((i+3 if mode else -(i+3)) for i in range(n))
+        name=f'unswitch_calls_{case}'
+        cases[name]=('''int main(){int n=getint();int mode=getint();int i=0;int total=0;
+          while(i<n){if(mode)total=total+getint();else total=total-getint();i=i+1;}
+          putf("%d %d\\n",total,getint());return 0;}''',f'{total} 99\n0\n')
+        (directory/f'{name}.in').write_text(f'{n} {mode} '+" ".join(str(i+3) for i in range(n))+' 99\n')
+    for case,(n,mode) in enumerate((n,m) for n in (0,7) for m in (0,-7)):
+        total=sum((i*7 if mode else -i*11) for i in range(min(n,3)))
+        name=f'unswitch_returns_{case}'
+        cases[name]=('''int run(int n,int mode){int i=0;int sum=0;while(i<n){
+          if(i==3)return sum;if(mode)sum=sum+i*7;else sum=sum-i*11;i=i+1;}return sum;}
+          int main(){int n=getint();int mode=getint();putint(run(n,mode));return 0;}''',f'{total}\n0\n')
+        (directory/f'{name}.in').write_text(f'{n} {mode}\n')
+    for case,(n,mode) in enumerate((n,m) for n in (0,17) for m in (0,-7)):
+        # Binary32 rounding at each source operation, including signed zero.
+        number=-0.0
+        for i in range(n):
+            factor=struct.unpack('<f',struct.pack('<f',0.1))[0]
+            term=struct.unpack('<f',struct.pack('<f',(i+1)*factor))[0]
+            number=struct.unpack('<f',struct.pack('<f',number+term if mode else number-term))[0]
+        reciprocal=struct.unpack('<f',struct.pack('<f',1.0/number))[0].hex() if number else '-inf'
+        name=f'unswitch_float_{case}'
+        cases[name]=('''int main(){int n=getint();int mode=getint();float x=getfloat();int i=0;
+          while(i<n){float y=(i+1)*0.1;if(mode)x=x+y;else x=x-y;i=i+1;}
+          putfloat(x);putch(32);putfloat(1.0/x);return 0;}''',f'{number.hex()} {reciprocal}\n0\n')
+        (directory/f'{name}.in').write_text(f'{n} {mode} -0x0p+0\n')
     for name, (source, expected) in cases.items():
         (directory / f"{name}.sy").write_text(source)
         (directory / f"{name}.out").write_text(expected)

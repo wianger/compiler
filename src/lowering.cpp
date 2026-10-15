@@ -341,7 +341,7 @@ void optimize(ModuleIR &module, int level, Stats *stats) {
   else {
     runPasses(module, "prune,globaldce,arg-specialize,inline-early,globaldce,sroa,promote,dce,inline-early,globaldce,sroa,promote,dce,global-memory,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,inline,globaldce,global-constants,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,repeat-store,gvn,simplify,dce,affine,dce,egraph,simplify,dce,fp-compare,arith,strength,gvn,simplify,dce,rotate,lookup,iv-coalesce,licm,memory,dse,simplify,dce,lftr", stats);
     if (level >= 3) runPasses(module, "unroll,memory,dse,simplify,dce", stats);
-    runPasses(module, "sccp,prune,dce,compact", stats);
+    runPasses(module, "sccp,prune,dce,unswitch,compact", stats);
   }
 }
 void runPasses(ModuleIR &module, const std::string &pipeline, Stats *stats) {

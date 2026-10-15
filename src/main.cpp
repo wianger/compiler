@@ -49,7 +49,7 @@ void help() {
       "  --emit-effects     print function read/write and observable-effect summaries\n"
       "  --stats            print stage timings and peak RSS as JSON to stderr\n"
       "  --passes=PIPELINE  override ordered IR passes (comma separated)\n"
-      "    prune,arg-specialize,inline,inline-early,globaldce,global-memory,global-constants,sroa,promote,loop-promote,ssa,simplify,sccp,gvn,memory,memory-basic,memory-phi,dse,dse-basic,affine,egraph,tail,fp-compare,arith,arith-global,arith-no-tables,licm,repeat-store,strength,iv-coalesce,rotate,lookup,lftr,unroll,dce,compact,lower-phi,isel,layout\n"
+      "    prune,arg-specialize,inline,inline-early,globaldce,global-memory,global-constants,sroa,promote,loop-promote,ssa,simplify,sccp,gvn,memory,memory-basic,memory-phi,dse,dse-basic,affine,egraph,tail,fp-compare,unswitch,arith,arith-global,arith-no-tables,licm,repeat-store,strength,iv-coalesce,rotate,lookup,lftr,unroll,dce,compact,lower-phi,isel,layout\n"
       "  --help             print this help\n";
 }
 Options options(int argc, char **argv) {

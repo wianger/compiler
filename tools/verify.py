@@ -143,12 +143,12 @@ int main() {
     bad=f;bad.values.assign(2,ValueType::Float);rejectCIR(bad);
   }
   std::cout<<"2 valid CIR pointer comparisons; "<<cirRejected<<" malformed comparisons rejected\n";
-  for(const char *pass:{"fp-compare","lookup","lftr"}) {
+  for(const char *pass:{"fp-compare","lookup","lftr","unswitch"}) {
     auto bad=f;bad.blocks[0].instructions[2].args={0};module.functions={bad};bool rejected=false;
     try {runPasses(module,pass);}catch(const std::logic_error &){rejected=true;}
     if(!rejected)throw std::runtime_error("custom pipeline skipped its first IR verification");
   }
-  std::cout<<"3 custom-pipeline initial verification guards passed\n";
+  std::cout<<"4 custom-pipeline initial verification guards passed\n";
 }
 '''
 

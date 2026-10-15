@@ -1170,6 +1170,135 @@ std::vector<Loop> loops(const Graph &graph) {
   return result;
 }
 
+// Unswitch only already available conditions: no load, call or arithmetic is
+// speculated. Close direct live-outs at the unique exit before duplicating SSA.
+// Reachability after specialization, not the unspecialized body, prices growth.
+bool unswitchLoops(FunctionIR &f) {
+  if (!f.ssa) return false;
+  size_t work = 65536, growth = 128;
+  bool changed = false;
+  for (int round = 0; round < 3; ++round) {
+    size_t size = f.values.size()+f.blocks.size(), branches = 0;
+    for (const auto &b : f.blocks) { size += b.instructions.size(); branches += b.instructions.back().op == Op::Branch; }
+    if (branches < 2 || size > work/3) break;
+    work -= size*3;
+    const auto graph = controlFlow(f); auto nests = loops(graph);
+    std::vector<int> sites(f.values.size(),-1);
+    for (size_t b = 0; b < f.blocks.size(); ++b) for (const auto &i : f.blocks[b].instructions)
+      if (i.result >= 0) sites[i.result] = b;
+    bool committed = false;
+    for (const auto &loop : nests) {
+      if (nests.size()+loop.blocks.size() > work) break;
+      work -= nests.size()+loop.blocks.size();
+      if (loop.blocks.size() > 24 || std::any_of(nests.begin(),nests.end(),[&](const Loop &other) {
+        return other.header != loop.header && loop.blocks.count(other.header);
+      })) continue;
+      int h = loop.header, pre = -1; size_t cost = 0; bool valid = true;
+      std::set<int> exits;
+      for (int b : loop.blocks) {
+        for (int p : graph.pred[b]) if (!loop.blocks.count(p)) {
+          if (b != h || pre >= 0) valid = false;
+          pre = p;
+        }
+        for (int s : graph.succ[b]) if (!loop.blocks.count(s)) exits.insert(s);
+        for (const auto &i : f.blocks[b].instructions) { ++cost; valid &= i.op != Op::Call; }
+      }
+      if (!valid || pre < 0 || cost > 80 || exits.size() != 1 ||
+          f.blocks[pre].instructions.back().op != Op::Jump) continue;
+      int exit = *exits.begin(), condition = -1; size_t extra = 0;
+      for (int b : loop.blocks) {
+        const auto &branch = f.blocks[b].instructions.back();
+        if (!work) break;
+        --work;
+        if (branch.op != Op::Branch || branch.target == branch.otherwise ||
+            !loop.blocks.count(branch.target) || !loop.blocks.count(branch.otherwise)) continue;
+        int c = branch.args[0];
+        if (sites[c] < 0 || loop.blocks.count(sites[c]) || !graph.dominates(sites[c],pre)) continue;
+        auto reachableCost = [&](bool choice) {
+          std::set<int> seen; std::vector<int> stack{h}; size_t n = 0;
+          while (!stack.empty()) {
+            int block = stack.back(); stack.pop_back();
+            if (!loop.blocks.count(block) || !seen.insert(block).second) continue;
+            n += f.blocks[block].instructions.size();
+            const auto &last = f.blocks[block].instructions.back();
+            if (last.op == Op::Branch && last.args[0] == c) stack.push_back(choice ? last.target : last.otherwise);
+            else for (int s : graph.succ[block]) stack.push_back(s);
+          }
+          return n;
+        };
+        if (cost*2 > work) break;
+        work -= cost*2;
+        size_t both = reachableCost(false)+reachableCost(true)+3;
+        size_t delta = both > cost ? both-cost : 0;
+        if (delta <= 48 && delta <= growth) { condition = c; extra = delta; break; }
+      }
+      if (condition < 0) continue;
+      // Existing exit phis already close their edge-specific values. Other
+      // uses need a new exit phi, and its source must dominate every exit edge.
+      std::set<int> live;
+      for (size_t b = 0; b < f.blocks.size(); ++b) if (!loop.blocks.count(b))
+        for (const auto &i : f.blocks[b].instructions) for (size_t n = 0; n < i.args.size(); ++n)
+          if (loop.blocks.count(sites[i.args[n]]) &&
+              !(static_cast<int>(b) == exit && i.op == Op::Phi && loop.blocks.count(i.edges[n]))) live.insert(i.args[n]);
+      for (int v : live) for (int p : graph.pred[exit]) valid &= graph.dominates(sites[v],p);
+      if (!live.empty()) for (int p : graph.pred[exit]) valid &= loop.blocks.count(p) != 0;
+      if (!valid || extra+live.size() > growth) continue;
+      std::map<int,int> closed;
+      std::vector<Instruction> exitPhis;
+      for (int v : live) {
+        Instruction phi{Op::Phi}; phi.result = newValue(f,f.values[v]); phi.edges = graph.pred[exit];
+        phi.args.assign(phi.edges.size(),v); closed[v] = phi.result; exitPhis.push_back(phi);
+      }
+      for (size_t b = 0; b < f.blocks.size(); ++b) if (!loop.blocks.count(b))
+        for (auto &i : f.blocks[b].instructions) for (size_t n = 0; n < i.args.size(); ++n)
+          if (closed.count(i.args[n]) && !(static_cast<int>(b) == exit && i.op == Op::Phi && loop.blocks.count(i.edges[n])))
+            i.args[n] = closed.at(i.args[n]);
+      auto &exitCode = f.blocks[exit].instructions;
+      exitCode.insert(exitCode.begin(),exitPhis.begin(),exitPhis.end());
+      int originalPre = f.blocks.size(), clonedPre = originalPre+1;
+      std::map<int,int> blocks, values;
+      for (int b : loop.blocks) {
+        blocks[b] = originalPre+2+blocks.size();
+        for (const auto &i : f.blocks[b].instructions) if (i.result >= 0) values[i.result] = newValue(f,f.values[i.result]);
+      }
+      auto value = [&](int v) { return values.count(v) ? values.at(v) : v; };
+      auto block = [&](int b) { return blocks.count(b) ? blocks.at(b) : b; };
+      std::vector<BasicBlock> clones;
+      for (int b : loop.blocks) {
+        auto code = f.blocks[b].instructions;
+        for (auto &i : code) {
+          if (i.op == Op::Branch && i.args[0] == condition) { int target = i.target; i = Instruction{Op::Jump}; i.target = target; }
+          for (int &a : i.args) a = value(a);
+          if (i.result >= 0) i.result = value(i.result);
+          i.target = block(i.target); i.otherwise = block(i.otherwise);
+          for (int &edge : i.edges) edge = edge == pre ? clonedPre : block(edge);
+        }
+        clones.push_back({"unswitch.true",std::move(code)});
+      }
+      for (auto &i : f.blocks[exit].instructions) if (i.op == Op::Phi) {
+        size_t count = i.edges.size();
+        for (size_t n = 0; n < count; ++n) if (loop.blocks.count(i.edges[n])) {
+          i.edges.push_back(block(i.edges[n])); i.args.push_back(value(i.args[n]));
+        }
+      }
+      for (int b : loop.blocks) for (auto &i : f.blocks[b].instructions) {
+        if (i.op == Op::Phi) for (int &edge : i.edges) if (edge == pre) edge = originalPre;
+        if (i.op == Op::Branch && i.args[0] == condition) { int target = i.otherwise; i = Instruction{Op::Jump}; i.target = target; }
+      }
+      Instruction dispatch{Op::Branch}; dispatch.args = {condition}; dispatch.target = clonedPre; dispatch.otherwise = originalPre;
+      f.blocks[pre].instructions.back() = dispatch;
+      Instruction jump{Op::Jump}; jump.target = h; f.blocks.push_back({"unswitch.false.pre",{jump}});
+      jump.target = block(h); f.blocks.push_back({"unswitch.true.pre",{jump}});
+      for (auto &b : clones) f.blocks.push_back(std::move(b));
+      growth -= extra+live.size();
+      pruneBlocks(f); repairPhi(f); simplify(f); deadSSA(f);
+      changed = committed = true; break;
+    }
+    if (!committed) break;
+  }
+  return changed;
+}
+
 // Collapse overwrite repetitions by jumping the outer induction directly to
 // its invariant bound after the first iteration. Preserve the original header
 // and all exit phis, including zero-trip behavior and final counter values.
@@ -2541,7 +2670,7 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out) {
 }
 
 bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
-  if (changed) *changed = name != "fp-compare" && name != "lookup" && name != "lftr";
+  if (changed) *changed = name != "fp-compare" && name != "lookup" && name != "lftr" && name != "unswitch";
   if (name == "global-constants") { globalConstants(module); return true; }
   if (name == "arg-specialize") { specializeArguments(module); return true; }
   if (name == "global-memory") {
@@ -2584,7 +2713,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
   if (name == "inline" || name == "inline-early") {
     inlineCalls(module,name == "inline-early"); return true;
   }
-  if (name == "lookup" || name == "fp-compare" || name == "lftr" || name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "unswitch" || name == "lookup" || name == "fp-compare" || name == "lftr" || name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
     if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse" || name == "dse-basic") summaries = summarize(module);
     for (auto &f : module.functions) {
@@ -2605,6 +2734,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
       else if (name == "memory-phi" && f.ssa) { AliasAnalysis alias(f); MemorySSA memory(f,summaries,alias); forwardMemoryPhis(f,alias,memory); }
       else if (name == "memory-phi") {}
       else if (name == "lookup") { if (lookupRecurrence(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
+      else if (name == "unswitch") { if (unswitchLoops(f) && changed) *changed = true; }
       else if (name == "fp-compare") { if (compareObservations(f)) { if (changed) *changed = true; pruneBlocks(f); simplify(f); deadSSA(f); } }
       else if (name == "lftr") { if (linearTest(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
       else if (name == "rotate") rotate(f);
