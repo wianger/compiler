@@ -11,6 +11,8 @@ enum class ValueType { Int, Float, Pointer, Double, WideInt };
 // ModMul is total: widen both signed int32 operands before multiplication,
 // take signed int64 remainder by its bounded positive immediate, then narrow.
 // Shr/Sar shift unsigned/signed int32 respectively; counts are masked to 0..31.
+// f32 Add/Sub/Mul/Div use RNE and canonicalize NaNs to 0x7fc00000, matching
+// RV64F and constant folding. Neg toggles the sign bit without canonicalizing.
 // Abs clears the f32 sign bit, preserving every other bit including NaN payloads.
 enum class Op {
   Constant, Address, String, Parameter, Move, Load, Store, Offset, Zero,

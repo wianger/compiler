@@ -143,12 +143,12 @@ int main() {
     bad=f;bad.values.assign(2,ValueType::Float);rejectCIR(bad);
   }
   std::cout<<"2 valid CIR pointer comparisons; "<<cirRejected<<" malformed comparisons rejected\n";
-  for(const char *pass:{"fp-compare","lookup","lftr","unswitch"}) {
+  for(const char *pass:{"fp-compare","fp-class","lookup","lftr","unswitch"}) {
     auto bad=f;bad.blocks[0].instructions[2].args={0};module.functions={bad};bool rejected=false;
     try {runPasses(module,pass);}catch(const std::logic_error &){rejected=true;}
     if(!rejected)throw std::runtime_error("custom pipeline skipped its first IR verification");
   }
-  std::cout<<"4 custom-pipeline initial verification guards passed\n";
+  std::cout<<"5 custom-pipeline initial verification guards passed\n";
 }
 '''
 
@@ -336,6 +336,47 @@ def check_smt():
             prove(f'FP comparison observation/{name}/{label}',compare(before,fy),compare(after,fy))
     solver=z3.Solver();solver.add(x==0x80000000,z3.fpIsNegative(fx)!=z3.fpIsNegative(z3.fpAbs(fx)))
     if solver.check()!=z3.sat:raise AssertionError('signed-zero observation counterexample missing')
+    # RISC-V arithmetic canonicalizes NaNs; sign injection preserves payloads.
+    # These identities preserve full binary32 bits, not merely comparisons.
+    canonical=z3.BitVecVal(0x7fc00000,32)
+    raw=lambda v:z3.If(z3.fpIsNaN(v),canonical,z3.fpToIEEEBV(v))
+    one=z3.FPVal(1,z3.Float32());minus_one=z3.FPVal(-1,z3.Float32())
+    minus_zero=z3.fpBVToFP(z3.BitVecVal(0x80000000,32),z3.Float32())
+    ordinary=z3.Or(z3.Not(z3.fpIsNaN(fx)),x==canonical)
+    for name,operation in [('mul',z3.fpMul),('div',z3.fpDiv)]:
+        prove('FP unit/'+name,raw(operation(z3.RNE(),fx,one)),x,ordinary)
+        prove('FP negative unit/'+name,raw(operation(z3.RNE(),fx,minus_one)),x^0x80000000,z3.Not(z3.fpIsNaN(fx)))
+    for name,before,guard in [('add -0',z3.fpAdd(z3.RNE(),fx,minus_zero),ordinary),
+                              ('sub +0',z3.fpSub(z3.RNE(),fx,zero),ordinary),
+                              ('add +0',z3.fpAdd(z3.RNE(),fx,zero),z3.And(ordinary,x!=0x80000000)),
+                              ('sub -0',z3.fpSub(z3.RNE(),fx,minus_zero),z3.And(ordinary,x!=0x80000000))]:
+        prove('FP zero identity/'+name,raw(before),x,guard)
+    prove('FP finite self subtraction',raw(z3.fpSub(z3.RNE(),fx,fx)),z3.BitVecVal(0,32),
+          z3.Not(z3.fpIsNaN(fx)),z3.Not(z3.fpIsInf(fx)))
+    converted=z3.fpSignedToFP(z3.RNE(),x,z3.Float32())
+    prove('FP int conversion classes',z3.Or(z3.fpIsNaN(converted),z3.fpIsInf(converted),
+          z3.And(z3.fpIsZero(converted),z3.fpIsNegative(converted))),z3.BoolVal(False))
+    def fp_class(bits):
+        magnitude=bits&0x7fffffff;negative=z3.Extract(31,31,bits)==1
+        return z3.If(magnitude==0,z3.If(negative,z3.BitVecVal(2,8),z3.BitVecVal(1,8)),
+          z3.If(z3.ULT(magnitude,0x7f800000),z3.If(negative,z3.BitVecVal(8,8),z3.BitVecVal(4,8)),
+          z3.If(magnitude==0x7f800000,z3.If(negative,z3.BitVecVal(32,8),z3.BitVecVal(16,8)),
+          z3.If(bits==canonical,z3.BitVecVal(64,8),z3.BitVecVal(128,8)))))
+    mask=z3.BitVec('fp_classes',8)
+    choose=lambda bit,value:z3.If(mask&bit!=0,z3.BitVecVal(value,8),z3.BitVecVal(0,8))
+    neg_mask=choose(1,2)|choose(2,1)|choose(4,8)|choose(8,4)|choose(16,32)|choose(32,16)|choose(64,128)|choose(128,192)
+    abs_mask=choose(3,1)|choose(12,4)|choose(48,16)|choose(64,64)|choose(128,192)
+    for name,after,result_mask in [('neg',x^0x80000000,neg_mask),('abs',x&0x7fffffff,abs_mask)]:
+        prove('FP class transfer/'+name,result_mask&fp_class(after)!=0,z3.BoolVal(True),mask&fp_class(x)!=0)
+    for name,predicate in [('eq',z3.fpEQ),('ne-false',z3.fpEQ),('lt',z3.fpLT),('le',z3.fpLEQ),('gt',z3.fpGT),('ge',z3.fpGEQ)]:
+        prove('FP ordered edge/'+name,z3.And(z3.Not(z3.fpIsNaN(fx)),z3.Not(z3.fpIsNaN(fy))),z3.BoolVal(True),predicate(fx,fy))
+    for name,before,after,assumptions in [
+        ('NaN canonicalization',raw(z3.fpMul(z3.RNE(),fx,one)),x,[x==0xffc12345]),
+        ('negative zero',raw(z3.fpAdd(z3.RNE(),fx,zero)),x,[x==0x80000000]),
+        ('NaN negation',raw(z3.fpMul(z3.RNE(),fx,minus_one)),x^0x80000000,[x==canonical]),
+        ('unordered nonzero edge',raw(z3.fpMul(z3.RNE(),fx,one)),x,[z3.Not(z3.fpEQ(fx,zero)),x==0x7f812345])]:
+        solver=z3.Solver();solver.add(*assumptions,before!=after)
+        if solver.check()!=z3.sat:raise AssertionError('FP missing-guard mutation: '+name)
     k,n=z3.BitVecs('lftr_k lftr_n',32);dk=z3.SignExt(32,k);dn=z3.SignExt(32,n)
     delta=z3.BitVec('lftr_delta',64)
     for stride in (1,4,8,404,516,2147483647):
@@ -476,15 +517,118 @@ trace_input: .zero 4
     print(f'{count} bounded QEMU boundary traces passed')
 
 
+def check_fp_traces(build):
+    import math
+    import struct
+    from test import CACHE,tool
+    source='''int main(){float x=getfloat();int n=getint();float y=n;
+      putfloat(x*1.0);putfloat(x/-1.0);putfloat((-x)*1.0);
+      putfloat((x+0.25)*1.0);putfloat(y*1.0);putfloat(y+0.0);putfloat(y-y);putfloat(y/-1.0);
+      if(x==x){putfloat(x*1.0);putfloat(x*-1.0);putfloat(x-x);}
+      else {putfloat(x*1.0);putfloat(x*-1.0);putfloat(x-x);}
+      if(x!=0.0)putfloat(x*1.0);else putfloat(x*1.0);
+      float a=x;int i=0;while(i<3){a=-a;i=i+1;}putfloat(a*1.0);
+      a=y;i=0;while(i<3){a=-a;i=i+1;}putfloat(a+0.0);
+      float u=x*1.0;putfloat(u*1.0);putfloat((-u)*1.0);
+      float choice=x;if(n<0)choice=x+0.0;putfloat(choice*1.0);
+      choice=x+0.0;if(n<0)choice=x*2.0;putfloat(choice*1.0);return 0;}'''
+    runtime=r'''.option nopic
+.text
+.globl _start
+_start:
+ .option push
+ .option norelax
+ la gp, __global_pointer$
+ .option pop
+ call main
+ li a7, 93
+ ecall
+.macro read_word
+ li a0, 0
+ la a1, word
+ li a2, 4
+ li a7, 63
+ ecall
+.endm
+.globl getfloat
+getfloat:
+ read_word
+ la t0, word
+ flw fa0, 0(t0)
+ ret
+.globl getint
+getint:
+ read_word
+ la t0, word
+ lw a0, 0(t0)
+ ret
+.globl putfloat
+putfloat:
+ fmv.x.w a0, fa0
+ la t0, word
+ sw a0, 0(t0)
+ li a0, 1
+ mv a1, t0
+ li a2, 4
+ li a7, 64
+ ecall
+ ret
+.bss
+.p2align 2
+word: .zero 4
+'''
+    def bits(value):
+        try:return struct.unpack('<I',struct.pack('<f',value))[0]
+        except OverflowError:return 0xff800000 if value<0 else 0x7f800000
+    def number(raw):return struct.unpack('<f',struct.pack('<I',raw))[0]
+    def arithmetic(op,a,b):
+        x,y=number(a),number(b)
+        if math.isnan(x) or math.isnan(y):return 0x7fc00000
+        value=x+y if op=='+' else x-y if op=='-' else x*y
+        return 0x7fc00000 if math.isnan(value) else bits(value)
+    values=(0,0x80000000,1,0x80000001,0x007fffff,0x807fffff,0x00800000,0x80800000,
+            0x3f800000,0xbf800000,0x7f7fffff,0xff7fffff,0x7f800000,0xff800000,
+            0x7fc00000,0xffc00000,0x7fc12345,0xffc12345,0x7f800001,0xff800001)
+    env=os.environ.copy();hostlibs=CACHE/'usr/lib/x86_64-linux-gnu'
+    if hostlibs.exists():env['LD_LIBRARY_PATH']=str(hostlibs)+':'+env.get('LD_LIBRARY_PATH','')
+    count=0
+    with tempfile.TemporaryDirectory(prefix='sysy-fp-trace-') as directory:
+        d=Path(directory);(d/'input.sy').write_text(source);(d/'runtime.s').write_text(runtime)
+        assembler,linker,qemu=(tool(name,None) for name in ('riscv64-linux-gnu-as','riscv64-linux-gnu-ld','qemu-riscv64'))
+        def assemble(name):subprocess.run([assembler,'-march=rv64gc','-mabi=lp64d',str(d/(name+'.s')),'-o',str(d/(name+'.o'))],check=True,env=env)
+        assemble('runtime')
+        for opt in (0,2,3):
+            subprocess.run([str(build/'compiler'),f'-O{opt}','--check-alloc',str(d/'input.sy'),'-o',str(d/'program.s')],check=True,env=env)
+            assemble('program');subprocess.run([linker,'-e','_start',str(d/'runtime.o'),str(d/'program.o'),'-o',str(d/'program')],check=True,env=env)
+            for raw in values:
+                for n in (-2147483648,-7,0,7,2147483647):
+                    y=bits(n);mul1=lambda a:arithmetic('*',a,0x3f800000)
+                    negative=lambda a:arithmetic('*',a,0xbf800000)
+                    u=mul1(raw)
+                    expected=[u,negative(raw),mul1(raw^0x80000000),mul1(arithmetic('+',raw,0x3e800000)),
+                              y,arithmetic('+',y,0),0,y^0x80000000,u,negative(raw),arithmetic('-',raw,raw),u,
+                              mul1(raw^0x80000000),arithmetic('+',y^0x80000000,0),u,mul1(u^0x80000000),
+                              mul1(arithmetic('+',raw,0) if n<0 else raw),
+                              mul1(arithmetic('*',raw,0x40000000) if n<0 else arithmetic('+',raw,0))]
+                    run=subprocess.run([qemu,str(d/'program')],input=struct.pack('<Ii',raw,n),capture_output=True,timeout=10,env=env)
+                    wanted=struct.pack('<'+'I'*len(expected),*expected)
+                    if run.returncode or run.stdout!=wanted:
+                        raise AssertionError(f'FP bits O{opt}/{raw:08x}/{n}: {run.returncode} {run.stdout.hex()} != {wanted.hex()} {run.stderr!r}')
+                    count+=1
+    print(f'{count} exact-binary32 QEMU traces passed')
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build",type=Path,default=ROOT/"build")
     parser.add_argument("--smt",action="store_true",help="also prove rules with optional z3-solver")
-    parser.add_argument("--traces",action="store_true",help="also check bounded QEMU traces across signed wrap")
+    parser.add_argument("--traces",action="store_true",help="also check QEMU signed-wrap and exact binary32 traces")
     opts=parser.parse_args()
     check_mir(opts.build.resolve())
     if opts.smt: check_smt()
-    if opts.traces: check_traces(opts.build.resolve())
+    if opts.traces:
+        check_traces(opts.build.resolve())
+        check_fp_traces(opts.build.resolve())
 
 
 if __name__ == "__main__":

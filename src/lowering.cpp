@@ -339,7 +339,7 @@ void optimize(ModuleIR &module, int level, Stats *stats) {
   if (level == 0) runPasses(module, "prune", stats);
   else if (level == 1) runPasses(module, "prune,inline,globaldce,promote,dce,ssa,simplify,sccp,prune,gvn,simplify,dce,compact", stats);
   else {
-    runPasses(module, "prune,globaldce,arg-specialize,inline-early,globaldce,sroa,promote,dce,inline-early,globaldce,sroa,promote,dce,global-memory,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,inline,globaldce,global-constants,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,repeat-store,gvn,simplify,dce,affine,dce,egraph,simplify,dce,fp-compare,arith,strength,gvn,simplify,dce,rotate,lookup,iv-coalesce,licm,memory,dse,simplify,dce,lftr", stats);
+    runPasses(module, "prune,globaldce,arg-specialize,inline-early,globaldce,sroa,promote,dce,inline-early,globaldce,sroa,promote,dce,global-memory,dce,loop-promote,ssa,simplify,sccp,prune,memory,dse,simplify,dce,inline,globaldce,global-constants,simplify,sccp,prune,memory,dse,simplify,dce,tail,prune,licm,repeat-store,gvn,simplify,dce,affine,dce,egraph,simplify,dce,fp-compare,fp-class,arith,strength,gvn,simplify,dce,rotate,lookup,iv-coalesce,licm,memory,dse,simplify,dce,lftr", stats);
     if (level >= 3) runPasses(module, "unroll,memory,dse,simplify,dce", stats);
     runPasses(module, "sccp,prune,dce,unswitch,compact", stats);
   }

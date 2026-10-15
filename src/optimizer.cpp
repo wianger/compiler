@@ -1783,6 +1783,129 @@ bool compareObservations(FunctionIR &f) {
   return changed;
 }
 
+// A small target-semantic FP class lattice. Arithmetic canonicalizes NaNs;
+// sign injection (Neg/Abs), loads and calls do not. No fast-math assumptions.
+bool floatClasses(FunctionIR &f) {
+  if (!f.ssa) return false;
+  enum { PZ=1, NZ=2, PF=4, NF=8, PI=16, NI=32, CN=64, ON=128,
+         Zeros=PZ|NZ, Finite=Zeros|PF|NF, Numbers=Finite|PI|NI, All=255 };
+  size_t budget = 65536, size = f.values.size(); bool candidate = false;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+    size += 1+i.args.size();
+    candidate |= i.result >= 0 && f.values[i.result] == ValueType::Float && i.op >= Op::Add && i.op <= Op::Div;
+  }
+  if (!candidate || size > budget) return false;
+  budget -= size;
+  auto defs = definitions(f);
+  candidate = false;
+  for (const auto &b : f.blocks) for (const auto &i : b.instructions) {
+    if (i.result < 0 || f.values[i.result] != ValueType::Float || i.op < Op::Add || i.op > Op::Div) continue;
+    candidate |= i.op == Op::Sub && i.args[0] == i.args[1];
+    for (int a : i.args) if (defs[a] && defs[a]->op == Op::Constant) {
+      uint32_t magnitude = uint32_t(defs[a]->immediate)&UINT32_C(0x7fffffff);
+      candidate |= !magnitude || magnitude == UINT32_C(0x3f800000);
+    }
+  }
+  if (!candidate) return false;
+  std::vector<unsigned> classes(f.values.size()), scoped(f.values.size(),All);
+  std::vector<std::vector<int>> users(f.values.size());
+  std::queue<int> queue; std::vector<bool> pending(f.values.size());
+  for (size_t v = 0; v < defs.size(); ++v) if (f.values[v] == ValueType::Float && defs[v]) {
+    queue.push(v); pending[v] = true;
+    for (int a : defs[v]->args) if (f.values[a] == ValueType::Float) users[a].push_back(v);
+  }
+  auto unary = [&](Op op,unsigned x) -> unsigned {
+    if (op == Op::Move) return x;
+    unsigned result = ((x&PF) ? NF : 0) | ((x&NF) ? PF : 0) | ((x&PI) ? NI : 0) | ((x&NI) ? PI : 0);
+    if (op == Op::Neg) return result | ((x&PZ) ? NZ : 0) | ((x&NZ) ? PZ : 0) |
+        ((x&CN) ? ON : 0) | ((x&ON) ? CN|ON : 0);
+    return ((x&Zeros) ? PZ : 0) | ((x&(PF|NF)) ? PF : 0) | ((x&(PI|NI)) ? PI : 0) |
+        (x&CN) | ((x&ON) ? CN|ON : 0);
+  };
+  auto transfer = [&](int v) -> unsigned {
+    const auto &i = *defs[v];
+    if (i.op == Op::Constant) {
+      uint32_t bits = i.immediate, magnitude = bits&UINT32_C(0x7fffffff); bool sign = bits>>31;
+      if (!magnitude) return sign ? NZ : PZ;
+      if (magnitude < UINT32_C(0x7f800000)) return sign ? NF : PF;
+      if (magnitude == UINT32_C(0x7f800000)) return sign ? NI : PI;
+      return bits == UINT32_C(0x7fc00000) ? CN : ON;
+    }
+    if (i.op == Op::Convert && f.values[i.args[0]] == ValueType::Int) return PZ|PF|NF;
+    if (i.op >= Op::Add && i.op <= Op::Div) return Numbers|CN;
+    if (i.op == Op::Move || i.op == Op::Neg || i.op == Op::Abs) return unary(i.op,classes[i.args[0]]);
+    if (i.op == Op::Phi) { unsigned result = 0; for (int a : i.args) result |= classes[a]; return result; }
+    return All;
+  };
+  while (!queue.empty()) {
+    int v = queue.front(); queue.pop(); pending[v] = false;
+    if (1+defs[v]->args.size()+users[v].size() > budget) return false;
+    budget -= 1+defs[v]->args.size()+users[v].size();
+    unsigned next = transfer(v);
+    if (next == classes[v]) continue;
+    classes[v] = next;
+    for (int u : users[v]) if (!pending[u]) { pending[u] = true; queue.push(u); }
+  }
+  // Unary queries carry dominating branch facts without applying them to a
+  // Phi's other incoming paths. Every committed rewrite preserves all bits,
+  // so the original unconditional class solution remains valid afterwards.
+  std::function<unsigned(int,int)> known = [&](int v,int depth) -> unsigned {
+    unsigned result = classes[v];
+    if (budget && depth < 16 && defs[v]) {
+      --budget; const auto &i = *defs[v];
+      if (i.op == Op::Move || i.op == Op::Neg || i.op == Op::Abs) result &= unary(i.op,known(i.args[0],depth+1));
+    }
+    return result & scoped[v];
+  };
+  auto literal = [&](int v) -> std::optional<uint32_t> {
+    return defs[v] && defs[v]->op == Op::Constant ? std::optional<uint32_t>(defs[v]->immediate) : std::nullopt;
+  };
+  const auto &graph = controlFlow(f); bool changed = false;
+  std::function<void(int,int)> walk = [&](int b,int depth) {
+    if (depth > 64 || !budget) return;
+    for (auto &i : f.blocks[b].instructions) {
+      if (!budget) break;
+      --budget;
+      if (i.result < 0 || f.values[i.result] != ValueType::Float || i.op < Op::Add || i.op > Op::Div) continue;
+      int source = -1; bool negate = false;
+      for (int side = 0; side < (i.op == Op::Add || i.op == Op::Mul ? 2 : 1); ++side) {
+        int x = i.args[side], c = i.args[1-side]; auto bits = literal(c);
+        if (!bits) continue;
+        unsigned mask = known(x,0); if (!mask) continue;
+        bool canonical = !(mask&ON), noNaN = !(mask&(CN|ON));
+        if ((i.op == Op::Mul || i.op == Op::Div) && (*bits&UINT32_C(0x7fffffff)) == UINT32_C(0x3f800000)) {
+          bool minus = *bits>>31;
+          if (minus ? noNaN : canonical) { source = x; negate = minus; break; }
+        }
+        if ((i.op == Op::Add || i.op == Op::Sub) && !(*bits&UINT32_C(0x7fffffff)) && canonical) {
+          bool negative = *bits>>31;
+          if ((i.op == Op::Add ? negative : !negative) || !(mask&NZ)) { source = x; break; }
+        }
+      }
+      if (source >= 0) { i.op = negate ? Op::Neg : Op::Move; i.args = {source}; changed = true; }
+      else if (i.op == Op::Sub && i.args[0] == i.args[1]) {
+        unsigned mask = known(i.args[0],0);
+        if (mask && !(mask&~Finite)) { i.op = Op::Constant; i.args.clear(); i.immediate = 0; changed = true; }
+      }
+    }
+    const auto &branch = f.blocks[b].instructions.back();
+    for (int child : graph.children[b]) {
+      std::vector<std::pair<int,unsigned>> undo;
+      if (branch.op == Op::Branch && branch.target != branch.otherwise && graph.pred[child] == std::vector<int>{b}) {
+        const auto *cmp = defs[branch.args[0]];
+        bool yes = child == branch.target, no = child == branch.otherwise;
+        if (cmp && cmp->op >= Op::Eq && cmp->op <= Op::Ge && f.values[cmp->args[0]] == ValueType::Float &&
+            ((yes && cmp->op != Op::Ne) || (no && cmp->op == Op::Ne))) {
+          for (int a : cmp->args) { undo.emplace_back(a,scoped[a]); scoped[a] &= Numbers; }
+        }
+      }
+      walk(child,depth+1);
+      for (auto it = undo.rbegin(); it != undo.rend(); ++it) scoped[it->first] = it->second;
+    }
+  };
+  walk(0,0); return changed;
+}
+
 void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true) {
   if (!f.ssa) return;
   auto borrowed = definitions(f); std::vector<std::optional<Instruction>> defs(f.values.size());
@@ -2670,7 +2793,7 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out) {
 }
 
 bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
-  if (changed) *changed = name != "fp-compare" && name != "lookup" && name != "lftr" && name != "unswitch";
+  if (changed) *changed = name != "fp-compare" && name != "fp-class" && name != "lookup" && name != "lftr" && name != "unswitch";
   if (name == "global-constants") { globalConstants(module); return true; }
   if (name == "arg-specialize") { specializeArguments(module); return true; }
   if (name == "global-memory") {
@@ -2713,7 +2836,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
   if (name == "inline" || name == "inline-early") {
     inlineCalls(module,name == "inline-early"); return true;
   }
-  if (name == "unswitch" || name == "lookup" || name == "fp-compare" || name == "lftr" || name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "fp-class" || name == "unswitch" || name == "lookup" || name == "fp-compare" || name == "lftr" || name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
     if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse" || name == "dse-basic") summaries = summarize(module);
     for (auto &f : module.functions) {
@@ -2735,6 +2858,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name, bool *changed) {
       else if (name == "memory-phi") {}
       else if (name == "lookup") { if (lookupRecurrence(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
       else if (name == "unswitch") { if (unswitchLoops(f) && changed) *changed = true; }
+      else if (name == "fp-class") { if (floatClasses(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
       else if (name == "fp-compare") { if (compareObservations(f)) { if (changed) *changed = true; pruneBlocks(f); simplify(f); deadSSA(f); } }
       else if (name == "lftr") { if (linearTest(f)) { if (changed) *changed = true; simplify(f); deadSSA(f); } }
       else if (name == "rotate") rotate(f);

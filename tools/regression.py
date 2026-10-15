@@ -1674,6 +1674,37 @@ int main(){int seed=getint();int mode=getint();int n=getint();int trips=getint()
             (fixture/(name+'.in')).write_text(f'{seed} {mode} {n} {trips}\n')
             (fixture/(name+'.out')).write_text(str(wrap(total))+'\n1024: '+' '.join(map(str,final))+'\n0\n')
         print(f"Wrote invariant-control fixture to {fixture}")
+        fixture=ROOT/"build/fp-class-fixture/performance";fixture.mkdir(parents=True,exist_ok=True)
+        source='''int data[1024];
+int main(){int seed=getint();int trips=getint();int i=0;
+ while(i<1024){data[i]=(i*119+seed)%2048;i=i+1;}
+ float sum=0.0;int r=0;starttime();
+ while(r<trips){i=0;while(i<1024){float x=((data[i]+r)%2)*1.0;
+  float y=(x+0.0)/1.0;sum=sum+y;i=i+1;}r=r+1;}
+ stoptime();putfloat(sum);putch(10);putarray(1024,data);return 0;}
+'''
+        seed,trips=-731,4000
+        values=[remainder(i*119+seed,2048) for i in range(1024)]
+        def odd_sum(a,b):
+            total=0
+            if b>=1:total+=(b+1)//2-max(a,1)//2
+            if a<0:total-=(-a+1)//2-(-min(b,-1))//2
+            return total
+        total=sum(odd_sum(a,a+trips-1) for a in values)
+        assert 1024*trips<2**24  # Every intermediate integer sum is exact in binary32.
+        (fixture/'fp_convert.sy').write_text(source)
+        (fixture/'fp_convert.in').write_text(f'{seed} {trips}\n')
+        (fixture/'fp_convert.out').write_text(float(total).hex()+'\n1024: '+' '.join(map(str,values))+'\n0\n')
+        source='''int main(){int seed=getint();int n=getint();float x=seed;float sum=0.0;int i=0;
+ starttime();while(i<n){float y=x*1.0;float z=y/-1.0;sum=sum+(z+0.125);x=-x;i=i+1;}
+ stoptime();putfloat(sum);putch(32);putfloat(x);return 0;}
+'''
+        seed,trips=-7,8000000;total=trips/8.0+(-seed if trips%2 else 0)
+        assert total+abs(seed)<2**21  # All partial sums are exact multiples of 1/8.
+        (fixture/'fp_phi.sy').write_text(source)
+        (fixture/'fp_phi.in').write_text(f'{seed} {trips}\n')
+        (fixture/'fp_phi.out').write_text(float(total).hex()+' '+float(-seed if trips%2 else seed).hex()+'\n0\n')
+        print(f"Wrote FP classification fixtures to {fixture}")
         return
     # Invariant control specialization must preserve aliasing, zero trips,
     # carried exit values, non-boolean predicates, and every break/continue edge.

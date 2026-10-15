@@ -44,6 +44,8 @@ HIR 还为完整的二分递归模乘建立语义证书，以入口范围守卫�
 
 `unswitch` 将已在循环外计算的不变分支移到入口，以局部出口 SSA 保留循环外的观察。按真假版本的可达代码估算增长，限制复制次数与分析预算；不提前求值条件、不假定数组互不别名。默认在末尾 SCCP／不可达清理后执行，以识别内联备用路径清除后的循环。
 
+`fp-class` 用有界工作队列分析浮点类别，区分正负零、有限值、无穷和 canonical／其他 NaN，并传播支配分支中的非 NaN 事实。在逐位相等的条件下删除乘除正负一、加减零及有限值自减；Phi 求不动点，未知加载和调用保持保守。默认在 `fp-compare` 后执行，不启用 fast-math，仅命中时清理 IR。
+
 标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。Token、Program、SSA 和降 Phi 后的 IR 可单独打印，各 PASS 可以重新组合。
 
 采用的现代设计及准确实现边界见 [Architecture-Research.md](docs/Architecture-Research.md)，全阶段调研、取舍与下一批实验见 [Compiler-Research.md](docs/Compiler-Research.md)。红绿 CST、完整 SoA、跨 CFG AEGraph、ISLE DSL 和完整 regalloc3 尚未实现；当前批量编译使用源码切片、块状 arena、自有目标 MIR 和区间分配器。
@@ -67,7 +69,7 @@ build/compiler --emit-ir --passes=prune,inline,promote,ssa,sccp,prune,gvn,dce in
 
 默认 `-O0`。`-O1` 使用标量 SSA 优化，`-O2` 增加调用、内存、循环和 tensor 结构优化，`-O3` 增加循环展开与经过数据流检查的重复循环归约。追求执行性能时使用 `-O3`。`-o -` 输出到标准输出，`-` 输入从标准输入读取。错误带文件、行、列；失败不会覆盖已有输出文件。
 
-`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。`memory` 在同一分析快照中先将可证明的内存 Phi 转成值 Phi，再协作执行 GVN 与加载前向；`memory-basic` 关闭 Phi 前向，`memory-phi` 可单独检查该步骤。EGraph 只提取区域外使用的结果，并按共同依赖的 DAG 对共享子式计费，搜索超预算保留已验证的候选。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR 和模乘 CIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数规则，编译器本身无需此依赖。
+`loop-promote` 在 SSA 前运行；`arith-global` 可替换 `arith`，用于关闭条件／惰性范围推理的对照。`memory` 在同一分析快照中先将可证明的内存 Phi 转成值 Phi，再协作执行 GVN 与加载前向；`memory-basic` 关闭 Phi 前向，`memory-phi` 可单独检查该步骤。EGraph 只提取区域外使用的结果，并按共同依赖的 DAG 对共享子式计费，搜索超预算保留已验证的候选。MIR 验证始终运行，`--check-alloc` 额外运行符号分配检查。构建后可执行 `python3 tools/verify.py` 检查故意破坏的 MIR 和 CIR；可选 `--smt` 使用 Python `z3-solver` 证明局部整数／浮点规则，编译器本身无需此依赖。`--traces` 另检查 QEMU 整数回绕及 binary32 原始位轨迹。
 
 优化保留浮点运算顺序，不启用 fast-math 或 FMA 重结合。浮点矩阵算法变换要求证明每一步乘积和部分和都能精确表示；未知浮点值走普通内核。常量求值采用目标的 [NaN 规则](https://docs.riscv.org/reference/isa/unpriv/f-st-ext.html)。
 
@@ -96,6 +98,6 @@ python3 tools/regression.py
 
 根据额外测试支持 `tensor int/float` 数组、逐元素 `+ - * / %`、一元 `+ -`、标量广播、`@` 二维矩阵乘法、tensor 参数和返回值。逐元素操作要求相同形状；矩阵乘法要求内部维度匹配；`%` 只接受整数。返回形状从函数体推导，各个 return 必须形状一致。tensor 运算和返回需要静态已知的维度；省略首维的 tensor 参数可按普通数组索引访问。
 
-性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 各 **210/210**；1020 个额外程序在 `-O0`、`-O2`、`-O3` 共 **3060 次执行**及 **20 个诊断**通过。另有 **1264 次 ASan/UBSan 编译**、**131 个 MIR／55 个 CIR 破坏性变异**、**620 条离线规则证明**和 **18 条 QEMU 边界轨迹**。
+性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 各 **210/210**；1020 个额外程序在 `-O0`、`-O2`、`-O3` 共 **3060 次执行**及 **20 个诊断**通过。另有 **1267 次 ASan/UBSan 编译**、**131 个 MIR／55 个 CIR 破坏性变异**、**638 项离线规则义务**、**18 条 QEMU 边界轨迹**及 **300 条 binary32 原始位轨迹**。
 
-相对 sysy-competition，本轮 QEMU 共同输入的整程序加速比几何平均为 **1.265×**，固定较长计时区间为 **1.982×**；计时区间中位数 **44/44** 较快，整程序 wall 为 **39/44**。新增不变条件模型的配对中位数加速比为 **1.234×／1.232×**。全部输入平均编译 **4.84 ms／输入**，同轮旧版 **4.82 ms**，总耗时基本持平；184 个共同输入的总编译 wall 加速比为 **28.8×**。接近持平的项目仍有跨轮反向和 QEMU 波动，尚不能称稳定全面领先；逐项数据与范围见性能文档。
+相对 sysy-competition，本轮 QEMU 共同输入的整程序加速比几何平均为 **1.273×**，固定较长计时区间为 **2.011×**；计时区间中位数 **43/44** 较快，整程序 wall 为 **40/44**。新增浮点分类模型的配对中位数加速比为 **2.498×／1.878×**，现有测试只改变 Dijkstra 三份汇编，小幅计时变化尚不稳定。全部输入平均编译 **4.66 ms／输入**，同轮旧版 **4.70 ms**，总耗时基本持平；184 个共同输入的总编译 wall 加速比为 **28.8×**。接近持平的项目仍有跨轮反向和 QEMU 波动，尚不能称稳定全面领先；逐项数据与范围见性能文档。
