@@ -1057,6 +1057,187 @@ def main():
                        " ".join(str(values[i]) for i in selected[:-3])+"\n"+
                        " ".join(str(values[i]) for i in selected[-3:])+"\n0\n")
         (directory / f"{name}.in").write_text(" ".join(map(str,inputs))+"\n")
+    for changed in (False,True):
+        for unknown_read in (False,True):
+            name=f"table_sequential_{int(changed)}_{int(unknown_read)}"
+            data=[3]*16+[7]*16
+            if changed:data[20]=-17
+            cases[name]=(f'''int main(){{int x=getint();int a[32]={{}};int i=0;
+              while(i<32){{if(i<16)a[i]=3;else a[i]=7;i=i+1;}}
+              {'a[20]=x;' if changed else ''}int sum=x;i=0;
+              while(i<16){{sum=sum+a[i];i=i+1;}}while(i<32){{sum=sum+a[i];i=i+1;}}
+              putf("%d %d\\n",sum,i);{'int j=getint();putint(a[j]);' if unknown_read else ''}return 0;}}''',
+              f"{sum(data)-17} 32\n"+(f"{data[20]}\n" if unknown_read else "")+"0\n")
+            (directory / f"{name}.in").write_text("-17 20\n")
+    for inclusive in (False,True):
+        for begin,end in ((-2147483648,-2147483648),(-2147483648,-2147483647),
+                          (-2147483648,-2147483645),(-2147483648,-2147483644),
+                          (-2147483647,-2147483644),(-2147483645,-2147483646),
+                          (-9,-1),(-3,5),(0,0),(3,17),(2147483638,2147483646),
+                          (2147483646,2147483647),(2147483647,2147483646)):
+            if inclusive and end==2147483647:continue  # Signed wrap makes this loop nonterminating.
+            name=f"signed_unroll_{int(inclusive)}_{begin}_{end}"
+            data=[0]*8;total=0;x=-731;i=begin;k=0
+            while i<=end if inclusive else i<end:
+                data[k%8]=x;total=wrap(total+x);x=wrap(x*1664525+1013904223);k+=1;i=wrap(i+1)
+            cases[name]=(f'''int main(){{int i=getint();int end=getint();int x=getint();
+              int a[8]={{}};int k=0;int sum=0;while(i{'<=' if inclusive else '<'}end){{
+                a[k%8]=x;sum=sum+x;x=x*1664525+1013904223;k=k+1;i=i+1;}}
+              putf("%d %d %d %d\\n",i,k,sum,x);putarray(8,a);return 0;}}''',
+              f"{i} {k} {total} {x}\n8: "+" ".join(map(str,data))+"\n0\n")
+            (directory / f"{name}.in").write_text(f"{begin} {end} -731\n")
+    for begin,end in ((0,-1),(3,3),(-5,-5),(-7,2),(4,13)):
+        name=f"unroll_mandatory_first_{begin}_{end}"
+        i=begin;x=-731;total=0
+        while True:
+            total=wrap(total+x);x=wrap(x*1664525+1013904223);i=wrap(i+1)
+            if i>=end:break
+        cases[name]=('''int run(int i,int end,int x,int sum){sum=sum+x;
+          x=x*1664525+1013904223;i=i+1;if(i<end)return run(i,end,x,sum);
+          putf("%d %d\\n",i,sum);return x;}
+          int main(){int i=getint();int n=getint();putint(run(i,n,-731,0));return 0;}''',
+          f"{i} {total}\n{x}\n0\n")
+        (directory / f"{name}.in").write_text(f"{begin} {end}\n")
+    for live in (False,True):
+        for escaped in (False,True):
+            name=f"private_dead_writes_{int(live)}_{int(escaped)}"
+            cases[name]=(f'''int observe(int p[],int n){{if(n)return observe(p,n-1);return p[2];}}
+              int main(){{int a[8]={{}};int i=0;while(i<5){{a[i]=getint();i=i+1;}}
+                putint(getint());putch(32);{'putint(a[2]);putch(32);' if live else ''}
+                {'putint(observe(a,2));putch(32);' if escaped else ''}return 0;}}''',
+              "99 "+("-17 " if live else "")+("-17 " if escaped else "")+"\n0\n")
+            (directory / f"{name}.in").write_text("1 3 -17 7 11 99\n")
+    # Observe complete arrays and loop exits, with independent scalar models.
+    # Dynamic starts exercise the guarded specialization and its fallback.
+    for start in (-2,0,2,5,2147483647):
+        for changed in (0,1):
+            name = f"small_loop_state_{start}_{changed}"
+            data = [0]*10; exits = []
+            for r in range(3):
+                i = start if not changed else r-1
+                while i < 5:
+                    data[i+2] = wrap(data[i+2]+i*31+r)
+                    i += 1
+                exits.append(i)
+            cases[name] = ('''int main(){int start=getint();int change=getint();int a[10]={};
+              int r=0;while(r<3){int i=start;if(change)i=r-1;
+                while(i<5){a[i+2]=a[i+2]+i*31+r;i=i+1;}putint(i);putch(32);r=r+1;}
+              putarray(10,a);return 0;}''',
+              " ".join(map(str,exits))+" 10: "+" ".join(map(str,data))+"\n0\n")
+            (directory / f"{name}.in").write_text(f"{start} {changed}\n")
+    for start in (0,2,5):
+        total = f32(-0.0)
+        for i in range(start,5): total = f32(total+f32(f32(i-3)*f32(.1)))
+        name = f"small_loop_effects_{start}"
+        cases[name] = ('''int main(){int i=getint();float x=-0.0;
+          while(i<5){putch(65+i);x=x+(i-3)*0.1;i=i+1;}putch(32);putfloat(x);return 0;}''',
+          "".join(chr(65+i) for i in range(start,5))+" "+total.hex()+"\n0\n")
+        (directory / f"{name}.in").write_text(f"{start}\n")
+    for same in (False,True):
+        for start in (0,3,26):
+            a,b = [17]*26,[31]*26
+            if same: b = a
+            x = -9;i = start
+            while i < 26:
+                x = 2147483647 if i == 0 else wrap(x*1664525+1013904223)
+                a[i] = x;b[25-i] = wrap(x+7);i += 1
+            name = f"constant_loop_alias_{int(same)}_{start}"
+            cases[name] = (f'''int a[26];int b[26];
+              int fill(int p[],int q[],int i){{int x=-9;
+                while(i<26){{if(i==0)x=2147483647;else x=x*1664525+1013904223;
+                  p[i]=x;q[25-i]=x+7;i=i+1;}}return x+i;}}
+              int main(){{int i=getint();int j=0;while(j<26){{a[j]=17;b[j]=31;j=j+1;}}
+                putint(fill(a,{'a' if same else 'b'},i));putch(32);putarray(26,a);putarray(26,b);return 0;}}''',
+              f"{wrap(x+i)} 26: "+" ".join(map(str,a))+"\n26: "+
+              " ".join(map(str,[31]*26 if same else b))+"\n0\n")
+            (directory / f"{name}.in").write_text(f"{start}\n")
+    cases["constant_loop_nested_wrap"] = ('''int a[5][5];int main(){int i=0;int x;
+      while(i<5){int j=0;while(j<5){if(i==0&&j==0)x=-2147483648/(-1);
+        else x=x*31+17;a[i][j]=x;j=j+1;}i=i+1;}
+      putint(x);putch(32);putint(i);putch(32);putarray(25,a[0]);return 0;}''', "")
+    data=[];x=-2147483648
+    for k in range(25):
+        if k:x=wrap(x*31+17)
+        data.append(x)
+    cases["constant_loop_nested_wrap"] = (cases["constant_loop_nested_wrap"][0],
+      f"{x} 5 25: "+" ".join(map(str,data))+"\n0\n")
+    # A nonconstant read/call, loop-local storage, and excessive evaluator work
+    # require retaining execution. Short circuiting must still suppress I/O.
+    for count in (5,128,129):
+        name=f"constant_loop_fallback_{count}"
+        values=[wrap(-731+i*17) for i in range(count)]
+        cases[name]=(f'''int a[{count}];int main(){{int i=0;
+          while(i<{count}){{int scratch[2]={{i,i+1}};a[i]=getint()+scratch[0]*17;
+            if(0&&getint())a[i]=99;i=i+1;}}putarray({count},a);return 0;}}''',
+          f"{count}: "+" ".join(map(str,values))+"\n0\n")
+        (directory / f"{name}.in").write_text("-731\n"*count)
+    for start in (-3,0,15,16,31,32,2147483647):
+        for stop in (0,16,32):
+            name=f"table_phase_{start}_{stop}";total=0;i=start
+            table=[3]*16+[7]*16
+            while i < stop:
+                total=wrap(total+(table[i] if i>=0 else -11));i+=1
+            cases[name]=('''int main(){int begin=getint();int n=getint();int a[32]={};int i=0;
+              while(i<16){a[i]=3;i=i+1;}while(i<32){a[i]=7;i=i+1;}
+              i=begin;int sum=0;while(i<n){if(i<0)sum=sum-11;else sum=sum+a[i];i=i+1;}
+              putf("%d %d\\n",sum,i);return 0;}''',f"{total} {i}\n0\n")
+            (directory / f"{name}.in").write_text(f"{start} {stop}\n")
+    for mode in range(5):
+        name=f"table_observation_{mode}";table=[0]*32;table[:8]=[3]*8;table[8:]=[7]*24
+        action="";prefix="";extra=""
+        if mode==1:action="a[20]=x;";table[20]=-17
+        if mode==2:action="mutate(a,2);";table[20]=-17
+        if mode==3:action="getarray(a);";table[:3]=[11,-7,19];extra="3 11 -7 19\n"
+        if mode==4:prefix="putint(a[20]);putch(32);";action="a[20]=x;";table[20]=-17
+        cases[name]=(f'''void mutate(int p[],int depth){{if(depth)mutate(p,depth-1);else p[20]=-17;}}
+          int main(){{int x=getint();int a[32]={{}};{prefix}int i=0;
+            while(i<8){{a[i]=3;i=i+1;}}while(i<32){{a[i]=7;i=i+1;}}{action}
+            int sum=0;i=0;while(i<32){{sum=sum+a[i];i=i+1;}}
+            putint(sum);putch(32);putarray(32,a);return 0;}}''',
+          ("0 " if mode==4 else "")+f"{sum(table)} 32: "+" ".join(map(str,table))+"\n0\n")
+        (directory / f"{name}.in").write_text("-17\n"+extra)
+    # Recursive callees remain visible to cross-call analyses. All call sites,
+    # intervening writes, object offsets and argument effects are observable.
+    for mode in range(8):
+        name=f"global_context_{mode}";data=[5,7,11,13];out=[]
+        actions=[]
+        if mode==0:actions.append("putint(read(2));putch(32);");out.append(data[2])
+        if mode==1:actions.append("if(x>0)data[2]=19;")
+        else:actions.append("data[2]=19;");data[2]=19
+        actions.append("putint(read(2));putch(32);");out.append(data[2])
+        if mode==2:actions.append("data[2]=23;");data[2]=23
+        if mode==3:actions.append("getarray(data);");data[:3]=[29,31,37]
+        if mode==4:actions.append("data[1]=23;");data[1]=23
+        if mode==5:actions.append("data[2]=x;");data[2]=-17
+        if mode==6:actions.append("touch(data,2);");data[2]=41
+        if mode==7:actions.append("data[2]=19;")
+        actions.append("putint(read(2));putch(32);");out.append(data[2])
+        cases[name]=('''int data[4]={5,7,11,13};int read(int n){if(n)return read(n-1);return data[2];}
+          void touch(int p[],int n){if(n)touch(p,n-1);else p[2]=41;}
+          int main(){int x=getint();'''+"".join(actions)+"putarray(4,data);return 0;}",
+          " ".join(map(str,out))+" 4: "+" ".join(map(str,data))+"\n0\n")
+        (directory / f"{name}.in").write_text("-17\n"+("3 29 31 37\n" if mode==3 else ""))
+    for mode in range(5):
+        name=f"pointer_context_{mode}"
+        args=["a[0],a[0]","a[0],b[0]","a[0],a[1]","local,a[0]","a[0],a[0]"][mode]
+        a=list(range(8));b=list(range(31,39));local=[71,73,79,83]
+        p=local if mode==3 else a
+        q=a if mode in (0,3,4) else b if mode==1 else a
+        offset=4 if mode==2 else 0
+        p[1]=wrap(p[1]-17);q[offset+1]=wrap(q[offset+1]+7)
+        value=wrap(p[1]+q[offset+1])
+        # A second actual-object/offset conflicts with otherwise uniform facts.
+        second=""
+        if mode==4:second="putint(run(b[0],b[1],3,2));putch(32);";b[1]+=3;b[5]+=7
+        cases[name]=(f'''int a[2][4];int b[2][4];
+          int run(int p[],int q[],int x,int n){{if(n)return run(p,q,x,n-1);
+            p[1]=p[1]+x;q[1]=q[1]+7;return p[1]+q[1];}}
+          int main(){{int x=getint();int local[4]={{71,73,79,83}};int i=0;
+            while(i<8){{a[i/4][i%4]=i;b[i/4][i%4]=31+i;i=i+1;}}
+            putint(run({args},x,2));putch(32);{second}putarray(8,a[0]);putarray(8,b[0]);putarray(4,local);return 0;}}''',
+          f"{value} "+(f"{b[1]+b[5]} " if mode==4 else "")+"8: "+" ".join(map(str,a))+
+          "\n8: "+" ".join(map(str,b))+"\n4: "+" ".join(map(str,local))+"\n0\n")
+        (directory / f"{name}.in").write_text("-17\n")
     if opts.benchmark:
         fixture = ROOT / "build/polyhedral-fixture/performance"
         fixture.mkdir(parents=True,exist_ok=True)

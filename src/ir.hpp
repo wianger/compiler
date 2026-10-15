@@ -225,7 +225,7 @@ void planTensors(ProgramIR &program, int tile = 0);
 void printTensorPlan(const ProgramIR &program, std::ostream &out);
 void expandTensors(ProgramIR &program);
 void analyzeTensors(ProgramIR &program);
-struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true, regionSummaries = true, loopPartition = true; };
+struct HighIROptions { bool scalarSummaries = true, modularLoops = true, quotientLoops = true, sortingContracts = true, resetRegions = true, regionSummaries = true, loopPartition = true, smallUnroll = true, constantLoops = true; };
 void optimizeHighIR(ProgramIR &program, int level, const HighIROptions &options = {});
 void optimizePolyhedral(ProgramIR &program, int level, int tile = 0);
 void printPolyhedralIR(const ProgramIR &program, std::ostream &out);

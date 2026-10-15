@@ -84,6 +84,80 @@ using Regions = std::set<const Symbol *>;
 struct Effects { Regions reads, writes; bool observable = false; };
 using Summaries = std::map<const Function *, Effects>;
 
+// Uniform argument specialization on a closed call graph. Bottom means no
+// incoming evidence yet, not an arbitrary pointer. Only the completed fixed
+// point may replace parameters; distinct offsets and opaque/local pointers
+// join to top. Keep the ABI and all argument evaluation unchanged.
+void specializeArguments(ModuleIR &module) {
+  bool entry = false, candidate = false;
+  for (const auto &f : module.functions) {
+    entry |= f.source->name == "main" && f.source->parameters.empty();
+    for (const auto &p : f.source->parameters) candidate |= p.symbol->type.array();
+  }
+  if (!entry || !candidate) return;
+  struct Fact { int kind = 0; const Symbol *object = nullptr; uint64_t offset = 0; };
+  auto join = [](Fact a,Fact b) {
+    if (!a.kind) return b;
+    if (!b.kind) return a;
+    if (a.kind == 1 && b.kind == 1 && a.object == b.object && a.offset == b.offset) return a;
+    return Fact{2};
+  };
+  std::map<const Function *,size_t> ids;
+  std::vector<std::vector<Fact>> facts;
+  std::vector<std::vector<const Instruction *>> defs;
+  size_t budget = 65536;
+  for (const auto &f : module.functions) {
+    if (f.values.size() > budget) return;
+    budget -= f.values.size(); ids[f.source] = facts.size();
+    facts.emplace_back(f.source->parameters.size()); defs.emplace_back(f.values.size(),nullptr);
+    std::vector<int> counts(f.values.size());
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions) if (i.result >= 0) {
+      defs.back()[i.result] = &i; ++counts[i.result];
+    }
+    for (size_t v = 0; v < counts.size(); ++v) if (counts[v] != 1) defs.back()[v] = nullptr;
+  }
+  bool changed;
+  do {
+    changed = false;
+    for (size_t f = 0; f < module.functions.size(); ++f) {
+      std::function<Fact(int,int)> query = [&](int v,int depth) -> Fact {
+        if (!budget || depth > 16 || !defs[f][v]) return {2};
+        --budget; const auto &i = *defs[f][v];
+        if (i.op == Op::Parameter) return facts[f].at(i.immediate);
+        if (i.op == Op::Address) return i.symbol->global ? Fact{1,i.symbol,uint64_t(i.immediate)} : Fact{2};
+        if (i.op == Op::Move) return query(i.args[0],depth+1);
+        if (i.op == Op::Offset && defs[f][i.args[1]] && defs[f][i.args[1]]->op == Op::Constant) {
+          auto base = query(i.args[0],depth+1);
+          if (base.kind == 1) base.offset += uint64_t(defs[f][i.args[1]]->immediate)*uint64_t(i.immediate);
+          return base;
+        }
+        if (i.op == Op::Phi) {
+          Fact result; for (int a : i.args) result = join(result,query(a,depth+1)); return result;
+        }
+        return {2};
+      };
+      for (const auto &b : module.functions[f].blocks) for (const auto &i : b.instructions) {
+        if (!budget) return;
+        --budget;
+        if (i.op != Op::Call || !ids.count(i.callee)) continue;
+        auto &callee = facts[ids.at(i.callee)];
+        for (size_t p = 0; p < callee.size(); ++p) if (i.callee->parameters[p].symbol->type.array()) {
+          auto next = join(callee[p],query(i.args[p],0));
+          if (next.kind != callee[p].kind || next.object != callee[p].object || next.offset != callee[p].offset) {
+            callee[p] = next; changed = true;
+          }
+        }
+      }
+    }
+  } while (changed);
+  if (!budget) return;
+  for (size_t f = 0; f < module.functions.size(); ++f)
+    for (auto &b : module.functions[f].blocks) for (auto &i : b.instructions)
+      if (i.op == Op::Parameter && module.functions[f].values[i.result] == ValueType::Pointer && facts[f].at(i.immediate).kind == 1) {
+        auto known = facts[f].at(i.immediate); i.op = Op::Address; i.symbol = known.object; i.immediate = static_cast<int64_t>(known.offset);
+      }
+}
+
 // Pointer provenance is a union lattice. Distinct objects cannot overlap;
 // parameters may alias each other or globals, but not this frame's locals.
 std::vector<Regions> provenance(const FunctionIR &f) {
@@ -766,6 +840,106 @@ struct MemorySSA {
   }
 };
 
+// A load can use a uniform call-entry cell only when every call supplies the
+// same typed constant and the callee cannot clobber its object. Query existing
+// caller MemorySSA; never add or speculate a load to discover the value.
+void globalConstants(ModuleIR &module) {
+  bool entry = false;
+  for (const auto &f : module.functions) entry |= f.source->name == "main" && f.source->parameters.empty();
+  if (!entry || !std::all_of(module.functions.begin(),module.functions.end(),[](const FunctionIR &f) { return f.ssa; })) return;
+  auto summaries = summarize(module);
+  Regions writes;
+  for (const auto &f : module.functions) if (f.source->name == "main") writes = summaries.at(f.source).writes;
+  struct Context {
+    std::unique_ptr<AliasAnalysis> alias;
+    std::unique_ptr<MemorySSA> memory;
+    std::vector<const Instruction *> defs;
+    std::map<PointerLocation,int> pointers;
+  };
+  std::vector<Context> contexts(module.functions.size());
+  struct Call { size_t function, block, position; };
+  std::map<const Function *,std::vector<Call>> calls;
+  size_t budget = 65536;
+  for (size_t f = 0; f < module.functions.size(); ++f) {
+    if (module.functions[f].values.size() > budget) return;
+    budget -= module.functions[f].values.size();
+    for (size_t b = 0; b < module.functions[f].blocks.size(); ++b)
+      for (size_t n = 0; n < module.functions[f].blocks[b].instructions.size(); ++n) {
+        const auto &i = module.functions[f].blocks[b].instructions[n];
+        if (i.op == Op::Call) calls[i.callee].push_back({f,b,n});
+      }
+  }
+  auto analysis = [&](size_t f) -> Context & {
+    auto &c = contexts[f];
+    if (!c.alias) {
+      c.alias = std::make_unique<AliasAnalysis>(module.functions[f]); c.defs = definitions(module.functions[f]);
+      for (size_t v = 0; v < c.alias->locations.size(); ++v) {
+        const auto &p = c.alias->locations[v];
+        if (p.object && p.object->global && p.base == -1) c.pointers.emplace(p,v);
+      }
+    }
+    return c;
+  };
+  struct Change { size_t function,block,position; int32_t value; };
+  std::vector<Change> changes;
+  for (size_t f = 0; f < module.functions.size(); ++f) {
+    const auto &function = module.functions[f];
+    bool candidate = false, globalPointer = false;
+    for (const auto &b : function.blocks) for (const auto &i : b.instructions) {
+      candidate |= i.op == Op::Load && function.values[i.result] == ValueType::Int;
+      globalPointer |= i.op == Op::Address && i.symbol->global;
+    }
+    if (!candidate || !globalPointer) continue;
+    auto &c = analysis(f);
+    std::map<PointerLocation,std::optional<int32_t>> cache;
+    for (size_t b = 0; b < function.blocks.size(); ++b) for (size_t n = 0; n < function.blocks[b].instructions.size(); ++n) {
+      const auto &i = function.blocks[b].instructions[n];
+      if (i.op != Op::Load || function.values[i.result] != ValueType::Int) continue;
+      auto location = c.alias->locations[i.args[0]]; auto object = location.object;
+      if (!object || !object->global || object->type.base != Base::Int || location.base != -1 || location.offset%4) continue;
+      auto found = cache.find(location);
+      if (found == cache.end()) {
+        if (cache.size() >= 128 || !budget) continue;
+        --budget;
+        std::optional<int32_t> value;
+        Regions cell{object};
+        if (!overlaps(cell,writes) && location.offset/4 < uint64_t(object->type.elements())) {
+          auto initial = object->values.find(location.offset/4);
+          value = initial == object->values.end() ? 0 : initial->second.integer;
+        } else if (function.source->name != "main" && !overlaps(cell,summaries.at(function.source).writes) && !calls[function.source].empty()) {
+          bool uniform = true;
+          for (auto call : calls[function.source]) {
+            auto &caller = analysis(call.function);
+            auto pointer = caller.pointers.find(location);
+            if (pointer == caller.pointers.end()) { uniform = false; break; }
+            if (!caller.memory) caller.memory = std::make_unique<MemorySSA>(module.functions[call.function],summaries,*caller.alias);
+            if (caller.memory->nodes.size() > budget) { uniform = false; break; }
+            budget -= caller.memory->nodes.size();
+            int id = caller.memory->clobber(caller.memory->before[call.block][call.position],cell,pointer->second,4);
+            const auto &node = caller.memory->nodes[id];
+            if (node.kind != MemoryNode::Def || !controlFlow(module.functions[call.function]).dominates(node.block,call.block) ||
+                (node.block == int(call.block) && node.position >= int(call.position))) { uniform = false; break; }
+            const auto &store = module.functions[call.function].blocks[node.block].instructions[node.position];
+            std::optional<int32_t> incoming;
+            if (store.op == Op::Store && module.functions[call.function].values[store.args[1]] == ValueType::Int && caller.defs[store.args[1]] &&
+                caller.defs[store.args[1]]->op == Op::Constant && caller.alias->covers(store.args[0],4,pointer->second,4)) incoming = static_cast<int32_t>(caller.defs[store.args[1]]->immediate);
+            if (store.op == Op::Zero && caller.alias->covers(store.args[0],store.immediate,pointer->second,4)) incoming = 0;
+            if (!incoming || (value && *value != *incoming)) { uniform = false; break; }
+            value = incoming;
+          }
+          if (!uniform) value.reset();
+        }
+        found = cache.emplace(location,value).first;
+      }
+      if (found->second) changes.push_back({f,b,n,*found->second});
+    }
+  }
+  for (auto change : changes) {
+    auto &i = module.functions[change.function].blocks[change.block].instructions[change.position];
+    i.op = Op::Constant; i.immediate = change.value; i.args.clear();
+  }
+}
+
 std::vector<size_t> forwardMemoryPhis(FunctionIR &f, const AliasAnalysis &alias, const MemorySSA &memory);
 void memoryForward(FunctionIR &f, const Summaries &summaries, bool phiForward = true) {
   if (!f.ssa) return;
@@ -919,16 +1093,32 @@ std::vector<size_t> forwardMemoryPhis(FunctionIR &f, const AliasAnalysis &alias,
 // Bound local DSE work independently of source size. Each retained later write
 // can kill an earlier fully covered store, until a possibly aliasing read or
 // call makes that write unavailable. Partial zero fills never kill live bytes.
-void deadStores(FunctionIR &f, const Summaries &summaries) {
+void deadStores(FunctionIR &f, const Summaries &summaries, bool privateObjects = true) {
   if (!f.ssa) return;
   bool candidate = false;
   for (const auto &b : f.blocks) {
     int writes = 0;
     for (const auto &i : b.instructions) if (i.op == Op::Store || i.op == Op::Zero) ++writes;
-    candidate |= writes > 1;
+    candidate |= writes > 1 || (privateObjects && !f.objects.empty() && writes);
   }
   if (!candidate) return;
   AliasAnalysis alias(f);
+  if (privateObjects && !f.objects.empty()) {
+    Regions observed;
+    for (const auto &b : f.blocks) for (const auto &i : b.instructions)
+      for (size_t a = 0; a < i.args.size(); ++a) if (f.values[i.args[a]] == ValueType::Pointer) {
+        bool addressOnly = (a == 0 && (i.op == Op::Store || i.op == Op::Zero || i.op == Op::Offset || i.op == Op::Move)) || i.op == Op::Phi;
+        if (!addressOnly) observed.insert(alias.roots[i.args[a]].begin(),alias.roots[i.args[a]].end());
+      }
+    // Only erasures follow this snapshot. Keep every call/argument evaluation;
+    // a pointer passed even to a write-only call conservatively escapes here.
+    for (auto &b : f.blocks) b.instructions.erase(std::remove_if(b.instructions.begin(),b.instructions.end(),[&](const Instruction &i) {
+      if (i.op != Op::Store && i.op != Op::Zero) return false;
+      const auto &roots = alias.roots[i.args[0]];
+      auto object = roots.size() == 1 ? *roots.begin() : nullptr;
+      return object && !object->global && !(object->parameter && object->type.array()) && !observed.count(object);
+    }),b.instructions.end());
+  }
   for (auto &b : f.blocks) {
     if (std::count_if(b.instructions.begin(),b.instructions.end(),[](const Instruction &i) { return i.op == Op::Store || i.op == Op::Zero; }) < 2) continue;
     struct Write { int pointer; uint64_t size; };
@@ -1216,8 +1406,18 @@ void unrollRuntime(FunctionIR &f, int h, int test, const std::vector<Instruction
   if (site < 0 || !graph.dominates(site, pre)) return;
   for (const auto &i : body) if (i.op == Op::Call) return;
   for (const auto &phi : phis) if (phi.edges.size() != 2 || std::find(phi.edges.begin(), phi.edges.end(), pre) == phi.edges.end()) return;
-  int main = f.blocks.size(), check = main+1, gate = main+2;
+  // Prove the rotated entry, rather than relying on a prior PASS name. A
+  // tail-recursive/do-while shaped CFG may require its first body unconditionally.
   int exit = f.blocks[test].instructions.back().otherwise;
+  if (graph.pred[pre].size() != 1 || graph.pred[exit].size() != 2) return;
+  int entry = graph.pred[pre][0];
+  const auto &guard = f.blocks[entry].instructions.back();
+  if (guard.op != Op::Branch || guard.target != pre || guard.otherwise != exit) return;
+  auto defs = definitions(f); const auto *firstCompare = defs[guard.args[0]];
+  const auto &ivPhi = *std::find_if(phis.begin(),phis.end(),[&](const Instruction &i) { return i.result == iv; });
+  int initialIV = ivPhi.args[ivPhi.edges[0] == pre ? 0 : 1];
+  if (!firstCompare || firstCompare->op != compare.op || firstCompare->args != std::vector<int>{initialIV,bound}) return;
+  int main = f.blocks.size(), check = main+1, gate = main+2;
   std::map<int, int> remap, initial, carried, gateState;
   auto value = [&](int v) { auto it = remap.find(v); return it == remap.end() ? v : it->second; };
   std::vector<Instruction> mainPhis, mainCode, gateCode;
@@ -1257,8 +1457,8 @@ void unrollRuntime(FunctionIR &f, int h, int test, const std::vector<Instruction
   for (auto &phi : f.blocks[h].instructions) if (phi.op == Op::Phi) for (size_t n = 0; n < phi.edges.size(); ++n) if (phi.edges[n] == pre) {
     phi.edges[n] = gate; phi.args[n] = gateState.at(phi.result);
   }
-  // The rotated entry guard proves bound > initial >= 0. bound-4 therefore
-  // cannot wrap; each main iteration has four valid scalar iterations.
+  // The verified rotated entry proves bound > initial >= 0. bound-4 cannot
+  // wrap; each main iteration has four valid scalar iterations.
   Instruction four{Op::Constant}; four.result = newValue(f, ValueType::Int); four.immediate = 4;
   Instruction threshold{Op::Sub}; threshold.result = newValue(f, ValueType::Int); threshold.args = {bound, four.result};
   Instruction enough{Op::Le}; enough.result = newValue(f, ValueType::Int); enough.args = {initial.at(iv), threshold.result};
@@ -1393,7 +1593,7 @@ void tailRecursion(FunctionIR &f) {
   Instruction jump{Op::Jump}; jump.target = header; parameters.push_back(jump); f.blocks[0].instructions = std::move(parameters);
 }
 
-void arithmetic(FunctionIR &f, bool predicates = true) {
+void arithmetic(FunctionIR &f, bool predicates = true, bool tableFolding = true) {
   if (!f.ssa) return;
   auto borrowed = definitions(f); std::vector<std::optional<Instruction>> defs(f.values.size());
   for (size_t v = 0; v < defs.size(); ++v) if (borrowed[v]) defs[v] = *borrowed[v];
@@ -1406,6 +1606,8 @@ void arithmetic(FunctionIR &f, bool predicates = true) {
     if (i.op >= Op::Eq && i.op <= Op::Ge) ranges[i.result] = {{0, 1}};
   }
   const auto &graph = controlFlow(f);
+  struct Induction { int phi, initial, bound; };
+  std::map<int,std::vector<Induction>> induction;
   for (const auto &loop : loops(graph)) {
     const auto &branch = f.blocks[loop.header].instructions.back();
     if (branch.op != Op::Branch || !loop.blocks.count(branch.target) || loop.blocks.count(branch.otherwise)) continue;
@@ -1416,10 +1618,12 @@ void arithmetic(FunctionIR &f, bool predicates = true) {
       int outside = loop.blocks.count(phi.edges[0]) ? 1 : 0;
       if (loop.blocks.count(phi.edges[outside])) continue;
       auto init = defs[phi.args[outside]], update = defs[phi.args[1-outside]];
-      if (!init || init->op != Op::Constant || init->immediate < 0 || !update || update->op != Op::Add ||
+      if (!init || !update || update->op != Op::Add ||
           !graph.dominates(branch.target, sites[update->result])) continue;
       int step = update->args[0] == phi.result ? update->args[1] : update->args[1] == phi.result ? update->args[0] : -1;
       if (step < 0 || !defs[step] || defs[step]->op != Op::Constant || defs[step]->immediate != 1) continue;
+      induction[loop.header].push_back({phi.result,phi.args[outside],compare->args[1]});
+      if (init->op != Op::Constant || init->immediate < 0) continue;
       auto limit = defs[compare->args[1]];
       int64_t high = limit && limit->op == Op::Constant ? std::max(init->immediate, limit->immediate) : INT32_MAX;
       ranges[phi.result] = {{init->immediate, high}};
@@ -1492,6 +1696,60 @@ void arithmetic(FunctionIR &f, bool predicates = true) {
     }
     return lo >= INT32_MIN && hi <= INT32_MAX ? Range{{lo,hi}} : Range{};
   };
+  // Entry-only constant writes define private lookup tables. Every escape,
+  // non-entry write or opaque destination invalidates the whole object. The
+  // table remains in place; only loads from a uniformly valued proven slice
+  // become constants, after all initialization writes have executed.
+  struct Table {
+    std::vector<std::optional<int32_t>> cells;
+    std::vector<bool> live;
+    bool valid = true, unknownRead = false;
+    size_t last = 0;
+  };
+  std::map<const Symbol *,Table> tables;
+  if (tableFolding && graph.pred[0].empty()) for (auto object : f.objects)
+    if (object->type.array() && object->type.base == Base::Int && object->type.elements() > 0 && object->type.elements() <= 256)
+      { tables[object].cells.resize(object->type.elements()); tables[object].live.resize(object->type.elements()); }
+  std::vector<Regions> tableRoots;
+  std::vector<PointerLocation> tableLocations;
+  if (!tables.empty()) {
+    AliasAnalysis alias(f);
+    for (size_t b = 0; b < f.blocks.size(); ++b) for (size_t n = 0; n < f.blocks[b].instructions.size(); ++n) {
+      const auto &i = f.blocks[b].instructions[n];
+      for (size_t a = 0; a < i.args.size(); ++a) if (f.values[i.args[a]] == ValueType::Pointer) {
+        bool addressUse = (a == 0 && (i.op == Op::Offset || i.op == Op::Move || i.op == Op::Load || i.op == Op::Store || i.op == Op::Zero)) || i.op == Op::Phi;
+        if (!addressUse) for (auto object : alias.roots[i.args[a]]) if (tables.count(object)) tables[object].valid = false;
+      }
+      if (i.op != Op::Store && i.op != Op::Zero) continue;
+      auto location = alias.locations[i.args[0]];
+      for (auto object : alias.roots[i.args[0]]) if (tables.count(object)) {
+        auto &table = tables[object];
+        uint64_t bytes = table.cells.size()*4, size = i.op == Op::Zero ? uint64_t(i.immediate) : 4;
+        bool constant = i.op == Op::Zero || (f.values[i.args[1]] == ValueType::Int && defs[i.args[1]] && defs[i.args[1]]->op == Op::Constant);
+        if (b != 0 || location.object != object || location.offset%4 || location.offset > bytes || size > bytes-location.offset || !constant) {
+          table.valid = false; continue;
+        }
+        int32_t value = i.op == Op::Zero ? 0 : static_cast<int32_t>(defs[i.args[1]]->immediate);
+        for (uint64_t offset = location.offset; offset < location.offset+size; offset += 4) table.cells[offset/4] = value;
+        table.last = n;
+      }
+    }
+    tableRoots = std::move(alias.roots); tableLocations = std::move(alias.locations);
+  }
+  struct Slice { const Symbol *object; int64_t low,high; };
+  std::function<std::optional<Slice>(int,int&)> slice = [&](int v,int &budget) -> std::optional<Slice> {
+    if (--budget < 0 || !defs[v]) return {};
+    const auto &i = *defs[v];
+    if (i.op == Op::Address && tables.count(i.symbol) && i.immediate >= 0 && i.immediate <= 1024)
+      return Slice{i.symbol,i.immediate,i.immediate};
+    if (i.op == Op::Move) return slice(i.args[0],budget);
+    if (i.op != Op::Offset || i.immediate < 0 || i.immediate > 1024) return {};
+    auto base = slice(i.args[0],budget); auto index = query(i.args[1],budget);
+    if (!base || !index) return {};
+    base->low += index->first*i.immediate; base->high += index->second*i.immediate;
+    return base;
+  };
+  size_t tableBudget = 65536;
   std::function<void(int)> rewrite = [&](int block) {
     int refined = -1; Range previous;
     if (predicates && graph.pred[block].size() == 1) {
@@ -1525,9 +1783,49 @@ void arithmetic(FunctionIR &f, bool predicates = true) {
         }
       }
     }
+    // Scoped exit facts from a preceding loop can establish the next loop's
+    // lower bound. A +1 recurrence tested by signed < cannot wrap on its body
+    // edge; include the zero-trip initial value in the header interval.
+    std::vector<std::pair<int,Range>> induced;
+    if (predicates && induction.count(block)) for (auto iv : induction.at(block)) {
+      int budget = 64; auto initial = query(iv.initial,budget), bound = query(iv.bound,budget);
+      if (!initial || !bound || initial->first < 0) continue;
+      auto old = facts.find(iv.phi); induced.push_back({iv.phi,old == facts.end() ? Range{} : Range{old->second}});
+      facts[iv.phi] = {initial->first,std::max(initial->second,bound->second)};
+    }
     auto &b = f.blocks[block];
     std::vector<Instruction> code;
-    for (auto i : b.instructions) {
+    for (size_t position = 0; position < b.instructions.size(); ++position) {
+      auto i = b.instructions[position];
+      if (i.op == Op::Load && !tables.empty()) {
+        bool covered = false;
+        int budget = 64; auto region = slice(i.args[0],budget);
+        if (region && tableBudget && f.values[i.result] == ValueType::Int) {
+          auto &table = tables.at(region->object);
+          if (table.valid && (block != 0 || position > table.last) && region->low >= 0 && region->low%4 == 0 &&
+              region->high%4 == 0 && region->high >= region->low && uint64_t(region->high) < table.cells.size()*4) {
+            std::optional<int32_t> value; bool uniform = true;
+            for (int64_t offset = region->low; offset <= region->high; offset += 4) {
+              if (!tableBudget) { uniform = false; break; }
+              --tableBudget; auto cell = table.cells[offset/4];
+              if (!cell || (value && *value != *cell)) { uniform = false; break; }
+              value = cell;
+            }
+            if (uniform && value) {
+              i.op = Op::Constant; i.immediate = *value; i.args.clear();
+              defs[i.result] = i; ranges[i.result] = {{*value,*value}};
+              covered = true;
+            } else if (tableBudget) {
+              covered = true;
+              for (int64_t offset = region->low; offset <= region->high; offset += 4) {
+                if (!tableBudget) { covered = false; break; }
+                --tableBudget; table.live[offset/4] = true;
+              }
+            }
+          }
+        }
+        if (!covered) for (auto object : tableRoots[i.args[0]]) if (tables.count(object)) tables[object].unknownRead = true;
+      }
       if (predicates && i.op >= Op::Eq && i.op <= Op::Ge && f.values[i.args[0]] == ValueType::Int &&
           f.values[i.args[1]] == ValueType::Int && (!facts.empty() || (ranges[i.args[0]] && ranges[i.args[1]]))) {
         int budget = 64; auto a = query(i.args[0],budget), c = query(i.args[1],budget);
@@ -1566,9 +1864,24 @@ void arithmetic(FunctionIR &f, bool predicates = true) {
     }
     b.instructions = std::move(code);
     for (int child : graph.children[block]) rewrite(child);
+    for (auto it = induced.rbegin(); it != induced.rend(); ++it) {
+      if (it->second) facts[it->first] = *it->second; else facts.erase(it->first);
+    }
     if (refined >= 0) { if (previous) facts[refined] = *previous; else facts.erase(refined); }
   };
   rewrite(0);
+  if (!tables.empty()) {
+    auto &entry = f.blocks[0].instructions;
+    entry.erase(std::remove_if(entry.begin(),entry.end(),[&](const Instruction &i) {
+      if (i.op != Op::Store && i.op != Op::Zero) return false;
+      const auto &p = tableLocations[i.args[0]];
+      auto found = tables.find(p.object);
+      if (found == tables.end() || !found->second.valid || found->second.unknownRead) return false;
+      const auto &live = found->second.live; uint64_t size = i.op == Op::Zero ? uint64_t(i.immediate) : 4;
+      for (uint64_t offset = p.offset; offset < p.offset+size; offset += 4) if (live[offset/4]) return false;
+      return true;
+    }),entry.end());
+  }
 }
 
 void licm(FunctionIR &f, const Summaries &summaries) {
@@ -1886,6 +2199,8 @@ void printMemoryIR(const ModuleIR &module, std::ostream &out) {
 }
 
 bool runAdvancedPass(ModuleIR &module, const std::string &name) {
+  if (name == "global-constants") { globalConstants(module); return true; }
+  if (name == "arg-specialize") { specializeArguments(module); return true; }
   if (name == "global-memory") {
     // Closed-world observation starts at main. ModRef substitutes actual
     // pointer roots through the call graph, including recursive fixed points.
@@ -1926,14 +2241,15 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
   if (name == "inline" || name == "inline-early") {
     inlineCalls(module,name == "inline-early"); return true;
   }
-  if (name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
+  if (name == "dse-basic" || name == "arith-no-tables" || name == "iv-coalesce" || name == "repeat-store" || name == "arith-global" || name == "loop-promote" || name == "sroa" || name == "dse" || name == "affine" || name == "egraph" || name == "ssa" || name == "simplify" || name == "lower-phi" || name == "sccp" || name == "gvn" || name == "licm" || name == "compact" || name == "strength" || name == "memory-basic" || name == "memory-phi" || name == "memory" || name == "rotate" || name == "unroll" || name == "tail" || name == "arith") {
     Summaries summaries;
-    if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse") summaries = summarize(module);
+    if (name == "repeat-store" || name == "loop-promote" || name == "gvn" || name == "licm" || name == "memory" || name == "memory-basic" || name == "memory-phi" || name == "dse" || name == "dse-basic") summaries = summarize(module);
     for (auto &f : module.functions) {
       if (name == "loop-promote") promoteLoopMemory(f,summaries);
       else if (name == "repeat-store") collapseOverwrites(f,summaries);
       else if (name == "sroa") scalarReplace(f);
       else if (name == "dse") deadStores(f,summaries);
+      else if (name == "dse-basic") deadStores(f,summaries,false);
       else if (name == "affine") normalizeAffine(f);
       else if (name == "egraph") rewriteEqualities(f);
       else if (name == "ssa") ssa(f);
@@ -1949,6 +2265,7 @@ bool runAdvancedPass(ModuleIR &module, const std::string &name) {
       else if (name == "unroll") unroll(f);
       else if (name == "tail") tailRecursion(f);
       else if (name == "arith") arithmetic(f);
+      else if (name == "arith-no-tables") arithmetic(f,true,false);
       else if (name == "arith-global") arithmetic(f,false);
       else if (name == "compact") compact(f);
       else if (name == "strength") strength(f);

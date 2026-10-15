@@ -40,13 +40,15 @@ void help() {
       "  --no-reset-regions disable repetition elimination after rectangular resets\n"
       "  --no-region-summaries disable guarded interprocedural region-kill summaries\n"
       "  --no-loop-partition disable bounded loop domain partitioning\n"
+      "  --no-small-unroll disable bounded complete expansion of small loops\n"
+      "  --no-constant-loops disable bounded integer loop evaluation\n"
       "  --poly-tile=N      cap unroll-and-jam width (1, 2, 4, 8)\n"
       "  --tensor-tile=N    override automatic column tile (1, 2, 4, 8)\n"
       "  --emit-memory-ir   print memory definitions, phis, uses and clobbers\n"
       "  --emit-effects     print function read/write and observable-effect summaries\n"
       "  --stats            print stage timings and peak RSS as JSON to stderr\n"
       "  --passes=PIPELINE  override ordered IR passes (comma separated)\n"
-      "    prune,inline,inline-early,globaldce,global-memory,sroa,promote,loop-promote,ssa,simplify,sccp,gvn,memory,memory-basic,memory-phi,dse,affine,egraph,tail,arith,arith-global,licm,repeat-store,strength,iv-coalesce,rotate,unroll,dce,compact,lower-phi,isel,layout\n"
+      "    prune,arg-specialize,inline,inline-early,globaldce,global-memory,global-constants,sroa,promote,loop-promote,ssa,simplify,sccp,gvn,memory,memory-basic,memory-phi,dse,dse-basic,affine,egraph,tail,arith,arith-global,arith-no-tables,licm,repeat-store,strength,iv-coalesce,rotate,unroll,dce,compact,lower-phi,isel,layout\n"
       "  --help             print this help\n";
 }
 Options options(int argc, char **argv) {
@@ -74,6 +76,8 @@ Options options(int argc, char **argv) {
     else if (arg == "--no-reset-regions") o.highIR.resetRegions = false;
     else if (arg == "--no-region-summaries") o.highIR.regionSummaries = false;
     else if (arg == "--no-loop-partition") o.highIR.loopPartition = false;
+    else if (arg == "--no-small-unroll") o.highIR.smallUnroll = false;
+    else if (arg == "--no-constant-loops") o.highIR.constantLoops = false;
     else if (arg.rfind("--poly-tile=",0) == 0) {
       auto tile = arg.substr(12);
       if (tile != "1" && tile != "2" && tile != "4" && tile != "8") throw std::runtime_error("poly tile must be 1, 2, 4 or 8");

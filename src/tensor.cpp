@@ -1109,6 +1109,115 @@ public:
   }
 };
 
+// Bounded integer execution produces an ordered store trace, not an assumed
+// final global state. Unknown inputs, calls, array reads and exceptional
+// arithmetic reject the trace. Local scalar state is replayed at its exit.
+// Evaluate a bounded integer trace without reading mutable memory or executing
+// calls. Preserve the ordered stores; export only private scalar exit values.
+class ConstantLoops {
+public:
+  struct Store { const Expr *target; std::vector<int32_t> indices; int32_t value; };
+  struct Model { std::vector<Store> stores; std::map<const Symbol *,int32_t> scalars; size_t cost = 1; };
+private:
+  std::map<const Symbol *,int32_t> values;
+  std::set<const Symbol *> written, declared;
+  Model model;
+  size_t &budget;
+  std::optional<int32_t> expression(const Expr &e,int depth = 0) {
+    if (!budget || depth > 32 || !e.type.numeric() || e.type.base != Base::Int) return {};
+    --budget;
+    if (e.constant && e.constant->base == Base::Int) return e.constant->integer;
+    if (e.kind == Expr::Kind::Variable && e.operands.empty() && values.count(e.symbol)) return values.at(e.symbol);
+    if (e.kind != Expr::Kind::Unary && e.kind != Expr::Kind::Binary) return {};
+    auto a = expression(*e.operands[0],depth+1); if (!a) return {};
+    if (e.kind == Expr::Kind::Unary) {
+      if (e.text == "+") return a;
+      if (e.text == "-") return static_cast<int32_t>(0u-uint32_t(*a));
+      if (e.text == "!") return !*a;
+      return {};
+    }
+    if (e.text == "&&" && !*a) return 0;
+    if (e.text == "||" && *a) return 1;
+    auto b = expression(*e.operands[1],depth+1); if (!b) return {};
+    uint32_t x = *a, y = *b;
+    if (e.text == "+") return static_cast<int32_t>(x+y);
+    if (e.text == "-") return static_cast<int32_t>(x-y);
+    if (e.text == "*") return static_cast<int32_t>(x*y);
+    if (e.text == "/" || e.text == "%") {
+      if (!*b) return {};
+      if (*a == INT32_MIN && *b == -1) return e.text == "/" ? INT32_MIN : 0;
+      return e.text == "/" ? *a / *b : *a % *b;
+    }
+    if (e.text == "&") return static_cast<int32_t>(x&y);
+    if (e.text == "shr") return static_cast<int32_t>(x>>(y&31));
+    if (e.text == "==") return *a == *b;
+    if (e.text == "!=") return *a != *b;
+    if (e.text == "<") return *a < *b;
+    if (e.text == "<=") return *a <= *b;
+    if (e.text == ">") return *a > *b;
+    if (e.text == ">=") return *a >= *b;
+    if (e.text == "&&") return bool(*a) && bool(*b);
+    if (e.text == "||") return bool(*a) || bool(*b);
+    return {};
+  }
+  bool statement(const Stmt &s,int depth = 0) {
+    if (!budget || depth > 32) return false;
+    --budget;
+    if (s.kind == Stmt::Kind::Block) {
+      for (const auto &c : s.children) if (!statement(*c,depth+1)) return false;
+      return true;
+    }
+    if (s.kind == Stmt::Kind::If) {
+      auto condition = expression(*s.expression); if (!condition) return false;
+      if (*condition) return statement(*s.children[0],depth+1);
+      return s.children.size() == 1 || statement(*s.children[1],depth+1);
+    }
+    if (s.kind == Stmt::Kind::While) {
+      for (;;) {
+        auto condition = expression(*s.expression); if (!condition) return false;
+        if (!*condition) return true;
+        if (!statement(*s.children[0],depth+1)) return false;
+      }
+    }
+    if (s.kind == Stmt::Kind::Declaration) {
+      for (const auto &v : s.variables) {
+        if (!v.symbol->type.numeric() || v.base != Base::Int || v.initializers.size() > 1) return false;
+        declared.insert(v.symbol); values.erase(v.symbol);
+        if (!v.initializers.empty()) {
+          auto value = expression(*v.initializers[0].second); if (!value) return false;
+          values[v.symbol] = *value;
+        } else if (v.initializer) values[v.symbol] = 0;
+      }
+      return true;
+    }
+    if (s.kind != Stmt::Kind::Assignment || s.target->kind != Expr::Kind::Variable ||
+        !s.target->type.numeric() || s.target->type.base != Base::Int) return false;
+    auto value = expression(*s.expression); if (!value) return false;
+    auto symbol = s.target->symbol;
+    if (!symbol->type.array()) {
+      if (symbol->global || !s.target->operands.empty()) return false;
+      values[symbol] = *value; written.insert(symbol); return true;
+    }
+    if (model.stores.size() >= 256 || s.target->operands.size() != symbol->type.shape.size() || s.target->operands.size() > 3) return false;
+    Store store{s.target.get(),{},*value};
+    for (const auto &index : s.target->operands) {
+      auto n = expression(*index); if (!n) return false;
+      store.indices.push_back(*n);
+    }
+    model.cost += 3+store.indices.size(); model.stores.push_back(std::move(store)); return true;
+  }
+public:
+  explicit ConstantLoops(size_t &work) : budget(work) {}
+  std::optional<Model> run(const Stmt &loop,const Symbol *counter) {
+    values[counter] = 0;
+    if (!statement(loop) || model.stores.empty()) return {};
+    for (auto symbol : written) if (!declared.count(symbol)) {
+      model.scalars[symbol] = values.at(symbol); model.cost += 3;
+    }
+    return std::move(model);
+  }
+};
+
 // Factor repeated, read-only loop bodies with integer additive reductions.
 // Definite assignment proves that auxiliary state resets each iteration; reads
 // of carried reductions, array writes, and impure calls prevent the transform.
@@ -1141,6 +1250,90 @@ class Repetition : NodeBuilder {
     if (source.target) s->target = clone(*source.target);
     for (const auto &c : source.children) s->children.push_back(partitionBody(*c,i,low,high));
     return s;
+  }
+  static const Stmt &unwrap(const Stmt &s) {
+    auto node = &s;
+    while (node->kind == Stmt::Kind::Block && node->children.size() == 1) node = node->children[0].get();
+    return *node;
+  }
+  void smallLoops(S &s,size_t &growth,size_t &evaluation,bool constants,bool unroll) {
+    for (auto &child : s->children) smallLoops(child,growth,evaluation,constants,unroll);
+    if (s->kind != Stmt::Kind::Block) return;
+    for (size_t position = 0; position < s->children.size(); ++position) {
+      auto &loop = s->children[position];
+      if (loop->kind != Stmt::Kind::While || loop->scheduled || loop->expression->kind != Expr::Kind::Binary ||
+          loop->expression->text != "<" || loop->children[0]->kind != Stmt::Kind::Block || loop->children[0]->children.empty()) continue;
+      auto &a = *loop->expression->operands[0], &b = *loop->expression->operands[1];
+      if (a.kind != Expr::Kind::Variable || !a.operands.empty() || a.symbol->global || !a.type.numeric() || a.type.base != Base::Int ||
+          !b.constant || b.constant->base != Base::Int || b.constant->integer < 2 || b.constant->integer > 128) continue;
+      auto counter = a.symbol; const auto &body = *loop->children[0];
+      auto step = increment(*body.children.back(),counter);
+      if (!step || !step->constant || step->constant->base != Base::Int || step->constant->integer != 1) continue;
+      size_t nodes = 0; int writes = 0; bool valid = true, nested = false, branches = false, arrayWrites = false;
+      std::vector<std::pair<const Stmt *,int>> pending{{&body,0}};
+      while (!pending.empty() && valid) {
+        auto [node,depth] = pending.back(); pending.pop_back();
+        if (++nodes > 1024 || depth > 32 || node->kind == Stmt::Kind::Break || node->kind == Stmt::Kind::Continue || node->kind == Stmt::Kind::Return) { valid = false; break; }
+        if (node->target && node->target->symbol == counter) ++writes;
+        nested |= node->kind == Stmt::Kind::While;
+        branches |= node->kind == Stmt::Kind::If;
+        arrayWrites |= node->target && node->target->symbol->type.array();
+        auto count = [&](Expr *e) { if (e) visitExpressions(*e,[&](Expr &) { if (++nodes > 1024) valid = false; }); };
+        count(node->expression.get()); count(node->target.get());
+        for (const auto &v : node->variables) for (auto entry : v.initializers) count(entry.second);
+        for (const auto &c : node->children) pending.push_back({c.get(),depth+1});
+      }
+      if (!valid || writes != 1) continue;
+      bool zero = false;
+      for (size_t n = position; n && position-n < 8;) {
+        const auto &prefix = unwrap(*s->children[--n]);
+        if (prefix.kind == Stmt::Kind::Assignment && prefix.target->symbol == counter) {
+          zero = prefix.expression->constant && prefix.expression->constant->base == Base::Int && prefix.expression->constant->integer == 0; break;
+        }
+        bool touched = false;
+        if (prefix.kind == Stmt::Kind::Declaration) for (const auto &v : prefix.variables) if (v.symbol == counter) {
+          touched = true; zero = v.initializers.size() == 1 && v.initializers[0].second->constant &&
+              v.initializers[0].second->constant->base == Base::Int && v.initializers[0].second->constant->integer == 0;
+        }
+        if (touched) break;
+        std::vector<const Stmt *> scan{&prefix};
+        size_t visited = 0;
+        while (!scan.empty()) {
+          if (++visited > 1024) { touched = true; break; }
+          auto node = scan.back(); scan.pop_back();
+          touched |= node->target && node->target->symbol == counter;
+          for (const auto &v : node->variables) touched |= v.symbol == counter;
+          for (const auto &c : node->children) scan.push_back(c.get());
+        }
+        if (touched) break;
+      }
+      auto expanded = block();
+      size_t work = std::min<size_t>(evaluation,4096); auto before = work;
+      auto trace = constants ? ConstantLoops(work).run(*loop,counter) : std::optional<ConstantLoops::Model>{};
+      evaluation -= before-work;
+      if (trace && trace->cost+8 <= growth) {
+        growth -= trace->cost+8;
+        for (const auto &store : trace->stores) {
+          auto target = program.expressions->make(Expr::Kind::Variable,store.target->location,store.target->text);
+          target->symbol = store.target->symbol; target->type = store.target->type;
+          for (int32_t index : store.indices) target->operands.push_back(integer(index));
+          expanded->children.push_back(assign(std::move(target),integer(store.value)));
+        }
+        for (auto [symbol,value] : trace->scalars) expanded->children.push_back(assign(reference(const_cast<Symbol *>(symbol)),integer(value)));
+      } else {
+        size_t cost = nodes*(b.constant->integer-(zero ? 1 : 0))+8;
+        // Residual loops and branch-heavy writes amplify CFG/inlining costs.
+        if (!unroll || nested || (branches && arrayWrites) || b.constant->integer > 8 || cost > 4096 || cost > growth) continue;
+        growth -= cost;
+        if (!zero) expanded->children.push_back(assign(reference(counter),integer(0)));
+        for (int n = 0; n < b.constant->integer; ++n) expanded->children.push_back(partitionBody(body,counter,n,n));
+      }
+      if (zero) loop = std::move(expanded);
+      else {
+        auto guard = program.statements->make(Stmt::Kind::If,loop->location);
+        guard->expression = binary("==",reference(counter),integer(0)); guard->children = {std::move(expanded),loop}; loop = std::move(guard);
+      }
+    }
   }
   void partition(S &s,size_t &growth) {
     for (auto &child : s->children) partition(child,growth);
@@ -1403,6 +1596,10 @@ public:
       });
     }
     for (auto &item : program.items) if (item.function) {
+      if (level >= 3 && (options.smallUnroll || options.constantLoops)) {
+        size_t growth = 4096, evaluation = 16384;
+        smallLoops(item.function->body,growth,evaluation,options.constantLoops,options.smallUnroll);
+      }
       if (options.loopPartition) { size_t growth = 4096; partition(item.function->body,growth); }
       if (level >= 3) { initial.clear(); assignments.clear(); facts(*item.function->body); optimize(item.function->body); }
     }

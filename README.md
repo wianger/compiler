@@ -32,6 +32,8 @@ Source → source-slice Token IR → arena Program IR → resolved HIR
 - `selection.cpp` 将 Phi 降为边上复制，选择布局和 RV64 目标指令；常量除法、地址计算及比较序列在寄存器分配前展开，常量地址链折成 base＋有符号 12 位访存位移。目标 MIR 暴露临时值、bank、early/late 使用时刻及调用 clobber。展开后进行局部值编号和复制传播，以定义版本保护可多次写入的值，保留常量重物化配方，再用 def-use 工作队列删除无用临时值并压缩 ID。
 - `backend.cpp` 用稀疏 64 位块计算活跃度，以有序占用区间查询冲突，按优先队列分配复制 bundle 并驱逐重试；避免冷路径的受限复制压缩热 bundle 的寄存器选择。热溢出区间拆分后重新分配，较高压力下相邻使用共享重载。独立冲突与 ABI 检查，以及可选的符号数据流检查，验证分配结果。ABI 参数按并行复制处理交换环；分配后消除无操作复制块和多余跳转，输出符合 [RISC-V psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/) 的汇编。
 
+HIR 的有界整数求值和小循环完整展开进一步暴露常量索引与有序初始化；`arg-specialize` 传播一致的全局指针实参，`global-constants` 用调用前 MemorySSA 传播精确常量单元。作用域归纳区间使后续循环能折叠私有表的一致区间，并删除已无读取的初始化。各项有工作／增长预算和独立消融开关，细节见技术调研文档。
+
 标量提升后，`ssa` PASS 将可多次写入的变量转换为单赋值，并在汇合处插入 Phi。每个 PASS 后检查终结指令、操作数、类型、调用签名，以及 SSA 定义唯一性、支配关系和 Phi 入边。CFG 变化会同步修复 Phi；退出 SSA 时拆分关键边，处理并行复制中的环。Token、Program、SSA 和降 Phi 后的 IR 可单独打印，各 PASS 可以重新组合。
 
 采用的现代设计及准确实现边界见 [Architecture-Research.md](docs/Architecture-Research.md)，全阶段调研、取舍与下一批实验见 [Compiler-Research.md](docs/Compiler-Research.md)。红绿 CST、完整 SoA、跨 CFG AEGraph、ISLE DSL 和完整 regalloc3 尚未实现；当前批量编译使用源码切片、块状 arena、自有目标 MIR 和区间分配器。
@@ -84,4 +86,4 @@ python3 tools/regression.py
 
 根据额外测试支持 `tensor int/float` 数组、逐元素 `+ - * / %`、一元 `+ -`、标量广播、`@` 二维矩阵乘法、tensor 参数和返回值。逐元素操作要求相同形状；矩阵乘法要求内部维度匹配；`%` 只接受整数。返回形状从函数体推导，各个 return 必须形状一致。tensor 运算和返回需要静态已知的维度；省略首维的 tensor 参数可按普通数组索引访问。
 
-性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 各 **210/210**；731 个额外程序在 `-O0`、`-O2`、`-O3` 共 **2193 次执行**及 **20 个诊断**通过。另有 **968 次 ASan/UBSan 编译**、**56 个 MIR 破坏性变异**和 **239 条离线整数规则证明**。QEMU 共同输入对照的 wall 几何平均为 **1.180×**，固定较长计时区间为 **1.570×**；原生编译总耗时约为 sysy-competition 的 **1/30.6**。相比本轮基线，全部输入编译总耗时增加 **1.16%**，平均 **4.45 ms／输入**。全面领先仍未完成，剩余差距、单项消融与测量范围见性能文档。
+性能验证和复现方法见 [Performance.md](docs/Performance.md)。当前 `-O2`、`-O3` 各 **210/210**；831 个额外程序在 `-O0`、`-O2`、`-O3` 共 **2493 次执行**及 **20 个诊断**通过。另有 **1068 次 ASan/UBSan 编译**、**56 个 MIR 破坏性变异**和 **248 条离线规则证明**。QEMU 共同输入对照的 wall 几何平均为 **1.205×**，固定较长计时区间为 **1.639×**；原生编译总耗时约为 sysy-competition 的 **1/29.5**。相比本轮基线，全部输入编译总耗时增加 **3.63%**，平均 **4.64 ms／输入**。卷积三项已反超，全面领先仍未完成；单项消融、剩余差距与测量范围见性能文档。

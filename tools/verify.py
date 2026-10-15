@@ -144,6 +144,22 @@ def check_smt():
     # Equality discovery operates in the int32 ring. Validate its factoring,
     # constant reassociation and identities without signed-overflow premises.
     y,z = accumulator,term
+    initial,limit,iv = z3.BitVecs("initial limit iv",32)
+    prove("signed +1 induction preserves lower bound",iv+1>=initial,z3.BoolVal(True),
+          initial>=0,iv>=initial,iv<limit)
+    prove("signed +1 induction preserves upper bound",iv+1<=limit,z3.BoolVal(True),
+          initial>=0,iv>=initial,iv<limit)
+    prove("zero-trip header included",initial<=z3.If(initial>limit,initial,limit),z3.BoolVal(True))
+    prove("canonical false-edge exact exit",iv,limit,limit>=0,iv>=0,iv<=limit,z3.Not(iv<limit))
+    for j in range(4):
+        prove(f"runtime chunk/{j}",iv+j<limit,z3.BoolVal(True),
+              initial>=0,initial<limit,iv>=initial,iv<=limit-4)
+    table=z3.Array("table",z3.BitVecSort(32),z3.BitVecSort(32))
+    cells=[z3.Select(table,z3.BitVecVal(i,32))==term for i in range(16,20)]
+    prove("uniform table slice",z3.Select(table,iv),term,iv>=16,iv<20,*cells)
+    # These hypotheses matter: an unconstrained cell outside the slice differs.
+    solver=z3.Solver();solver.add(*cells,iv==20,z3.Select(table,iv)!=term)
+    if solver.check()!=z3.sat:raise AssertionError("table bounds counterexample missing")
     prove("integer factoring",x*y+x*z,x*(y+z))
     prove("add reassociation",(x+y)+z,x+(y+z))
     prove("multiply reassociation",(x*y)*z,x*(y*z))

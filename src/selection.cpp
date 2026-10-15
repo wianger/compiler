@@ -53,8 +53,21 @@ class Selector {
     int a = i.args[0], dst = i.result; int32_t d = *c;
     if (i.op == Op::And && small(d)) { emit(RV::Andi,{a},d,dst); return true; }
     if (i.op == Op::Shr) { emit(RV::Srliw,{a},d&31,dst); return true; }
-    if ((i.op == Op::Add && small(d)) || (i.op == Op::Sub && small(-int64_t(d)))) {
-      emit(RV::Addiw,{a},i.op == Op::Add ? d : -int64_t(d),dst); return true;
+    if (i.op == Op::Add || i.op == Op::Sub) {
+      // Word additions compose modulo 2^32, including overflow and subtraction.
+      // defs excludes multiply-defined Phi/edge-copy values after SSA lowering.
+      int base = a; uint32_t delta = i.op == Op::Add ? uint32_t(d) : 0u-uint32_t(d);
+      for (int depth = 0; depth < 16 && defs[base]; ++depth) {
+        const auto &prior = *defs[base];
+        if (prior.op != Op::Add && prior.op != Op::Sub) break;
+        auto step = literal(prior.args[1]); if (!step) break;
+        delta += prior.op == Op::Add ? uint32_t(*step) : 0u-uint32_t(*step);
+        base = prior.args[0];
+      }
+      if (small(static_cast<int32_t>(delta))) { emit(RV::Addiw,{base},static_cast<int32_t>(delta),dst); return true; }
+      if ((i.op == Op::Add && small(d)) || (i.op == Op::Sub && small(-int64_t(d)))) {
+        emit(RV::Addiw,{a},i.op == Op::Add ? d : -int64_t(d),dst); return true;
+      }
     }
     uint64_t magnitude = d < 0 ? -int64_t(d) : d;
     bool power = magnitude && !(magnitude & (magnitude-1)); int shift = 0;
